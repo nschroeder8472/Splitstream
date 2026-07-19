@@ -449,6 +449,27 @@ Real code must: register the thread with MMCSS before the loop; handle `AUDCLNT_
 
 ---
 
+## Links
+
+- Design override: `§6.2 trait ownership` — changed from port traits defined in `win-audio` to traits defined in `engine::ports`, implemented by `win-audio`. Reason: `win-audio` carries `windows-rs`; engine importing its traits would break Linux CI builds required by §6/N5 (interface-at-consumer idiom).
+- Design override: `Appendix A capture seam shape` — changed from `LoopbackCapture` pumping into an `rtrb::Producer` to `CapturePort::read(&mut [f32])` pull model behind an `AudioSystem` facade. Reason: keeps ring library out of port contracts; ring ownership stays in `engine::runtime`; mocks trivial.
+- Design alignment: remaining L4 contracts (Mixer semantics §11.2, polled loopback, event-driven render, command plane §6.4, hot-reload §11.1) consistent with requirement spec — no further overrides. See `.lattice/context/engine-core.md`.
+- Design override: `§7.3 drift input` — changed from sampling device rates (`IAudioClock`/`IAudioClock2`) + ring fill to ring-fill-only PI control. Reason: fill error is the held quantity, self-correcting, no port/COM surface growth; revisit only if 8h soak shows slow convergence (P2 design).
+- Design override: `§10 device-added handling` — elaborated from "offer as a routing target" to auto-restore: a fallen-back group returns to its configured device automatically when it reappears. Reason: config is source of truth; replug UX. See `.lattice/context/drift-and-recovery.md`.
+- Design alignment: remaining P2 contracts (smoothed corrections §7.3, supervisor rebuild §10, telemetry, fallback-to-default) consistent with requirement spec.
+- Design override: `§15.5 session→group matching` — resolved from open question to: process image name + full path with glob syntax; precedence exact name > glob, ties by config order; window title excluded. Reason: titles volatile (rematch churn), spec config example already glob-shaped (P3 design).
+- Design alignment: remaining P3 contracts (session enumeration §9.2 with priming, best-effort routing §9.3, visibility/default §9.4, degradation N4, feature-gating per §9 risk note) consistent with requirement spec. See `.lattice/context/session-routing.md`.
+- Design override: `§15.1 UI toolkit` — resolved to `egui`/`eframe` per spec's own recommendation (P4 design).
+- Design override: `§11.3 config schema` — added top-level `muted: bool` (effective master = muted ? 0 : master, preserves gain) and `[app]` table with `autostart: bool`. Reason: mute hotkey must not overwrite master gain; autostart user-controllable (F11).
+- Design alignment: remaining P4 contracts (UI mutates config and sends commands §6.5 — param fast path + config funnel; single-instance/autostart F11; hot-reload §11.1 with echo suppression) consistent with requirement spec. See `.lattice/context/app-shell.md`.
+- Design override: `§6.1 Ducker` — changed from a `DspStage` in the per-group chain to a mixer-level cross-group processor (trigger envelope followers → target gain reduction). Reason: sidechain spans groups; keeps `DspStage` single-group pure. Duck config lives target-side in `[[group.dsp]]` with `trigger = "<group>"`.
+- Design alignment: remaining P5 contracts (`DspStage` trait shape §6.1, DSP placement after gain before SRC §8, per-output headroom limiting §8 step 5, `[[group.dsp]]` schema §11.3) consistent with requirement spec. See `.lattice/context/dsp-pipeline.md`.
+- Design override: `§11.2 mute semantics` — mute hotkey silences ALL groups (output-stage kill flag), including `follow_master = false` groups; master and group gains untouched. Reason: a mute that leaves audio playing reads as a bug (cross-blueprint review).
+- Design override: `§7.2 command transport` — parameters reach the mixer via a bounded lock-free MPSC queue (not an SPSC ring); SPSC `rtrb` remains for PCM only. Reason: ≥3 command producers by P5 (UI fast path, drift loop, supervisor swaps).
+- Design elaboration (cross-blueprint review): mixer thread is timer-paced with silence synthesis for idle loopback buses (§7.1); topology `Epoch` guards in-flight commands across rebuilds/chain swaps; `schema_version` policy — v2 covers `muted`/`[app]`/duck fields, unknown newer versions rejected (§11.3). Details in the five `.lattice/context/*.md` revision sections.
+
+---
+
 ## Appendix B — Glossary
 
 - **Bus / group:** a logical channel of grouped app audio with its own volume, DSP, and output.
