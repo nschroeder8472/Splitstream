@@ -23,9 +23,9 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-use audio_core::{Gain, GroupId};
+use audio_core::{DspSpec, EqBandSpec, Gain, GroupId};
 use control::ConfigEdit;
-use engine::{GroupConfig, RoutingReader, SessionInfo};
+use engine::{DuckSpecConfig, GroupConfig, RoutingReader, SessionInfo};
 
 use crate::event_pump::UiState;
 use crate::ShellAction;
@@ -34,6 +34,9 @@ use crate::ShellAction;
 struct GroupDraft {
     output_device: String,
     match_rules: String,
+    /// Free-text duck trigger name — same draft treatment as `output_device`
+    /// (a name field, fights in-progress typing if re-derived every frame).
+    duck_trigger: String,
 }
 
 #[derive(Default)]
@@ -70,6 +73,7 @@ impl SettingsApp {
         self.drafts.entry(group.name.clone()).or_insert_with(|| GroupDraft {
             output_device: group.output_device.clone(),
             match_rules: group.match_rules.join(", "),
+            duck_trigger: group.duck.as_ref().map(|d| d.trigger.clone()).unwrap_or_default(),
         })
     }
 }
@@ -198,6 +202,153 @@ impl SettingsApp {
             draft.output_device = output_draft;
             draft.match_rules = rules_draft;
         }
+
+        self.dsp_controls(ui, group);
+        self.duck_controls(ui, group);
+    }
+
+    /// Per-group DSP chain: one row per configured stage (live param
+    /// sliders + bypass + remove), plus add-stage buttons. EQ stages start
+    /// with a single band on creation — a new band's params, once added,
+    /// can only be retuned via `SetEqBand`, not created independently (no
+    /// `AddEqBand` edit exists; matches the contract's edit set as written).
+    fn dsp_controls(&self, ui: &mut egui::Ui, group: &GroupConfig) {
+        let name = group.name.clone();
+        ui.collapsing("DSP", |ui| {
+            for (stage_idx, stage) in group.dsp.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    match &stage.spec {
+                        DspSpec::Eq { bands } => {
+                            ui.label(format!("EQ #{stage_idx}"));
+                            if let Some(band) = bands.first() {
+                                let mut freq = band.freq_hz;
+                                let mut gain_db = band.gain_db;
+                                let mut q = band.q;
+                                let mut changed = false;
+                                changed |= ui
+                                    .add(egui::Slider::new(&mut freq, 20.0..=20_000.0).logarithmic(true).text("Hz"))
+                                    .changed();
+                                changed |= ui.add(egui::Slider::new(&mut gain_db, -24.0..=24.0).text("dB")).changed();
+                                changed |= ui.add(egui::Slider::new(&mut q, 0.1..=10.0).text("Q")).changed();
+                                if changed {
+                                    self.send(ShellAction::EditParams(vec![ConfigEdit::SetEqBand(
+                                        name.clone(),
+                                        0,
+                                        EqBandSpec { freq_hz: freq, gain_db, q },
+                                    )]));
+                                }
+                            }
+                        }
+                        DspSpec::Limiter { ceiling_db } => {
+                            ui.label(format!("Limiter #{stage_idx}"));
+                            let mut ceiling = *ceiling_db;
+                            if ui.add(egui::Slider::new(&mut ceiling, -24.0..=0.0).text("Ceiling dB")).changed() {
+                                self.send(ShellAction::EditParams(vec![ConfigEdit::SetLimiterCeiling(
+                                    name.clone(),
+                                    ceiling,
+                                )]));
+                            }
+                        }
+                    }
+
+                    let mut bypassed = stage.bypassed;
+                    if ui.checkbox(&mut bypassed, "Bypass").changed() {
+                        self.send(ShellAction::EditParams(vec![ConfigEdit::SetDspBypass(
+                            name.clone(),
+                            stage_idx,
+                            bypassed,
+                        )]));
+                    }
+                    if ui.button("Remove").clicked() {
+                        self.send(ShellAction::EditDspChains(vec![ConfigEdit::RemoveDspStage(
+                            name.clone(),
+                            stage_idx,
+                        )]));
+                    }
+                });
+            }
+
+            ui.horizontal(|ui| {
+                if ui.button("Add EQ").clicked() {
+                    self.send(ShellAction::EditDspChains(vec![ConfigEdit::AddDspStage(
+                        name.clone(),
+                        DspSpec::Eq {
+                            bands: vec![EqBandSpec { freq_hz: 1000.0, gain_db: 0.0, q: 0.7 }],
+                        },
+                    )]));
+                }
+                if ui.button("Add Limiter").clicked() {
+                    self.send(ShellAction::EditDspChains(vec![ConfigEdit::AddDspStage(
+                        name.clone(),
+                        DspSpec::Limiter { ceiling_db: -1.0 },
+                    )]));
+                }
+            });
+        });
+    }
+
+    /// Cross-group sidechain: trigger name (draft text field, same pattern
+    /// as `output_device`) plus amount/threshold/attack/release sliders,
+    /// shown only while a duck is configured. The enable checkbox creates a
+    /// sensible default config; disabling clears it entirely.
+    fn duck_controls(&mut self, ui: &mut egui::Ui, group: &GroupConfig) {
+        let name = group.name.clone();
+        self.draft_for(group);
+        let mut trigger_draft = self.drafts[&name].duck_trigger.clone();
+
+        ui.collapsing("Duck (sidechain)", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Trigger group:");
+                ui.text_edit_singleline(&mut trigger_draft);
+
+                let mut enabled = group.duck.is_some();
+                if ui.checkbox(&mut enabled, "Enabled").changed() {
+                    let duck = enabled.then(|| {
+                        group.duck.clone().unwrap_or(DuckSpecConfig {
+                            trigger: trigger_draft.clone(),
+                            amount_db: 6.0,
+                            threshold_db: -30.0,
+                            attack_ms: 5.0,
+                            release_ms: 200.0,
+                        })
+                    });
+                    self.send(ShellAction::EditParams(vec![ConfigEdit::SetDuck(name.clone(), duck)]));
+                }
+            });
+
+            if let Some(duck) = &group.duck {
+                let mut amount_db = duck.amount_db;
+                let mut threshold_db = duck.threshold_db;
+                let mut attack_ms = duck.attack_ms;
+                let mut release_ms = duck.release_ms;
+                let mut changed = false;
+                changed |= ui.add(egui::Slider::new(&mut amount_db, 0.0..=24.0).text("Amount dB")).changed();
+                changed |= ui
+                    .add(egui::Slider::new(&mut threshold_db, -60.0..=0.0).text("Threshold dB"))
+                    .changed();
+                changed |= ui.add(egui::Slider::new(&mut attack_ms, 1.0..=200.0).text("Attack ms")).changed();
+                changed |= ui.add(egui::Slider::new(&mut release_ms, 10.0..=1000.0).text("Release ms")).changed();
+                if ui.button("Set trigger").clicked() {
+                    changed = true;
+                }
+                if changed {
+                    self.send(ShellAction::EditParams(vec![ConfigEdit::SetDuck(
+                        name.clone(),
+                        Some(DuckSpecConfig {
+                            trigger: trigger_draft.clone(),
+                            amount_db,
+                            threshold_db,
+                            attack_ms,
+                            release_ms,
+                        }),
+                    )]));
+                }
+            }
+        });
+
+        if let Some(draft) = self.drafts.get_mut(&name) {
+            draft.duck_trigger = trigger_draft;
+        }
     }
 
     fn add_group_controls(&mut self, ui: &mut egui::Ui) {
@@ -217,6 +368,8 @@ impl SettingsApp {
                     gain: Gain::UNITY,
                     follow_master: true,
                     match_rules: vec![],
+                    dsp: Vec::new(),
+                    duck: None,
                 };
                 self.send(ShellAction::EditStructure(vec![ConfigEdit::AddGroup(group)]));
                 self.new_group = NewGroupDraft::default();

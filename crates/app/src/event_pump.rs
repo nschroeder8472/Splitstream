@@ -76,6 +76,8 @@ mod tests {
                 ring_fill: vec![],
                 applied_ratio: vec![],
                 group_faults: vec![],
+                limiter_engaged: vec![],
+                duck_depth_db: vec![],
             },
             routing_degraded: false,
         }))

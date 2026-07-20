@@ -1,13 +1,16 @@
-//! Per-group gain, SRC, and output summing. Everything here runs on the RT
-//! mixer thread (`engine::runtime`) — no allocation, no locks, no blocking.
+//! Per-group gain, DSP, duck, SRC, and output summing. Everything here runs
+//! on the RT mixer thread (`engine::runtime`) — no allocation, no locks, no
+//! blocking.
 
 use crate::channel::ChannelMatrix;
+use crate::dsp::{db_to_linear, DspChain, DspParam, DspStage, Limiter};
 use crate::resample::Src;
 use crate::sample::{
-    DomainError, Format, Gain, GroupId, GroupSpec, OutputId, ResampleRatio, Topology,
+    DomainError, DuckSpec, Format, Gain, GroupId, GroupSpec, OutputId, ResampleRatio, Topology,
 };
+use crate::smoothing::Smoothed;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum MixerCommand {
     SetGroupGain(GroupId, Gain),
     SetMaster(Gain),
@@ -19,37 +22,138 @@ pub enum MixerCommand {
     /// every group's contribution to every output. Gain/master smoothers
     /// keep running so unmute resumes at the same value with no re-ramp.
     SetMuted(bool),
+    /// Param tweak or bypass toggle on a pre-allocated stage — smoothed
+    /// internally, never a stepped change (notes §8).
+    SetDspParam {
+        group: GroupId,
+        stage: usize,
+        param: DspParam,
+    },
+    SetDspBypass {
+        group: GroupId,
+        stage: usize,
+        bypassed: bool,
+    },
+    /// Reconfigures (or clears) a group's duck sidechain. Command-path, not
+    /// `Structural`: unlike adding/removing a DSP stage, this never resizes
+    /// any RT-owned buffer — just swaps a few scalar fields.
+    SetDuck {
+        group: GroupId,
+        duck: Option<DuckSpec>,
+    },
+    /// Add/remove-stage change, funnel-classified `Structural` but
+    /// implemented as an RT-safe pointer swap (dsp-pipeline.md's revision):
+    /// the new chain is built off-thread by the caller, moved in here, and
+    /// the retired chain is hg  anded back for the caller to drop off-thread.
+    SwapChain {
+        group: GroupId,
+        chain: Box<DspChain>,
+    },
 }
 
 const GAIN_TIME_CONSTANT_S: f32 = 0.01; // 10ms — inaudible as a ramp, kills zipper noise
+/// Envelope-follower detection time, fixed (not user-configurable — `DuckSpec`
+/// only exposes the *reaction* attack/release, see `DuckTargetGain`). Fast
+/// enough to catch onset without being noise-jittery.
+const ENV_FOLLOWER_ATTACK_MS: f32 = 5.0;
+const ENV_FOLLOWER_RELEASE_MS: f32 = 100.0;
+/// Always-on per-output headroom limiter ceiling (L1 capability 4: shared
+/// outputs must never clip). Not user-configurable — this is a safety net,
+/// not a mix decision; per-group limiting is what `DspSpec::Limiter` is for.
+const OUTPUT_HEADROOM_CEILING_DB: f32 = 0.0;
 
-/// One-pole parameter smoother. Every audible parameter ramps toward its
-/// target instead of stepping — a stepped gain is an audible "zipper" click.
-#[derive(Debug, Clone, Copy)]
-struct Smoothed {
-    current: f32,
-    target: f32,
-    coeff: f32,
+fn one_pole_coeff(time_constant_s: f32, sample_rate: u32) -> f32 {
+    (-1.0 / (time_constant_s * sample_rate as f32)).exp()
 }
 
-impl Smoothed {
-    fn new(initial: f32, sample_rate: u32, time_constant_s: f32) -> Smoothed {
-        let coeff = (-1.0 / (time_constant_s * sample_rate as f32)).exp();
-        Smoothed {
-            current: initial,
-            target: initial,
-            coeff,
+/// Mixer-level cross-group sidechain follower (L2: not a `DspStage` — it
+/// reads one group's post-chain signal to drive gain on a *different*
+/// group). One instance per group, always running: any group can become a
+/// duck trigger via a live `SetDuck` command, and pre-allocating a follower
+/// only for groups referenced at construction would mean growing state at
+/// runtime (an RT allocation) the first time a new trigger relationship is
+/// configured.
+struct EnvFollower {
+    env: f32,
+    attack: f32,
+    release: f32,
+}
+
+impl EnvFollower {
+    fn new(sample_rate: u32) -> EnvFollower {
+        EnvFollower {
+            env: 0.0,
+            attack: one_pole_coeff(ENV_FOLLOWER_ATTACK_MS / 1000.0, sample_rate),
+            release: one_pole_coeff(ENV_FOLLOWER_RELEASE_MS / 1000.0, sample_rate),
         }
     }
 
-    fn set_target(&mut self, target: f32) {
-        self.target = target;
+    /// Returns the envelope, in dBFS, at the end of `buf` — the per-frame
+    /// tracking state carries across calls, but only the final value is
+    /// reported (L3 interaction A: one reading per group per tick).
+    ///
+    /// One update per FRAME (peak across `channels`), not per interleaved
+    /// element — `attack`/`release` assume one call per sample-period;
+    /// stepping per element would make detection `channels` times faster
+    /// than intended (review finding, dsp-pipeline P5).
+    fn process_block(&mut self, buf: &[f32], channels: usize) -> f32 {
+        let frame_count = buf.len() / channels;
+        for f in 0..frame_count {
+            let start = f * channels;
+            let a = buf[start..start + channels]
+                .iter()
+                .fold(0.0f32, |acc, &s| acc.max(s.abs()));
+            let c = if a > self.env { self.attack } else { self.release };
+            self.env = a + c * (self.env - a);
+        }
+        20.0 * self.env.max(1.0e-6).log10()
+    }
+}
+
+/// Smoothed linear gain applied to a duck target's buffer — asymmetric
+/// attack/release from the group's own `DuckSpec` (the knobs a user tunes),
+/// distinct from `EnvFollower`'s fixed detection timing.
+struct DuckTargetGain {
+    current: f32,
+    attack_coeff: f32,
+    release_coeff: f32,
+}
+
+impl DuckTargetGain {
+    fn new(sample_rate: u32, attack_ms: f32, release_ms: f32) -> DuckTargetGain {
+        DuckTargetGain {
+            current: 1.0,
+            attack_coeff: one_pole_coeff(attack_ms / 1000.0, sample_rate),
+            release_coeff: one_pole_coeff(release_ms / 1000.0, sample_rate),
+        }
     }
 
-    #[inline]
-    fn next(&mut self) -> f32 {
-        self.current = self.target + self.coeff * (self.current - self.target);
-        self.current
+    /// Ramps per-frame toward `target` (attack when reducing, release when
+    /// recovering) and applies the running gain to every channel in that
+    /// frame. One ramp step per frame, not per interleaved element — same
+    /// rate bug class as `EnvFollower::process_block` (review finding,
+    /// dsp-pipeline P5): `attack_coeff`/`release_coeff` assume one call per
+    /// sample-period, so a per-element step would make the group's
+    /// configured `attack_ms`/`release_ms` `channels` times faster.
+    fn apply(&mut self, buf: &mut [f32], target: f32, channels: usize) {
+        let frame_count = buf.len() / channels;
+        for f in 0..frame_count {
+            let coeff = if target < self.current {
+                self.attack_coeff
+            } else {
+                self.release_coeff
+            };
+            self.current = target + coeff * (self.current - target);
+            let start = f * channels;
+            for s in &mut buf[start..start + channels] {
+                *s *= self.current;
+            }
+        }
+    }
+
+    /// Current reduction, in dB (0 = no reduction).
+    fn depth_db(&self) -> f32 {
+        -20.0 * self.current.max(1.0e-6).log10()
     }
 }
 
@@ -66,17 +170,32 @@ struct GroupState {
     // Independent copies at the same time constant drift from each other by
     // a fraction of a sample over a ~10ms ramp — inaudible.
     master: Smoothed,
-    /// Converts source layout -> output layout, between gain and SRC. Skipped
-    /// entirely when `is_identity()` (same layout in and out).
+    /// Converts source layout -> output layout, between the DSP chain and
+    /// SRC. Skipped entirely when `is_identity()` (same layout in and out).
     matrix: ChannelMatrix,
     /// Matrix output, pre-SRC. Capacity: `max_block_frames * output channels`.
     matrixed: Vec<f32>,
     src: Src,
-    /// Gain-applied samples, pre-matrix. Capacity: `max_block_frames * channels`.
+    /// Gain-applied, then DSP-chain- and duck-processed samples, pre-matrix.
+    /// Capacity: `max_block_frames * channels`. Source layout throughout
+    /// (notes §17: DSP/duck stay at source layout, not output layout).
     scratch: Vec<f32>,
+    /// Valid interleaved sample count in `scratch` this tick — set by
+    /// `push_group`, consumed by `mix_tick`'s duck/matrix/SRC/sum phases.
+    valid_len: usize,
     /// SRC output. Capacity is generous (see Mixer::new) so a full block's
     /// worth of input is always consumed in one `push_group` call.
     resampled: Vec<f32>,
+    input_format: Format,
+    /// Boxed at construction (off-RT) so a live `SwapChain` command is a
+    /// pointer move, never an RT allocation (notes §7).
+    dsp_chain: Box<DspChain>,
+    duck: Option<DuckSpec>,
+    duck_gain: Option<DuckTargetGain>,
+    env_follower: EnvFollower,
+    /// This group's own envelope, computed fresh every tick before any
+    /// target's duck gain is applied — see `Mixer::mix_tick` phase 1.
+    last_env_db: f32,
 }
 
 struct OutputState {
@@ -84,6 +203,10 @@ struct OutputState {
     accum: Vec<f32>,
     /// High-water mark of valid samples in `accum` since the last `take_output`.
     filled: usize,
+    format: Format,
+    /// Always-on headroom limiter (L1 capability 4) — runs after every
+    /// group has summed into `accum`, before the render thread reads it.
+    limiter: Limiter,
 }
 
 pub struct Mixer {
@@ -121,6 +244,15 @@ fn build_group(
             output: gspec.output,
         })?;
 
+    if let Some(duck) = &gspec.duck {
+        if !topology.groups.iter().any(|gg| gg.id == duck.trigger) {
+            return Err(DomainError::DanglingDuckTrigger {
+                group: gspec.id,
+                trigger: duck.trigger,
+            });
+        }
+    }
+
     validate_layout(&gspec.input_format)?;
     validate_layout(&out_spec.format)?;
 
@@ -141,6 +273,11 @@ fn build_group(
     };
     let src = Src::new(src_from, out_spec.format, max_block_frames)?;
 
+    let dsp_chain = Box::new(DspChain::new(&gspec.dsp, gspec.input_format, max_block_frames)?);
+    let duck_gain = gspec
+        .duck
+        .map(|d| DuckTargetGain::new(sample_rate, d.attack_ms, d.release_ms));
+
     Ok(GroupState {
         id: gspec.id,
         output: gspec.output,
@@ -152,11 +289,18 @@ fn build_group(
         matrixed: vec![0.0; max_block_frames * out_channels],
         src,
         scratch: vec![0.0; max_block_frames * channels],
+        valid_len: 0,
         // 8x covers every realistic device sample-rate ratio (worst case
         // in practice is well under 2x) with no per-tick sizing math. Sized
         // by out_channels, not the source channel count — undersizing here
         // for an upmix would only trip the debug_assert below in tests.
         resampled: vec![0.0; max_block_frames * out_channels * 8],
+        input_format: gspec.input_format,
+        dsp_chain,
+        duck: gspec.duck,
+        duck_gain,
+        env_follower: EnvFollower::new(sample_rate),
+        last_env_db: f32::NEG_INFINITY,
     })
 }
 
@@ -171,6 +315,8 @@ impl Mixer {
                 id: spec.id,
                 accum: vec![0.0; cap],
                 filled: 0,
+                format: spec.format,
+                limiter: Limiter::new(OUTPUT_HEADROOM_CEILING_DB, spec.format, max_block_frames),
             });
         }
 
@@ -189,37 +335,73 @@ impl Mixer {
 
     /// Unknown ids are dropped silently: the command ring may still carry a
     /// stale-epoch command past the point its group/output was torn down.
-    pub fn apply(&mut self, cmd: MixerCommand) {
+    /// Returns the retired chain on `SwapChain` — the caller drops it
+    /// off-RT (notes §7); every other variant returns `None`.
+    pub fn apply(&mut self, cmd: MixerCommand) -> Option<Box<DspChain>> {
         match cmd {
             MixerCommand::SetGroupGain(id, gain) => {
                 if let Some(g) = self.groups.iter_mut().find(|g| g.id == id) {
                     g.gain.set_target(gain.value());
                 }
+                None
             }
             MixerCommand::SetMaster(gain) => {
                 for g in self.groups.iter_mut() {
                     g.master.set_target(gain.value());
                 }
+                None
             }
             MixerCommand::SetFollowMaster(id, follow) => {
                 if let Some(g) = self.groups.iter_mut().find(|g| g.id == id) {
                     g.follow_master = follow;
                 }
+                None
             }
             MixerCommand::SetOutputRatio(output_id, ratio) => {
                 for g in self.groups.iter_mut().filter(|g| g.output == output_id) {
                     g.src.set_ratio(ratio);
                 }
+                None
             }
             MixerCommand::SetMuted(muted) => {
                 self.muted = muted;
+                None
             }
+            MixerCommand::SetDspParam { group, stage, param } => {
+                if let Some(g) = self.groups.iter_mut().find(|g| g.id == group) {
+                    g.dsp_chain.set_param(stage, param);
+                }
+                None
+            }
+            MixerCommand::SetDspBypass { group, stage, bypassed } => {
+                if let Some(g) = self.groups.iter_mut().find(|g| g.id == group) {
+                    g.dsp_chain.set_bypass(stage, bypassed);
+                }
+                None
+            }
+            MixerCommand::SetDuck { group, duck } => {
+                if let Some(g) = self.groups.iter_mut().find(|g| g.id == group) {
+                    g.duck_gain = duck.map(|d| {
+                        DuckTargetGain::new(g.input_format.sample_rate, d.attack_ms, d.release_ms)
+                    });
+                    g.duck = duck;
+                }
+                None
+            }
+            MixerCommand::SwapChain { group, chain } => self
+                .groups
+                .iter_mut()
+                .find(|g| g.id == group)
+                .map(|g| std::mem::replace(&mut g.dsp_chain, chain)),
         }
     }
 
-    /// Applies gain (and master, if bound) per-sample, resamples to the
-    /// group's target output format, and sums into that output's per-tick
-    /// accumulator. `frames` is interleaved and truncated to `max_block_frames`.
+    /// Applies gain (and master, if bound) per-sample, then the group's DSP
+    /// chain — both at source layout. Duck, matrix, SRC, and output summing
+    /// happen later in `mix_tick`, once every group has reached this point
+    /// (L3 interaction A: duck needs every trigger's post-chain signal
+    /// before any target is touched). `frames` is interleaved and truncated
+    /// to `max_block_frames`.
     pub fn push_group(&mut self, group: GroupId, frames: &[f32]) {
         let Some(idx) = self.groups.iter().position(|g| g.id == group) else {
             return;
@@ -243,38 +425,89 @@ impl Mixer {
             }
         }
 
-        // Matrix stage: skipped entirely (no copy) when source and output
-        // share a layout — the common case should pay nothing extra.
-        let (matrix_input, matrix_len): (&[f32], usize) = if g.matrix.is_identity() {
-            (&g.scratch[..n], n)
-        } else {
-            let len = g.matrix.process(&g.scratch[..n], &mut g.matrixed);
-            (&g.matrixed[..len], len)
-        };
+        g.dsp_chain.process(&mut g.scratch[..n], g.input_format);
+        g.valid_len = n;
+    }
 
-        let progress = g.src.process(matrix_input, &mut g.resampled);
-        debug_assert_eq!(
-            progress.consumed, matrix_len,
-            "resampled scratch undersized for one block"
-        );
-
-        // Output-stage kill: gain/matrix/SRC still ran above (smoothers and
-        // resampler state stay warm), only the write into the shared output
-        // accumulator is skipped — unmute resumes with no re-ramp or glitch.
-        if self.muted {
-            return;
+    /// Runs once per tick, after every group's `push_group` call and before
+    /// `take_output`. Order per L3 interaction A: every trigger's post-chain
+    /// envelope first (phase 1), then duck gain reduction on every target
+    /// (phase 2) — no target's matrix/SRC/sum has run yet, so there's no
+    /// feedback regardless of how the duck config graph is shaped — then
+    /// matrix -> SRC -> sum per group (phase 3), then the always-on
+    /// per-output headroom limiter (phase 4).
+    pub fn mix_tick(&mut self) {
+        for i in 0..self.groups.len() {
+            let g = &mut self.groups[i];
+            let n = g.valid_len;
+            g.last_env_db = g.env_follower.process_block(&g.scratch[..n], g.channels);
         }
 
-        let output = g.output;
-        let produced = progress.produced;
-        let Some(out) = self.outputs.iter_mut().find(|o| o.id == output) else {
-            return;
-        };
-        let write_len = produced.min(out.accum.len());
-        for i in 0..write_len {
-            out.accum[i] += g.resampled[i];
+        for i in 0..self.groups.len() {
+            let Some(duck) = self.groups[i].duck else {
+                continue;
+            };
+            let trigger_env = self
+                .groups
+                .iter()
+                .position(|gr| gr.id == duck.trigger)
+                .map(|ti| self.groups[ti].last_env_db)
+                .unwrap_or(f32::NEG_INFINITY);
+            let reduction = if trigger_env > duck.threshold_db {
+                db_to_linear(-duck.amount_db)
+            } else {
+                1.0
+            };
+            let n = self.groups[i].valid_len;
+            let g = &mut self.groups[i];
+            if let Some(dg) = g.duck_gain.as_mut() {
+                dg.apply(&mut g.scratch[..n], reduction, g.channels);
+            }
         }
-        out.filled = out.filled.max(write_len);
+
+        for i in 0..self.groups.len() {
+            let n = self.groups[i].valid_len;
+            let g = &mut self.groups[i];
+
+            // Matrix stage: skipped entirely (no copy) when source and
+            // output share a layout — the common case should pay nothing extra.
+            let (matrix_input, matrix_len): (&[f32], usize) = if g.matrix.is_identity() {
+                (&g.scratch[..n], n)
+            } else {
+                let len = g.matrix.process(&g.scratch[..n], &mut g.matrixed);
+                (&g.matrixed[..len], len)
+            };
+
+            let progress = g.src.process(matrix_input, &mut g.resampled);
+            debug_assert_eq!(
+                progress.consumed, matrix_len,
+                "resampled scratch undersized for one block"
+            );
+
+            // Output-stage kill: gain/chain/duck/matrix/SRC still ran above
+            // (smoothers and resampler state stay warm), only the write into
+            // the shared output accumulator is skipped — unmute resumes with
+            // no re-ramp or glitch.
+            if self.muted {
+                continue;
+            }
+
+            let output = g.output;
+            let produced = progress.produced;
+            let Some(out) = self.outputs.iter_mut().find(|o| o.id == output) else {
+                continue;
+            };
+            let write_len = produced.min(out.accum.len());
+            for s in 0..write_len {
+                out.accum[s] += g.resampled[s];
+            }
+            out.filled = out.filled.max(write_len);
+        }
+
+        for out in self.outputs.iter_mut() {
+            let filled = out.filled;
+            out.limiter.process(&mut out.accum[..filled], out.format);
+        }
     }
 
     /// Copies this tick's summed output into `buf` (up to its length) and
@@ -292,11 +525,36 @@ impl Mixer {
         out.filled = 0;
         n
     }
+
+    /// Telemetry accessor (`EngineStats::limiter_engaged`): whether this
+    /// output's always-on headroom limiter reduced gain during the last
+    /// `mix_tick`. Unknown id: `false`, same "nothing to report" convention
+    /// as every other unknown-id lookup here.
+    pub fn output_limiter_engaged(&self, output: OutputId) -> bool {
+        self.outputs
+            .iter()
+            .find(|o| o.id == output)
+            .map(|o| o.limiter.engaged())
+            .unwrap_or(false)
+    }
+
+    /// Telemetry accessor (`EngineStats::duck_depth_db`): this group's
+    /// current duck gain reduction, in dB (0 = not reduced / not a duck
+    /// target). Unknown id or no duck configured: `0.0`.
+    pub fn group_duck_depth_db(&self, group: GroupId) -> f32 {
+        self.groups
+            .iter()
+            .find(|g| g.id == group)
+            .and_then(|g| g.duck_gain.as_ref())
+            .map(|dg| dg.depth_db())
+            .unwrap_or(0.0)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dsp::DspSpec;
     use crate::sample::{ChannelLayout, Format, GroupSpec, OutputSpec};
 
     fn stereo(rate: u32) -> Format {
@@ -324,6 +582,8 @@ mod tests {
                 follow_master,
                 output: OutputId(1),
                 input_format: stereo(48_000),
+                dsp: Vec::new(),
+                duck: None,
             }],
             outputs: vec![OutputSpec {
                 id: OutputId(1),
@@ -347,6 +607,7 @@ mod tests {
         let mut collected = Vec::new();
         for _ in 0..ticks {
             mixer.push_group(group, frames);
+            mixer.mix_tick();
             let mut out = vec![0.0f32; frames.len()];
             let n = mixer.take_output(output, &mut out);
             collected.extend_from_slice(&out[..n]);
@@ -410,8 +671,9 @@ mod tests {
     fn unknown_group_and_output_ids_are_ignored_not_panicking() {
         let topo = single_group_topology(1.0, false, 1.0);
         let mut mixer = Mixer::new(&topo, 256).unwrap();
-        mixer.apply(MixerCommand::SetGroupGain(GroupId(99), Gain::UNITY));
+        assert!(mixer.apply(MixerCommand::SetGroupGain(GroupId(99), Gain::UNITY)).is_none());
         mixer.push_group(GroupId(99), &[0.0; 4]);
+        mixer.mix_tick();
         let mut out = [0.0f32; 4];
         assert_eq!(mixer.take_output(OutputId(99), &mut out), 0);
     }
@@ -426,6 +688,8 @@ mod tests {
                 follow_master: false,
                 output: OutputId(404),
                 input_format: stereo(48_000),
+                dsp: Vec::new(),
+                duck: None,
             }],
             outputs: vec![],
         };
@@ -448,6 +712,8 @@ mod tests {
                 follow_master: false,
                 output: OutputId(1),
                 input_format: five_one(48_000),
+                dsp: Vec::new(),
+                duck: None,
             }],
             outputs: vec![OutputSpec {
                 id: OutputId(1),
@@ -467,6 +733,8 @@ mod tests {
                 follow_master: false,
                 output: OutputId(1),
                 input_format: five_one(48_000),
+                dsp: Vec::new(),
+                duck: None,
             }],
             outputs: vec![OutputSpec {
                 id: OutputId(1),
@@ -534,6 +802,8 @@ mod tests {
                 follow_master: false,
                 output: OutputId(1),
                 input_format: bad_format,
+                dsp: Vec::new(),
+                duck: None,
             }],
             outputs: vec![OutputSpec {
                 id: OutputId(1),
@@ -544,5 +814,260 @@ mod tests {
             Mixer::new(&topo, 256),
             Err(DomainError::InvalidLayout { .. })
         ));
+    }
+
+    #[test]
+    fn dangling_duck_trigger_is_rejected_at_construction() {
+        let topo = Topology {
+            master: Gain::UNITY,
+            groups: vec![GroupSpec {
+                id: GroupId(1),
+                gain: Gain::UNITY,
+                follow_master: false,
+                output: OutputId(1),
+                input_format: stereo(48_000),
+                dsp: Vec::new(),
+                duck: Some(DuckSpec {
+                    trigger: GroupId(99), // does not exist in this topology
+                    amount_db: 6.0,
+                    threshold_db: -30.0,
+                    attack_ms: 5.0,
+                    release_ms: 200.0,
+                }),
+            }],
+            outputs: vec![OutputSpec {
+                id: OutputId(1),
+                format: stereo(48_000),
+            }],
+        };
+        assert!(matches!(
+            Mixer::new(&topo, 256),
+            Err(DomainError::DanglingDuckTrigger { .. })
+        ));
+    }
+
+    fn two_group_topology() -> Topology {
+        Topology {
+            master: Gain::UNITY,
+            groups: vec![
+                GroupSpec {
+                    id: GroupId(1), // trigger — e.g. voice chat
+                    gain: Gain::UNITY,
+                    follow_master: false,
+                    output: OutputId(1),
+                    input_format: stereo(48_000),
+                    dsp: Vec::new(),
+                    duck: None,
+                },
+                GroupSpec {
+                    id: GroupId(2), // target — e.g. music, ducks under GroupId(1)
+                    gain: Gain::UNITY,
+                    follow_master: false,
+                    output: OutputId(1),
+                    input_format: stereo(48_000),
+                    dsp: Vec::new(),
+                    duck: Some(DuckSpec {
+                        trigger: GroupId(1),
+                        amount_db: 12.0,
+                        threshold_db: -40.0,
+                        attack_ms: 5.0,
+                        release_ms: 200.0,
+                    }),
+                },
+            ],
+            outputs: vec![OutputSpec {
+                id: OutputId(1),
+                format: stereo(48_000),
+            }],
+        }
+    }
+
+    #[test]
+    fn loud_trigger_ducks_the_target_group_below_its_dry_level() {
+        let topo = two_group_topology();
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        let loud_trigger = vec![0.8f32; 64 * 2];
+        let target = vec![0.5f32; 64 * 2];
+
+        let mut settled = Vec::new();
+        for _ in 0..80 {
+            mixer.push_group(GroupId(1), &loud_trigger);
+            mixer.push_group(GroupId(2), &target);
+            mixer.mix_tick();
+            let mut out = vec![0.0f32; 128 * 2];
+            let n = mixer.take_output(OutputId(1), &mut out);
+            settled = out[..n].to_vec();
+        }
+
+        assert!(mixer.group_duck_depth_db(GroupId(2)) > 1.0, "target should be ducked");
+        // Summed output is trigger + ducked target; the ducked target alone
+        // settles below its dry 0.5 — check via the depth accessor above
+        // rather than trying to separate it back out of the sum.
+        assert!(!settled.is_empty());
+    }
+
+    #[test]
+    fn quiet_trigger_does_not_duck_the_target() {
+        let topo = two_group_topology();
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        let quiet_trigger = vec![0.0001f32; 64 * 2]; // well under threshold_db (-40dB)
+        let target = vec![0.5f32; 64 * 2];
+
+        for _ in 0..80 {
+            mixer.push_group(GroupId(1), &quiet_trigger);
+            mixer.push_group(GroupId(2), &target);
+            mixer.mix_tick();
+            let mut out = vec![0.0f32; 128 * 2];
+            mixer.take_output(OutputId(1), &mut out);
+        }
+
+        assert!(
+            mixer.group_duck_depth_db(GroupId(2)) < 0.5,
+            "target should not be ducked by a quiet trigger"
+        );
+    }
+
+    #[test]
+    fn set_duck_command_reconfigures_a_running_group_without_a_rebuild() {
+        let topo = single_group_topology(1.0, false, 1.0); // GroupId(1), no duck at construction
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        assert_eq!(mixer.group_duck_depth_db(GroupId(1)), 0.0);
+
+        mixer.apply(MixerCommand::SetDuck {
+            group: GroupId(1),
+            duck: Some(DuckSpec {
+                trigger: GroupId(1), // trivial self-trigger just to exercise the command path
+                amount_db: 6.0,
+                threshold_db: -60.0,
+                attack_ms: 5.0,
+                release_ms: 200.0,
+            }),
+        });
+
+        let frames = vec![0.5f32; 64 * 2];
+        for _ in 0..40 {
+            mixer.push_group(GroupId(1), &frames);
+            mixer.mix_tick();
+            let mut out = vec![0.0f32; 128 * 2];
+            mixer.take_output(OutputId(1), &mut out);
+        }
+        assert!(mixer.group_duck_depth_db(GroupId(1)) > 1.0);
+    }
+
+    #[test]
+    fn swap_chain_replaces_the_running_chain_and_returns_the_retired_one() {
+        let topo = single_group_topology(1.0, false, 1.0);
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+
+        let new_chain = Box::new(
+            DspChain::new(
+                &[DspSpec::Limiter { ceiling_db: -6.0 }],
+                stereo(48_000),
+                256,
+            )
+            .unwrap(),
+        );
+        let retired = mixer.apply(MixerCommand::SwapChain {
+            group: GroupId(1),
+            chain: new_chain,
+        });
+        assert!(retired.is_some(), "swap should hand back the previously-installed chain");
+    }
+
+    #[test]
+    fn swap_chain_on_unknown_group_is_a_no_op_returning_none() {
+        let topo = single_group_topology(1.0, false, 1.0);
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        let chain = Box::new(DspChain::new(&[], stereo(48_000), 256).unwrap());
+        assert!(mixer
+            .apply(MixerCommand::SwapChain {
+                group: GroupId(99),
+                chain,
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn set_dsp_param_routes_into_the_groups_chain() {
+        let topo = Topology {
+            master: Gain::UNITY,
+            groups: vec![GroupSpec {
+                id: GroupId(1),
+                gain: Gain::UNITY,
+                follow_master: false,
+                output: OutputId(1),
+                input_format: stereo(48_000),
+                dsp: vec![DspSpec::Limiter { ceiling_db: -6.0 }],
+                duck: None,
+            }],
+            outputs: vec![OutputSpec {
+                id: OutputId(1),
+                format: stereo(48_000),
+            }],
+        };
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        // No panic / unknown-id-style silent success is the assertion here —
+        // the per-stage EQ/limiter math itself is covered in dsp.rs's own tests.
+        mixer.apply(MixerCommand::SetDspParam {
+            group: GroupId(1),
+            stage: 0,
+            param: DspParam::LimiterCeilingDb(-3.0),
+        });
+        mixer.apply(MixerCommand::SetDspBypass {
+            group: GroupId(1),
+            stage: 0,
+            bypassed: true,
+        });
+        let frames = vec![1.0f32; 64 * 2];
+        let collected = run_ticks(&mut mixer, GroupId(1), OutputId(1), &frames, 40);
+        assert!(!collected.is_empty());
+    }
+
+    #[test]
+    fn output_headroom_limiter_engages_when_summed_groups_clip() {
+        let topo = Topology {
+            master: Gain::UNITY,
+            groups: vec![
+                GroupSpec {
+                    id: GroupId(1),
+                    gain: Gain::UNITY,
+                    follow_master: false,
+                    output: OutputId(1),
+                    input_format: stereo(48_000),
+                    dsp: Vec::new(),
+                    duck: None,
+                },
+                GroupSpec {
+                    id: GroupId(2),
+                    gain: Gain::UNITY,
+                    follow_master: false,
+                    output: OutputId(1),
+                    input_format: stereo(48_000),
+                    dsp: Vec::new(),
+                    duck: None,
+                },
+            ],
+            outputs: vec![OutputSpec {
+                id: OutputId(1),
+                format: stereo(48_000),
+            }],
+        };
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        let hot = vec![0.9f32; 64 * 2]; // two groups at 0.9 sum to 1.8 — well over full scale
+
+        let mut settled = Vec::new();
+        for _ in 0..80 {
+            mixer.push_group(GroupId(1), &hot);
+            mixer.push_group(GroupId(2), &hot);
+            mixer.mix_tick();
+            let mut out = vec![0.0f32; 128 * 2];
+            let n = mixer.take_output(OutputId(1), &mut out);
+            settled = out[..n].to_vec();
+        }
+
+        assert!(mixer.output_limiter_engaged(OutputId(1)));
+        for &s in &settled {
+            assert!(s <= 1.0 + 1e-2, "expected no clipping above full scale, got {s}");
+        }
     }
 }

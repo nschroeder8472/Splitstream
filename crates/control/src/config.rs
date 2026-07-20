@@ -12,8 +12,11 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use audio_core::{Gain, GroupId, MixerCommand};
-use engine::{AppConfig, ConfigSnapshot, GroupConfig, GroupRules, HotkeyChord, HotkeyMap, MatchRule};
+use audio_core::{DspSpec, DuckSpec, EqBandSpec, Gain, GroupId, MixerCommand};
+use engine::{
+    AppConfig, ConfigSnapshot, DspStageConfig, DuckSpecConfig, GroupConfig, GroupRules,
+    HotkeyChord, HotkeyMap, MatchRule,
+};
 
 pub const SUPPORTED_SCHEMA_VERSION: u32 = 2;
 
@@ -65,6 +68,44 @@ struct RawGroup {
     follow_master: bool,
     #[serde(default)]
     match_rules: Vec<String>,
+    #[serde(default)]
+    dsp: Vec<RawDspStage>,
+    #[serde(default)]
+    duck: Option<RawDuck>,
+}
+
+/// TOML shape for `[[group.dsp]]` (spec §11.3). `bypassed` has no place on
+/// `audio_core::DspSpec` (pure construction input) — see
+/// `engine::DspStageConfig`'s doc comment for why it's paired here instead.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum RawDspStage {
+    Eq {
+        bands: Vec<RawEqBand>,
+        #[serde(default)]
+        bypassed: bool,
+    },
+    Limiter {
+        ceiling_db: f32,
+        #[serde(default)]
+        bypassed: bool,
+    },
+}
+
+#[derive(Deserialize)]
+struct RawEqBand {
+    freq_hz: f32,
+    gain_db: f32,
+    q: f32,
+}
+
+#[derive(Deserialize)]
+struct RawDuck {
+    trigger: String,
+    amount_db: f32,
+    threshold_db: f32,
+    attack_ms: f32,
+    release_ms: f32,
 }
 
 fn current_schema_version() -> u32 {
@@ -73,6 +114,85 @@ fn current_schema_version() -> u32 {
 
 fn default_gain() -> f32 {
     1.0
+}
+
+fn convert_dsp_stage(raw: RawDspStage) -> Result<DspStageConfig, ConfigError> {
+    match raw {
+        RawDspStage::Eq { bands, bypassed } => {
+            let bands = bands
+                .into_iter()
+                .map(|b| {
+                    let band = EqBandSpec {
+                        freq_hz: b.freq_hz,
+                        gain_db: b.gain_db,
+                        q: b.q,
+                    };
+                    validate_eq_band_shape(&band)?;
+                    Ok(band)
+                })
+                .collect::<Result<Vec<_>, ConfigError>>()?;
+            Ok(DspStageConfig {
+                spec: DspSpec::Eq { bands },
+                bypassed,
+            })
+        }
+        RawDspStage::Limiter { ceiling_db, bypassed } => Ok(DspStageConfig {
+            spec: DspSpec::Limiter { ceiling_db },
+            bypassed,
+        }),
+    }
+}
+
+/// Partial validation only — freq/Q sanity, not the nyquist upper bound
+/// (that needs the group's resolved sample rate, unknown until `engine`
+/// resolves the bus endpoint against a live device). `DspChain::new` catches
+/// the nyquist bound later as a `DomainError` — defense in depth, not
+/// duplicated logic, since this layer genuinely can't check it yet.
+fn validate_eq_band_shape(band: &EqBandSpec) -> Result<(), ConfigError> {
+    if band.freq_hz > 0.0 && band.q > 0.0 && band.q.is_finite() && band.gain_db.is_finite() {
+        Ok(())
+    } else {
+        Err(ConfigError::Invalid(format!(
+            "invalid EQ band: freq_hz {} and q {} must be positive and finite",
+            band.freq_hz, band.q
+        )))
+    }
+}
+
+/// Whole-snapshot duck validation (spec: "duck cycles, unknown triggers ...
+/// → ConfigError::Invalid"): every configured `trigger` name must resolve to
+/// another group in the same snapshot, and following the trigger chain from
+/// any duck-configured group must never lead back to itself.
+fn validate_duck_config(groups: &[GroupConfig]) -> Result<(), ConfigError> {
+    let names: std::collections::HashSet<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+    let trigger_of: std::collections::HashMap<&str, &str> = groups
+        .iter()
+        .filter_map(|g| g.duck.as_ref().map(|d| (g.name.as_str(), d.trigger.as_str())))
+        .collect();
+
+    for (name, trigger) in &trigger_of {
+        if !names.contains(trigger) {
+            return Err(ConfigError::Invalid(format!(
+                "group '{name}': duck trigger '{trigger}' not found"
+            )));
+        }
+    }
+
+    for &start in trigger_of.keys() {
+        let mut current = start;
+        for _ in 0..trigger_of.len() {
+            match trigger_of.get(current) {
+                Some(&next) if next == start => {
+                    return Err(ConfigError::Invalid(format!(
+                        "duck cycle detected involving group '{start}'"
+                    )));
+                }
+                Some(&next) => current = next,
+                None => break, // chain ends at a group with no duck config — no cycle through here
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn load(path: &Path) -> Result<ConfigSnapshot, ConfigError> {
@@ -96,6 +216,18 @@ pub(crate) fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
         .into_iter()
         .map(|g| {
             let gain = Gain::new(g.gain).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+            let dsp = g
+                .dsp
+                .into_iter()
+                .map(convert_dsp_stage)
+                .collect::<Result<Vec<_>, ConfigError>>()?;
+            let duck = g.duck.map(|d| DuckSpecConfig {
+                trigger: d.trigger,
+                amount_db: d.amount_db,
+                threshold_db: d.threshold_db,
+                attack_ms: d.attack_ms,
+                release_ms: d.release_ms,
+            });
             Ok(GroupConfig {
                 name: g.name,
                 bus_endpoint: g.bus_endpoint,
@@ -103,9 +235,12 @@ pub(crate) fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
                 gain,
                 follow_master: g.follow_master,
                 match_rules: g.match_rules,
+                dsp,
+                duck,
             })
         })
         .collect::<Result<Vec<_>, ConfigError>>()?;
+    validate_duck_config(&groups)?;
 
     let mute_master = raw
         .hotkeys
@@ -139,11 +274,16 @@ pub struct ConfigDelta {
     pub structural: bool,
     pub params: Vec<MixerCommand>,
     pub rules: Option<Vec<GroupRules>>,
+    /// Per-group DSP chain shape changes (a stage added/removed/reordered) —
+    /// funnels through `EngineHandle::apply_dsp_chains`'s RT-safe swap path,
+    /// not a full rebuild. A pure param tweak (existing stage's band/ceiling
+    /// value) or a bypass toggle stays in `params` instead (see `diff`).
+    pub dsp_chains: Option<Vec<(GroupId, Vec<DspSpec>)>>,
 }
 
 impl ConfigDelta {
     pub fn is_unchanged(&self) -> bool {
-        !self.structural && self.params.is_empty() && self.rules.is_none()
+        !self.structural && self.params.is_empty() && self.rules.is_none() && self.dsp_chains.is_none()
     }
 }
 
@@ -179,6 +319,7 @@ pub fn diff(old: &ConfigSnapshot, new: &ConfigSnapshot) -> ConfigDelta {
 
     let mut params = Vec::new();
     let mut rules_changed = false;
+    let mut dsp_chains: Vec<(GroupId, Vec<DspSpec>)> = Vec::new();
     if old.master != new.master {
         params.push(MixerCommand::SetMaster(new.master));
     }
@@ -200,12 +341,54 @@ pub fn diff(old: &ConfigSnapshot, new: &ConfigSnapshot) -> ConfigDelta {
         if o.match_rules != n.match_rules {
             rules_changed = true;
         }
+
+        // Stage count/type/order/param changed — an RT-safe chain swap, not
+        // a full rebuild (dsp-pipeline.md). Compared on `spec` only, so a
+        // pure bypass-flag flip (same specs) falls through to the dedicated
+        // check below instead of rebuilding the whole chain for it.
+        let o_specs: Vec<&DspSpec> = o.dsp.iter().map(|s| &s.spec).collect();
+        let n_specs: Vec<&DspSpec> = n.dsp.iter().map(|s| &s.spec).collect();
+        if o_specs != n_specs {
+            dsp_chains.push((id, n.dsp.iter().map(|s| s.spec.clone()).collect()));
+        } else {
+            for (stage, (ob, nb)) in o.dsp.iter().zip(n.dsp.iter()).enumerate() {
+                if ob.bypassed != nb.bypassed {
+                    params.push(MixerCommand::SetDspBypass {
+                        group: id,
+                        stage,
+                        bypassed: nb.bypassed,
+                    });
+                }
+            }
+        }
+
+        if o.duck != n.duck {
+            // Trigger name resolved against `new` (same positional `GroupId`
+            // convention as everywhere else here); an edit that names a
+            // trigger not found in `new` shouldn't reach `diff` at all
+            // (`validate_duck_config` at parse time is the real gate) — if
+            // it somehow does, drop to no-duck rather than guess.
+            let duck = n.duck.as_ref().and_then(|d| {
+                new.groups
+                    .iter()
+                    .position(|gg| gg.name == d.trigger)
+                    .map(|ti| DuckSpec {
+                        trigger: GroupId(ti as u16),
+                        amount_db: d.amount_db,
+                        threshold_db: d.threshold_db,
+                        attack_ms: d.attack_ms,
+                        release_ms: d.release_ms,
+                    })
+            });
+            params.push(MixerCommand::SetDuck { group: id, duck });
+        }
     }
 
     ConfigDelta {
         structural: false,
         params,
         rules: rules_changed.then(|| group_rules(new)),
+        dsp_chains: (!dsp_chains.is_empty()).then_some(dsp_chains),
     }
 }
 
@@ -297,6 +480,8 @@ mod tests {
             gain: Gain::new(gain).unwrap(),
             follow_master,
             match_rules: vec![],
+            dsp: Vec::new(),
+            duck: None,
         }
     }
 
@@ -570,6 +755,232 @@ mod tests {
             rules[1].rules,
             vec![MatchRule::Glob(engine::GlobPattern::new("music*.exe"))]
         );
+    }
+
+    #[test]
+    fn parses_eq_and_limiter_dsp_stages() {
+        let toml = r#"
+            schema_version = 2
+            master = 1.0
+
+            [[group]]
+            name = "Music"
+            bus_endpoint = "Bus"
+            output_device = "Out"
+
+            [[group.dsp]]
+            type = "eq"
+            bands = [{ freq_hz = 200.0, gain_db = 3.0, q = 0.7 }]
+
+            [[group.dsp]]
+            type = "limiter"
+            ceiling_db = -1.0
+            bypassed = true
+        "#;
+        let snapshot = parse(toml).unwrap();
+        let dsp = &snapshot.groups[0].dsp;
+        assert_eq!(dsp.len(), 2);
+        assert!(matches!(dsp[0].spec, DspSpec::Eq { .. }));
+        assert!(!dsp[0].bypassed);
+        assert!(matches!(dsp[1].spec, DspSpec::Limiter { ceiling_db } if ceiling_db == -1.0));
+        assert!(dsp[1].bypassed);
+    }
+
+    #[test]
+    fn eq_band_with_non_positive_q_is_invalid() {
+        let toml = r#"
+            schema_version = 2
+            master = 1.0
+
+            [[group]]
+            name = "Music"
+            bus_endpoint = "Bus"
+            output_device = "Out"
+
+            [[group.dsp]]
+            type = "eq"
+            bands = [{ freq_hz = 200.0, gain_db = 3.0, q = 0.0 }]
+        "#;
+        assert!(matches!(parse(toml), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn parses_duck_config() {
+        let toml = r#"
+            schema_version = 2
+            master = 1.0
+
+            [[group]]
+            name = "Voice"
+            bus_endpoint = "Bus1"
+            output_device = "Out"
+
+            [[group]]
+            name = "Music"
+            bus_endpoint = "Bus2"
+            output_device = "Out"
+
+            [group.duck]
+            trigger = "Voice"
+            amount_db = 12.0
+            threshold_db = -40.0
+            attack_ms = 5.0
+            release_ms = 200.0
+        "#;
+        let snapshot = parse(toml).unwrap();
+        let duck = snapshot.groups[1].duck.as_ref().expect("Music should have duck config");
+        assert_eq!(duck.trigger, "Voice");
+        assert_eq!(duck.amount_db, 12.0);
+    }
+
+    #[test]
+    fn unknown_duck_trigger_name_is_invalid() {
+        let toml = r#"
+            schema_version = 2
+            master = 1.0
+
+            [[group]]
+            name = "Music"
+            bus_endpoint = "Bus"
+            output_device = "Out"
+
+            [group.duck]
+            trigger = "Nonexistent"
+            amount_db = 12.0
+            threshold_db = -40.0
+            attack_ms = 5.0
+            release_ms = 200.0
+        "#;
+        assert!(matches!(parse(toml), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn a_duck_cycle_is_invalid() {
+        let toml = r#"
+            schema_version = 2
+            master = 1.0
+
+            [[group]]
+            name = "A"
+            bus_endpoint = "Bus1"
+            output_device = "Out"
+            [group.duck]
+            trigger = "B"
+            amount_db = 6.0
+            threshold_db = -40.0
+            attack_ms = 5.0
+            release_ms = 200.0
+
+            [[group]]
+            name = "B"
+            bus_endpoint = "Bus2"
+            output_device = "Out"
+            [group.duck]
+            trigger = "A"
+            amount_db = 6.0
+            threshold_db = -40.0
+            attack_ms = 5.0
+            release_ms = 200.0
+        "#;
+        assert!(matches!(parse(toml), Err(ConfigError::Invalid(_))));
+    }
+
+    fn group_with_dsp(name: &str, bus: &str, output: &str, dsp: Vec<DspStageConfig>) -> GroupConfig {
+        GroupConfig {
+            dsp,
+            ..group(name, bus, output, 1.0, true)
+        }
+    }
+
+    #[test]
+    fn diff_reports_dsp_chains_for_a_stage_shape_change() {
+        let a = ConfigSnapshot {
+            schema_version: 2,
+            master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
+            groups: vec![group_with_dsp("Game", "Bus", "Out", vec![])],
+        };
+        let b = ConfigSnapshot {
+            schema_version: 2,
+            master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
+            groups: vec![group_with_dsp(
+                "Game",
+                "Bus",
+                "Out",
+                vec![DspStageConfig {
+                    spec: DspSpec::Limiter { ceiling_db: -1.0 },
+                    bypassed: false,
+                }],
+            )],
+        };
+        let delta = diff(&a, &b);
+        assert!(!delta.structural);
+        let chains = delta.dsp_chains.expect("expected a dsp_chains delta");
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0].0, GroupId(0));
+        assert_eq!(chains[0].1, vec![DspSpec::Limiter { ceiling_db: -1.0 }]);
+    }
+
+    #[test]
+    fn diff_reports_a_fast_path_bypass_command_not_a_chain_rebuild_for_a_bypass_only_change() {
+        let stage = |bypassed: bool| DspStageConfig {
+            spec: DspSpec::Limiter { ceiling_db: -1.0 },
+            bypassed,
+        };
+        let a = ConfigSnapshot {
+            schema_version: 2,
+            master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
+            groups: vec![group_with_dsp("Game", "Bus", "Out", vec![stage(false)])],
+        };
+        let b = ConfigSnapshot {
+            schema_version: 2,
+            master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
+            groups: vec![group_with_dsp("Game", "Bus", "Out", vec![stage(true)])],
+        };
+        let delta = diff(&a, &b);
+        assert!(delta.dsp_chains.is_none(), "same spec shape must not trigger a chain rebuild");
+        assert_eq!(delta.params.len(), 1);
+        assert!(matches!(
+            delta.params[0],
+            MixerCommand::SetDspBypass { group: GroupId(0), stage: 0, bypassed: true }
+        ));
+    }
+
+    #[test]
+    fn diff_reports_a_set_duck_command_with_the_triggers_resolved_group_id() {
+        let a = ConfigSnapshot {
+            schema_version: 2,
+            master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
+            groups: vec![
+                group("Voice", "Bus1", "Out", 1.0, true),
+                group("Music", "Bus2", "Out", 1.0, true),
+            ],
+        };
+        let mut b = a.clone();
+        b.groups[1].duck = Some(DuckSpecConfig {
+            trigger: "Voice".into(),
+            amount_db: 12.0,
+            threshold_db: -40.0,
+            attack_ms: 5.0,
+            release_ms: 200.0,
+        });
+        let delta = diff(&a, &b);
+        assert!(!delta.structural);
+        assert!(delta.dsp_chains.is_none());
+        assert_eq!(delta.params.len(), 1);
+        assert!(matches!(
+            &delta.params[0],
+            MixerCommand::SetDuck { group: GroupId(1), duck: Some(d) } if d.trigger == GroupId(0)
+        ));
     }
 
     #[test]

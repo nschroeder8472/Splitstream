@@ -13,10 +13,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use toml_edit::{value, Array, ArrayOfTables, DocumentMut, Table};
+use toml_edit::{value, Array, ArrayOfTables, DocumentMut, Item, Table};
 
-use audio_core::{Gain, GroupId};
-use engine::{ConfigSnapshot, GroupConfig};
+use audio_core::{DspSpec, EqBandSpec, Gain, GroupId};
+use engine::{ConfigSnapshot, DuckSpecConfig, GroupConfig};
 
 use crate::config::{parse, ConfigError};
 
@@ -30,6 +30,12 @@ pub enum ConfigEdit {
     AddGroup(GroupConfig),
     RemoveGroup(String),
     SetRules(String, Vec<String>),
+    SetEqBand(String, usize, EqBandSpec),
+    SetLimiterCeiling(String, f32),
+    SetDuck(String, Option<DuckSpecConfig>),
+    SetDspBypass(String, usize, bool),
+    AddDspStage(String, DspSpec),
+    RemoveDspStage(String, usize),
 }
 
 #[derive(Debug)]
@@ -128,6 +134,63 @@ fn apply_edit(doc: &mut DocumentMut, edit: &ConfigEdit) -> Result<(), StoreError
         ConfigEdit::SetRules(name, rules) => {
             find_group_table(doc, name)?["match_rules"] = value(string_array(rules));
         }
+        ConfigEdit::SetEqBand(name, band, spec) => {
+            let group = find_group_table(doc, name)?;
+            let stage = find_dsp_stage_mut(group, name, "eq")?.ok_or_else(|| no_such_dsp_stage(name, "eq"))?;
+            let bands = stage["bands"]
+                .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
+                .as_array_of_tables_mut()
+                .ok_or_else(|| malformed_shape(name, "bands", "[[group.dsp.bands]]"))?;
+            let band_table = bands.get_mut(*band).ok_or_else(|| no_such_band(name, *band))?;
+            band_table["freq_hz"] = value(spec.freq_hz as f64);
+            band_table["gain_db"] = value(spec.gain_db as f64);
+            band_table["q"] = value(spec.q as f64);
+        }
+        ConfigEdit::SetLimiterCeiling(name, ceiling_db) => {
+            let group = find_group_table(doc, name)?;
+            let stage = find_dsp_stage_mut(group, name, "limiter")?
+                .ok_or_else(|| no_such_dsp_stage(name, "limiter"))?;
+            stage["ceiling_db"] = value(*ceiling_db as f64);
+        }
+        ConfigEdit::SetDspBypass(name, stage_idx, bypassed) => {
+            let group = find_group_table(doc, name)?;
+            let stage = dsp_array(group, name)?
+                .get_mut(*stage_idx)
+                .ok_or_else(|| no_such_dsp_stage_index(name, *stage_idx))?;
+            stage["bypassed"] = value(*bypassed);
+        }
+        ConfigEdit::AddDspStage(name, spec) => {
+            let group = find_group_table(doc, name)?;
+            let stage = dsp_stage_table(spec);
+            dsp_array(group, name)?.push(stage);
+        }
+        ConfigEdit::RemoveDspStage(name, stage_idx) => {
+            let group = find_group_table(doc, name)?;
+            let stages = dsp_array(group, name)?;
+            if *stage_idx >= stages.len() {
+                return Err(no_such_dsp_stage_index(name, *stage_idx));
+            }
+            stages.remove(*stage_idx);
+        }
+        ConfigEdit::SetDuck(name, duck) => {
+            let group = find_group_table(doc, name)?;
+            match duck {
+                Some(d) => {
+                    let t = group["duck"]
+                        .or_insert(Item::Table(Table::new()))
+                        .as_table_mut()
+                        .ok_or_else(|| malformed_shape(name, "duck", "[group.duck]"))?;
+                    t["trigger"] = value(d.trigger.as_str());
+                    t["amount_db"] = value(d.amount_db as f64);
+                    t["threshold_db"] = value(d.threshold_db as f64);
+                    t["attack_ms"] = value(d.attack_ms as f64);
+                    t["release_ms"] = value(d.release_ms as f64);
+                }
+                None => {
+                    group.remove("duck");
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -137,6 +200,78 @@ fn groups_array(doc: &mut DocumentMut) -> &mut ArrayOfTables {
         .or_insert(toml_edit::Item::ArrayOfTables(ArrayOfTables::new()))
         .as_array_of_tables_mut()
         .expect("`group` key must hold an array of tables")
+}
+
+/// Fallible, unlike `groups_array`: `dsp`/`bands`/`duck` are all keys a user
+/// can plausibly hand-write in an alternate-but-still-valid TOML shape (e.g.
+/// `dsp = [{...}]` as one inline array instead of `[[group.dsp]]` blocks) —
+/// `parse()` accepts either shape identically (serde doesn't care), but only
+/// the block form is `toml_edit`-editable as an `ArrayOfTables`/`Table` here.
+/// A live edit against the inline form must error, not panic (review finding,
+/// dsp-pipeline P5 — an inline-array `bands` list crashed `SetEqBand`).
+fn dsp_array<'a>(group: &'a mut Table, name: &str) -> Result<&'a mut ArrayOfTables, StoreError> {
+    group["dsp"]
+        .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
+        .as_array_of_tables_mut()
+        .ok_or_else(|| malformed_shape(name, "dsp", "[[group.dsp]]"))
+}
+
+fn find_dsp_stage_mut<'a>(
+    group: &'a mut Table,
+    name: &str,
+    stage_type: &str,
+) -> Result<Option<&'a mut Table>, StoreError> {
+    Ok(dsp_array(group, name)?
+        .iter_mut()
+        .find(|t| t.get("type").and_then(|v| v.as_str()) == Some(stage_type)))
+}
+
+fn malformed_shape(group: &str, key: &str, expected: &str) -> StoreError {
+    StoreError::Validation(ConfigError::Invalid(format!(
+        "group {group:?}: `{key}` must be written as `{expected}` blocks, not an inline array/table, to support live edits"
+    )))
+}
+
+fn dsp_stage_table(spec: &DspSpec) -> Table {
+    let mut t = Table::new();
+    match spec {
+        DspSpec::Eq { bands } => {
+            t["type"] = value("eq");
+            let mut arr = ArrayOfTables::new();
+            for b in bands {
+                let mut bt = Table::new();
+                bt["freq_hz"] = value(b.freq_hz as f64);
+                bt["gain_db"] = value(b.gain_db as f64);
+                bt["q"] = value(b.q as f64);
+                arr.push(bt);
+            }
+            t["bands"] = Item::ArrayOfTables(arr);
+        }
+        DspSpec::Limiter { ceiling_db } => {
+            t["type"] = value("limiter");
+            t["ceiling_db"] = value(*ceiling_db as f64);
+        }
+    }
+    t["bypassed"] = value(false);
+    t
+}
+
+fn no_such_dsp_stage(group: &str, stage_type: &str) -> StoreError {
+    StoreError::Validation(ConfigError::Invalid(format!(
+        "group {group:?} has no {stage_type} dsp stage"
+    )))
+}
+
+fn no_such_dsp_stage_index(group: &str, idx: usize) -> StoreError {
+    StoreError::Validation(ConfigError::Invalid(format!(
+        "group {group:?} has no dsp stage at index {idx}"
+    )))
+}
+
+fn no_such_band(group: &str, idx: usize) -> StoreError {
+    StoreError::Validation(ConfigError::Invalid(format!(
+        "group {group:?}'s eq stage has no band at index {idx}"
+    )))
 }
 
 fn find_group_table<'a>(doc: &'a mut DocumentMut, name: &str) -> Result<&'a mut Table, StoreError> {
@@ -158,6 +293,24 @@ fn group_table(g: &GroupConfig) -> Table {
     t["gain"] = value(g.gain.value() as f64);
     t["follow_master"] = value(g.follow_master);
     t["match_rules"] = value(string_array(&g.match_rules));
+    if !g.dsp.is_empty() {
+        let mut arr = ArrayOfTables::new();
+        for stage in &g.dsp {
+            let mut st = dsp_stage_table(&stage.spec);
+            st["bypassed"] = value(stage.bypassed);
+            arr.push(st);
+        }
+        t["dsp"] = Item::ArrayOfTables(arr);
+    }
+    if let Some(d) = &g.duck {
+        let mut dt = Table::new();
+        dt["trigger"] = value(d.trigger.as_str());
+        dt["amount_db"] = value(d.amount_db as f64);
+        dt["threshold_db"] = value(d.threshold_db as f64);
+        dt["attack_ms"] = value(d.attack_ms as f64);
+        dt["release_ms"] = value(d.release_ms as f64);
+        t["duck"] = Item::Table(dt);
+    }
     t
 }
 
@@ -261,6 +414,8 @@ follow_master = true
             gain: Gain::UNITY,
             follow_master: true,
             match_rules: vec!["chat.exe".into()],
+            dsp: Vec::new(),
+            duck: None,
         };
         let snapshot = store.apply(&[ConfigEdit::AddGroup(added)]).unwrap();
         assert_eq!(snapshot.groups.len(), 2);
@@ -301,5 +456,197 @@ follow_master = true
         let snapshot = parse(BASE).unwrap();
         assert_eq!(group_id_for(&snapshot, "Game"), Some(GroupId(0)));
         assert_eq!(group_id_for(&snapshot, "Nonexistent"), None);
+    }
+
+    #[test]
+    fn add_dsp_stage_then_set_eq_band_and_limiter_ceiling_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let eq = DspSpec::Eq {
+            bands: vec![EqBandSpec {
+                freq_hz: 200.0,
+                gain_db: 3.0,
+                q: 0.7,
+            }],
+        };
+        let limiter = DspSpec::Limiter { ceiling_db: -1.0 };
+        let snapshot = store
+            .apply(&[
+                ConfigEdit::AddDspStage("Game".into(), eq),
+                ConfigEdit::AddDspStage("Game".into(), limiter),
+            ])
+            .unwrap();
+        assert_eq!(snapshot.groups[0].dsp.len(), 2);
+
+        let snapshot = store
+            .apply(&[
+                ConfigEdit::SetEqBand(
+                    "Game".into(),
+                    0,
+                    EqBandSpec {
+                        freq_hz: 500.0,
+                        gain_db: -2.0,
+                        q: 1.2,
+                    },
+                ),
+                ConfigEdit::SetLimiterCeiling("Game".into(), -3.0),
+            ])
+            .unwrap();
+
+        match &snapshot.groups[0].dsp[0].spec {
+            DspSpec::Eq { bands } => {
+                assert_eq!(bands[0].freq_hz, 500.0);
+                assert_eq!(bands[0].q, 1.2);
+            }
+            _ => panic!("expected the eq stage at index 0"),
+        }
+        match &snapshot.groups[0].dsp[1].spec {
+            DspSpec::Limiter { ceiling_db } => assert_eq!(*ceiling_db, -3.0),
+            _ => panic!("expected the limiter stage at index 1"),
+        }
+    }
+
+    #[test]
+    fn set_dsp_bypass_then_remove_dsp_stage_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        store
+            .apply(&[ConfigEdit::AddDspStage(
+                "Game".into(),
+                DspSpec::Limiter { ceiling_db: -1.0 },
+            )])
+            .unwrap();
+
+        let snapshot = store
+            .apply(&[ConfigEdit::SetDspBypass("Game".into(), 0, true)])
+            .unwrap();
+        assert!(snapshot.groups[0].dsp[0].bypassed);
+
+        let snapshot = store
+            .apply(&[ConfigEdit::RemoveDspStage("Game".into(), 0)])
+            .unwrap();
+        assert!(snapshot.groups[0].dsp.is_empty());
+    }
+
+    #[test]
+    fn set_eq_band_on_a_group_with_no_eq_stage_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let result = store.apply(&[ConfigEdit::SetEqBand(
+            "Game".into(),
+            0,
+            EqBandSpec {
+                freq_hz: 200.0,
+                gain_db: 0.0,
+                q: 0.7,
+            },
+        )]);
+        assert!(matches!(result, Err(StoreError::Validation(_))));
+    }
+
+    const BASE_TWO_GROUPS: &str = r#"
+schema_version = 2
+master = 0.8
+
+[[group]]
+name = "Game"
+bus_endpoint = "Bus 1"
+output_device = "Speakers"
+
+[[group]]
+name = "Voice"
+bus_endpoint = "Bus 2"
+output_device = "Speakers"
+"#;
+
+    #[test]
+    fn set_duck_then_clear_duck_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE_TWO_GROUPS);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let snapshot = store
+            .apply(&[ConfigEdit::SetDuck(
+                "Game".into(),
+                Some(DuckSpecConfig {
+                    trigger: "Voice".into(),
+                    amount_db: 6.0,
+                    threshold_db: -40.0,
+                    attack_ms: 5.0,
+                    release_ms: 200.0,
+                }),
+            )])
+            .unwrap();
+        let duck = snapshot.groups[0].duck.as_ref().expect("duck should be set");
+        assert_eq!(duck.trigger, "Voice");
+
+        let snapshot = store.apply(&[ConfigEdit::SetDuck("Game".into(), None)]).unwrap();
+        assert!(snapshot.groups[0].duck.is_none());
+    }
+
+    #[test]
+    fn set_eq_band_against_a_hand_written_inline_array_bands_shape_errors_not_panics() {
+        // Regression test for a review finding: `bands = [{...}]` (a valid,
+        // parseable TOML shape — serde doesn't distinguish it from
+        // `[[group.dsp.bands]]`) used to panic `SetEqBand` via an `.expect()`
+        // on `as_array_of_tables_mut()`. Must return a StoreError instead.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(
+            dir.path(),
+            r#"
+schema_version = 2
+master = 1.0
+
+[[group]]
+name = "Game"
+bus_endpoint = "Bus"
+output_device = "Out"
+
+[[group.dsp]]
+type = "eq"
+bands = [{ freq_hz = 200.0, gain_db = 3.0, q = 0.7 }]
+"#,
+        );
+        let mut store = ConfigStore::open(&path).unwrap();
+        let result = store.apply(&[ConfigEdit::SetEqBand(
+            "Game".into(),
+            0,
+            EqBandSpec {
+                freq_hz: 500.0,
+                gain_db: 1.0,
+                q: 1.0,
+            },
+        )]);
+        assert!(matches!(result, Err(StoreError::Validation(_))));
+    }
+
+    #[test]
+    fn add_dsp_stage_against_a_hand_written_inline_array_dsp_shape_errors_not_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(
+            dir.path(),
+            r#"
+schema_version = 2
+master = 1.0
+
+[[group]]
+name = "Game"
+bus_endpoint = "Bus"
+output_device = "Out"
+dsp = [{ type = "limiter", ceiling_db = -1.0 }]
+"#,
+        );
+        let mut store = ConfigStore::open(&path).unwrap();
+        let result = store.apply(&[ConfigEdit::AddDspStage(
+            "Game".into(),
+            DspSpec::Limiter { ceiling_db: -2.0 },
+        )]);
+        assert!(matches!(result, Err(StoreError::Validation(_))));
     }
 }

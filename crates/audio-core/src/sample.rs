@@ -16,6 +16,10 @@ pub enum DomainError {
     InvalidResampleRatio(f64),
     #[error("format has {channels} channels but its layout describes {layout_count}")]
     InvalidLayout { channels: u16, layout_count: u16 },
+    #[error("invalid EQ band: freq {freq_hz}Hz must be in (0, nyquist) and q {q} must be positive")]
+    InvalidEqBand { freq_hz: f32, q: f32 },
+    #[error("group {group:?}'s duck triggers {trigger:?}, which is not in the topology")]
+    DanglingDuckTrigger { group: GroupId, trigger: GroupId },
 }
 
 /// WASAPI `SPEAKER_*` bit values (mmreg.h / ksmedia.h) — this is the same
@@ -172,6 +176,18 @@ pub struct GroupId(pub u16);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OutputId(pub u16);
 
+/// Cross-group sidechain config for the mixer-level `Ducker` (P5) — configured
+/// on the **target** group: "this group's level drops when `trigger` carries
+/// signal." See `.lattice/context/dsp-pipeline.md`'s ducking-topology decision.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DuckSpec {
+    pub trigger: GroupId,
+    pub amount_db: f32,
+    pub threshold_db: f32,
+    pub attack_ms: f32,
+    pub release_ms: f32,
+}
+
 #[derive(Debug, Clone)]
 pub struct GroupSpec {
     pub id: GroupId,
@@ -179,6 +195,11 @@ pub struct GroupSpec {
     pub follow_master: bool,
     pub output: OutputId,
     pub input_format: Format,
+    /// Per-group DSP chain (EQ, limiter), pre-allocated at `Mixer::new`/rebuild
+    /// time — runs after gain, before the channel matrix (notes §17: DSP stays
+    /// at source layout).
+    pub dsp: Vec<crate::dsp::DspSpec>,
+    pub duck: Option<DuckSpec>,
 }
 
 #[derive(Debug, Clone)]
