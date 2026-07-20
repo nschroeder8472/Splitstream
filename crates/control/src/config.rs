@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use audio_core::{Gain, GroupId, MixerCommand};
-use engine::{ConfigSnapshot, GroupConfig};
+use engine::{ConfigSnapshot, GroupConfig, GroupRules, MatchRule};
 
 pub const SUPPORTED_SCHEMA_VERSION: u32 = 2;
 
@@ -96,10 +96,40 @@ fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
     })
 }
 
-pub enum ConfigDelta {
-    Params(Vec<MixerCommand>),
-    Structural,
-    Unchanged,
+/// Struct, not a flat enum (session-routing 2026-07-20 decision): a single
+/// config save can change a gain (`params`) and a match rule (`rules`) at
+/// once, and both must reach the caller from one `diff()` call — a flat
+/// enum can only carry one variant, silently dropping whichever axis it
+/// doesn't return. `structural` short-circuits the other two fields (a
+/// rebuild makes positional `GroupId`s and any params/rules delta for the
+/// pre-rebuild topology moot).
+#[derive(Default)]
+pub struct ConfigDelta {
+    pub structural: bool,
+    pub params: Vec<MixerCommand>,
+    pub rules: Option<Vec<GroupRules>>,
+}
+
+impl ConfigDelta {
+    pub fn is_unchanged(&self) -> bool {
+        !self.structural && self.params.is_empty() && self.rules.is_none()
+    }
+}
+
+/// `GroupRules` for every group in `snapshot`, in config order — the same
+/// positional `GroupId` convention `engine::graph::resolve` and `diff` use.
+/// Used both by `diff` (when `match_rules` changed) and by callers building
+/// the initial `Vec<GroupRules>` for `start_routing`/`update_topology`.
+pub fn group_rules(snapshot: &ConfigSnapshot) -> Vec<GroupRules> {
+    snapshot
+        .groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| GroupRules {
+            group: GroupId(i as u16),
+            rules: g.match_rules.iter().map(|r| MatchRule::parse(r)).collect(),
+        })
+        .collect()
 }
 
 /// `GroupId`s are derived from group position, matching `engine::graph::resolve`'s
@@ -110,31 +140,41 @@ pub fn diff(old: &ConfigSnapshot, new: &ConfigSnapshot) -> ConfigDelta {
     let old_names: Vec<&str> = old.groups.iter().map(|g| g.name.as_str()).collect();
     let new_names: Vec<&str> = new.groups.iter().map(|g| g.name.as_str()).collect();
     if old_names != new_names {
-        return ConfigDelta::Structural;
+        return ConfigDelta {
+            structural: true,
+            ..ConfigDelta::default()
+        };
     }
 
-    let mut cmds = Vec::new();
+    let mut params = Vec::new();
+    let mut rules_changed = false;
     if old.master != new.master {
-        cmds.push(MixerCommand::SetMaster(new.master));
+        params.push(MixerCommand::SetMaster(new.master));
     }
 
     for (i, (o, n)) in old.groups.iter().zip(new.groups.iter()).enumerate() {
         if o.bus_endpoint != n.bus_endpoint || o.output_device != n.output_device {
-            return ConfigDelta::Structural;
+            return ConfigDelta {
+                structural: true,
+                ..ConfigDelta::default()
+            };
         }
         let id = GroupId(i as u16);
         if o.gain != n.gain {
-            cmds.push(MixerCommand::SetGroupGain(id, n.gain));
+            params.push(MixerCommand::SetGroupGain(id, n.gain));
         }
         if o.follow_master != n.follow_master {
-            cmds.push(MixerCommand::SetFollowMaster(id, n.follow_master));
+            params.push(MixerCommand::SetFollowMaster(id, n.follow_master));
+        }
+        if o.match_rules != n.match_rules {
+            rules_changed = true;
         }
     }
 
-    if cmds.is_empty() {
-        ConfigDelta::Unchanged
-    } else {
-        ConfigDelta::Params(cmds)
+    ConfigDelta {
+        structural: false,
+        params,
+        rules: rules_changed.then(|| group_rules(new)),
     }
 }
 
@@ -282,6 +322,20 @@ mod tests {
         assert!(matches!(result, Err(ConfigError::Io(_))));
     }
 
+    fn group_with_rules(
+        name: &str,
+        bus: &str,
+        output: &str,
+        gain: f32,
+        follow_master: bool,
+        rules: &[&str],
+    ) -> GroupConfig {
+        GroupConfig {
+            match_rules: rules.iter().map(|r| r.to_string()).collect(),
+            ..group(name, bus, output, gain, follow_master)
+        }
+    }
+
     #[test]
     fn diff_reports_unchanged_for_identical_snapshots() {
         let a = ConfigSnapshot {
@@ -294,7 +348,7 @@ mod tests {
             master: Gain::UNITY,
             groups: vec![group("Game", "Bus", "Out", 1.0, true)],
         };
-        assert!(matches!(diff(&a, &b), ConfigDelta::Unchanged));
+        assert!(diff(&a, &b).is_unchanged());
     }
 
     #[test]
@@ -309,13 +363,11 @@ mod tests {
             master: Gain::UNITY,
             groups: vec![group("Game", "Bus", "Out", 0.5, true)],
         };
-        match diff(&a, &b) {
-            ConfigDelta::Params(cmds) => {
-                assert_eq!(cmds.len(), 1);
-                assert!(matches!(cmds[0], MixerCommand::SetGroupGain(GroupId(0), _)));
-            }
-            _ => panic!("expected Params"),
-        }
+        let delta = diff(&a, &b);
+        assert!(!delta.structural);
+        assert!(delta.rules.is_none());
+        assert_eq!(delta.params.len(), 1);
+        assert!(matches!(delta.params[0], MixerCommand::SetGroupGain(GroupId(0), _)));
     }
 
     #[test]
@@ -330,7 +382,10 @@ mod tests {
             master: Gain::UNITY,
             groups: vec![group("Music", "Bus", "Out", 1.0, true)],
         };
-        assert!(matches!(diff(&a, &b), ConfigDelta::Structural));
+        let delta = diff(&a, &b);
+        assert!(delta.structural);
+        assert!(delta.params.is_empty());
+        assert!(delta.rules.is_none());
     }
 
     #[test]
@@ -345,7 +400,71 @@ mod tests {
             master: Gain::UNITY,
             groups: vec![group("Game", "Bus", "Headphones", 1.0, true)],
         };
-        assert!(matches!(diff(&a, &b), ConfigDelta::Structural));
+        assert!(diff(&a, &b).structural);
+    }
+
+    #[test]
+    fn diff_reports_rules_for_a_match_rules_only_change() {
+        let a = ConfigSnapshot {
+            schema_version: 2,
+            master: Gain::UNITY,
+            groups: vec![group_with_rules("Game", "Bus", "Out", 1.0, true, &[])],
+        };
+        let b = ConfigSnapshot {
+            schema_version: 2,
+            master: Gain::UNITY,
+            groups: vec![group_with_rules("Game", "Bus", "Out", 1.0, true, &["game.exe"])],
+        };
+        let delta = diff(&a, &b);
+        assert!(!delta.structural);
+        assert!(delta.params.is_empty());
+        let rules = delta.rules.expect("expected a rules delta");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].group, GroupId(0));
+        assert_eq!(rules[0].rules, vec![MatchRule::ExactName("game.exe".into())]);
+    }
+
+    #[test]
+    fn diff_reports_both_params_and_rules_for_a_simultaneous_edit() {
+        // Regression case for the ConfigDelta restructure: a single save
+        // changing both a gain and a match rule must not silently drop
+        // either half (the flat-enum shape this replaced could only return one).
+        let a = ConfigSnapshot {
+            schema_version: 2,
+            master: Gain::UNITY,
+            groups: vec![group_with_rules("Game", "Bus", "Out", 1.0, true, &[])],
+        };
+        let b = ConfigSnapshot {
+            schema_version: 2,
+            master: Gain::UNITY,
+            groups: vec![group_with_rules("Game", "Bus", "Out", 0.5, true, &["game.exe"])],
+        };
+        let delta = diff(&a, &b);
+        assert!(!delta.structural);
+        assert_eq!(delta.params.len(), 1);
+        assert!(matches!(delta.params[0], MixerCommand::SetGroupGain(GroupId(0), _)));
+        assert!(delta.rules.is_some(), "rules change must not be dropped");
+    }
+
+    #[test]
+    fn group_rules_builds_one_entry_per_group_in_config_order() {
+        let snapshot = ConfigSnapshot {
+            schema_version: 2,
+            master: Gain::UNITY,
+            groups: vec![
+                group_with_rules("Game", "Bus", "Out", 1.0, true, &["game.exe"]),
+                group_with_rules("Music", "Bus", "Out", 1.0, true, &["music*.exe"]),
+            ],
+        };
+        let rules = group_rules(&snapshot);
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].group, GroupId(0));
+        assert_eq!(rules[0].rules, vec![MatchRule::ExactName("game.exe".into())]);
+        assert_eq!(rules[1].group, GroupId(1));
+        assert_eq!(
+            rules[1].rules,
+            vec![MatchRule::Glob(engine::GlobPattern::new("music*.exe"))]
+        );
     }
 
     #[test]

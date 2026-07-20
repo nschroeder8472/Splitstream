@@ -7,7 +7,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
 use std::time::Duration;
 
-use control::{diff, load, ConfigDelta, ConfigWatcher};
+use control::{diff, load, ConfigWatcher};
 use engine::ports::AudioSystem;
 use win_audio::WasapiSystem;
 
@@ -65,19 +65,19 @@ fn main() {
     while !stop.load(Ordering::Relaxed) {
         match config_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(new_snapshot) => {
-                match diff(&current, &new_snapshot) {
-                    ConfigDelta::Unchanged => {}
-                    ConfigDelta::Params(cmds) => {
-                        if let Err(e) = handle.apply_params(&cmds) {
-                            eprintln!("apply_params failed: {e:?}");
-                        }
+                let delta = diff(&current, &new_snapshot);
+                if delta.structural {
+                    if let Err(e) = handle.rebuild(&new_snapshot) {
+                        eprintln!("rebuild failed: {e:?}");
                     }
-                    ConfigDelta::Structural => {
-                        if let Err(e) = handle.rebuild(&new_snapshot) {
-                            eprintln!("rebuild failed: {e:?}");
-                        }
+                } else if !delta.params.is_empty() {
+                    if let Err(e) = handle.apply_params(&delta.params) {
+                        eprintln!("apply_params failed: {e:?}");
                     }
                 }
+                // delta.rules: session routing isn't wired into this minimal
+                // binary yet — RoutingCoordinator wiring is P4/app-shell scope,
+                // same as tray/UI (see .lattice/context/session-routing.md).
                 current = new_snapshot;
             }
             Err(RecvTimeoutError::Timeout) => {}

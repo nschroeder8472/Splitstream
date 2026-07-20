@@ -26,7 +26,9 @@ pub struct GroupConfig {
     pub output_device: String,
     pub gain: Gain,
     pub follow_master: bool,
-    pub match_rules: Vec<String>, // unused until P3 (session-routing)
+    /// Raw config strings — parsed into `rules::MatchRule` by `control::group_rules`,
+    /// not here (this type only mirrors the TOML shape; see session-routing.md).
+    pub match_rules: Vec<String>,
 }
 
 /// Config with names resolved to endpoint ids, ready for `runtime` to open
