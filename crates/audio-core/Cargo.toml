@@ -1,0 +1,8 @@
+[package]
+name = "audio-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rubato = "0.15"
+thiserror = "2.0.19"

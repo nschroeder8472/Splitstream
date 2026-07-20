@@ -1,0 +1,14 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "splitstream"
+path = "src/main.rs"
+
+[dependencies]
+control = { version = "0.1.0", path = "../control" }
+ctrlc = "3.5.2"
+engine = { version = "0.1.0", path = "../engine" }
+win-audio = { version = "0.1.0", path = "../win-audio" }

@@ -20,11 +20,18 @@ Experiential patterns from practice. Complements standards (what should be) with
 
 ## Implementation Craft
 
+- 2026-07-19 [implementation] When a blueprint's contract references a type documented under a sibling component that the build order constructs later, relocate the type to the earlier-built *consumer* rather than reordering the build or fully decoupling — same interface-at-consumer idiom as port traits, extended to config/DTO types.
+- 2026-07-19 [implementation] For unfamiliar or fast-moving external crate APIs (major-version churn), verify exact signatures by writing the call and reading the real compiler error, not from memory or pre-written notes — notes can predate a dependency's breaking change; the compiler is ground truth. When a crate's own docs aren't browsable in-session, this is also faster than hunting for docs.
+- 2026-07-19 [implementation] Before committing to a dependency's latest major version, check for accidental package-name collisions in its transitive tree (an external crate can happen to share your own workspace crate's name) — breaks `cargo build/test -p <name>`. Pinning to an older minor that matches already-written internal documentation can dodge both the collision and an API rewrite at once.
+- 2026-07-19 [implementation] RAII guards for OS thread-affine resources (COM apartments, etc.) can't be struct fields on a type required to be `Send + Sync` — use a lazy per-thread `thread_local!` initializer called at the top of every method that touches the resource instead.
+- 2026-07-19 [implementation] Real-time thread orchestration functions (open ports → compute timing → build the mixer → spawn N thread kinds → assemble a handle) accrete responsibilities fast and quietly cross the parameter-count/size thresholds — `#[allow(clippy::too_many_arguments)]` on a hot function is a signal to extract a context struct right then, not a thing to suppress and revisit later. Caught one review cycle later than it should have been.
+
 ## Quality Signals
 
 ## Reliability
 
 - 2026-07-18 [design] For unreliable/undocumented APIs: first failure → flag + single notice + skip further calls; retry only on deliberate user action. No retry storms, no silent spam.
 - 2026-07-18 [design] Cross-feeding computations: fix producer-before-consumer order within a cycle/block and reject dependency cycles at validation time — determinism by construction, not runtime checks.
+- 2026-07-19 [reliability] Real hardware/OS smoke tests (marked ignored, run explicitly during development, not in normal CI) catch API-shape and integration mistakes that mocks structurally cannot — worth writing per platform-boundary component even when the permanent suite can't run them unattended.
 
 ## Structural Health
