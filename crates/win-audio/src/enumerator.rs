@@ -12,7 +12,7 @@
 use windows::core::PWSTR;
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Media::Audio::{
-    eRender, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
+    eConsole, eRender, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, DEVICE_STATE_ACTIVE,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL, STGM_READ};
 
@@ -58,6 +58,42 @@ impl EndpointEnumerator {
             Ok(endpoints)
         }
     }
+
+    /// `default_output()` port method (drift-and-recovery L4): the recovery
+    /// supervisor's fallback target on device removal. `eConsole`, not
+    /// `eMultimedia`/`eCommunications` — matches what most apps (and the
+    /// user's system volume mixer) treat as "the default device".
+    pub fn default_output(&self) -> Result<Endpoint, PortError> {
+        crate::com::ensure_initialized().map_err(|e| PortError::Backend(e.to_string()))?;
+        unsafe {
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                    .map_err(|e| PortError::Backend(e.to_string()))?;
+            let device = enumerator
+                .GetDefaultAudioEndpoint(eRender, eConsole)
+                .map_err(|e| PortError::Backend(e.to_string()))?;
+            describe_device(&device, &self.bus_name_prefix)?.ok_or_else(|| {
+                PortError::Backend("default render endpoint has no usable mix format".into())
+            })
+        }
+    }
+
+    pub(crate) fn bus_name_prefix(&self) -> &str {
+        &self.bus_name_prefix
+    }
+}
+
+/// Opens and describes one endpoint by id — used by the device-change
+/// monitor (`monitor.rs`) to turn the bare device-id string an
+/// `IMMNotificationClient` callback hands us into a full `Endpoint` for
+/// `DeviceEvent::Added`.
+pub(crate) fn describe_device_by_id(
+    id: &EndpointId,
+    bus_name_prefix: &str,
+) -> Result<Option<Endpoint>, PortError> {
+    crate::com::ensure_initialized().map_err(|e| PortError::Backend(e.to_string()))?;
+    let device = crate::device::open(id)?;
+    unsafe { describe_device(&device, bus_name_prefix) }
 }
 
 /// Reads id/name/format for one device and classifies it. Returns `Ok(None)`

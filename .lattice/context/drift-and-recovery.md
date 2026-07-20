@@ -2,7 +2,7 @@
 feature: drift-and-recovery
 requirement_doc: Splitstream-Engineering-Spec.md
 created: 2026-07-18
-status: approved
+status: complete
 ---
 
 # Drift and Recovery (P2)
@@ -184,6 +184,22 @@ impl DriftController {
 | crates/audio-core/src/sample.rs | `ResampleRatio`, `MIN`/`MAX_RESAMPLE_RATIO` |
 | crates/audio-core/src/resample.rs | `Src` rewritten around `rubato::SincFixedIn` (variable-ratio) + `set_ratio` glide |
 | crates/audio-core/src/mixer.rs | `MixerCommand::SetOutputRatio` (fans out to every group's `Src` on that output) |
+| crates/engine/src/clock.rs | `DriftController` — pure PI loop, `FillSample` idle guard, anti-windup |
+| crates/engine/src/runtime.rs | Recovery supervisor (`supervisor_loop`, `handle_endpoint_lost`, `handle_device_added`), `EngineEvent`, `Persistent.overrides`/`canonical_snapshot`, RT-thread fault channel, per-tick `dead_endpoints`/`added_endpoints` dedup |
+| crates/engine/src/graph.rs | `resolve(..., parked)` — parked groups excluded, `GroupId`s stay stable across a rebuild |
+| crates/engine/src/ports/mod.rs | `DeviceEvent`, `AudioSystem::{default_output, subscribe_device_events}` |
+| crates/engine/src/ports/mock.rs | `MockSystem` test hooks: `remove_endpoint`/`add_endpoint`/`emit_device_event`/`invalidate_render`/`set_default_output` |
+| crates/win-audio/src/monitor.rs | `IMMNotificationClient` wrapper (`DeviceMonitor`, `NotificationSink`) → `DeviceEvent` channel |
+| crates/win-audio/src/enumerator.rs | `EndpointEnumerator::default_output`, `describe_device_by_id` (shared with the monitor) |
+| crates/win-audio/src/system.rs | `WasapiSystem` wires `default_output`/`subscribe_device_events` into `AudioSystem` |
+
+## Implementation Notes (win-audio, P2 layer)
+
+- **`windows-core` needed as a *direct* dependency, not just transitive via `windows`.** The `#[implement(IMMNotificationClient)]` macro (windows-rs's COM callback codegen) expands to absolute `::windows_core::...` paths — those only resolve if `windows-core` is in this crate's own extern prelude, which requires it as a direct `Cargo.toml` dependency at the same version `windows` itself pins internally (0.62.2). Without it: `E0433 could not find windows_core`. Not documented anywhere obvious in windows-rs's own docs — found by reading the macro's generated-code error.
+- **`DeviceMonitor` (holding `IMMDeviceEnumerator` + `IMMNotificationClient`) needed an explicit `unsafe impl Send`.** windows-rs COM interface wrappers are `!Send`/`!Sync` by default (raw pointer inside). Sound here for the same reason `WasapiRender`/`WasapiCapture` already carry the identical annotation: every thread that touches COM in this crate joins the MTA via `com::ensure_initialized` first, and both interfaces were `CoCreateInstance`'d under `CLSCTX_ALL` on an MTA thread — MTA objects are safe to call from any MTA thread, not just their creator. `WasapiSystem` only ever touches `DeviceMonitor` behind a `Mutex`, so no concurrent-access story needed beyond the cross-thread move.
+- **`OnDefaultDeviceChanged`/`default_output()` both scope to `(eRender, eConsole)`**, not `eMultimedia`/`eCommunications` — matches what the OS's own default-device concept and most apps mean by "the default device". Not spec-mandated (spec is silent on role), but the natural reading of "fallback target on removal" (design decision log, L3 interaction B).
+- **`OnDeviceAdded` only gets a bare device-id string from the OS** — `DeviceEvent::Added` needs a full `Endpoint` (id, name, kind, format), so the handler calls `enumerator::describe_device_by_id` (opens the device + probes mix format + classifies bus/physical). **Caught in review, fixed before this landed:** the first version called that synchronously *inside* the `IMMNotificationClient` callback — `describe_device_by_id` calls back into `IMMDeviceEnumerator::GetDevice`, and MSDN's `IMMNotificationClient` remarks explicitly warn that calling `GetDevice`/`EnumAudioEndpoints`/`GetDefaultAudioEndpoint` back into the enumerator synchronously from within a notification callback can deadlock the OS's shared notification thread — process-wide, not just this app. Fixed by spawning a short-lived worker thread from the callback to do the describe + send; the callback itself now only captures the device id and returns immediately. A device that fails to describe (format not ready yet, transient) is silently skipped rather than surfaced as a malformed event — `enumerate()` on the next rebuild picks it up once it settles.
+- **Validated against real hardware**, not just `MockSystem`: `default_output()` returns the actual live default endpoint (`cargo test -p win-audio -- --ignored default_output_returns_a_real_physical_endpoint`); `subscribe_device_events()` has an `--ignored --nocapture` manual smoke test for plug/unplug (can't assert automatically — no hardware to script in CI).
 
 ## Implementation Notes (audio-core, P2 layer)
 

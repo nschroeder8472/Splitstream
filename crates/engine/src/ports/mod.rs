@@ -2,6 +2,7 @@
 //! because `win-audio` carries `windows-rs` — this crate (and its graph
 //! logic) must compile and unit-test on any platform (spec §6, N5).
 
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 use audio_core::Format;
@@ -9,7 +10,7 @@ use audio_core::Format;
 #[cfg(any(test, feature = "test-support"))]
 pub mod mock;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EndpointId(pub String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +32,15 @@ pub enum PortError {
     DeviceInvalidated,
     NotFound(EndpointId),
     Backend(String),
+}
+
+/// `IMMNotificationClient` events, typed and decoupled from COM (drift-and-recovery L4).
+#[derive(Debug, Clone, PartialEq)]
+pub enum DeviceEvent {
+    Added(Endpoint),
+    Removed(EndpointId),
+    DefaultChanged(EndpointId),
+    StateChanged(EndpointId),
 }
 
 /// RAII thread-priority promotion (MMCSS "Pro Audio" in the real `win-audio`
@@ -66,6 +76,12 @@ pub trait AudioSystem: Send + Sync {
     fn open_capture(&self, id: &EndpointId) -> Result<Box<dyn CapturePort>, PortError>;
     fn open_render(&self, id: &EndpointId) -> Result<Box<dyn RenderPort>, PortError>;
     fn promote_rt_thread(&self) -> RtGuard;
+    /// Current default render endpoint — the supervisor's fallback target on device removal.
+    fn default_output(&self) -> Result<Endpoint, PortError>;
+    /// `IMMNotificationClient` wrapper behind a std channel (drift-and-recovery decision:
+    /// facade method, not a second port trait — single consumer, the recovery supervisor).
+    /// Callable once; a second call replaces the previous subscription in real `win-audio`.
+    fn subscribe_device_events(&self) -> Result<Receiver<DeviceEvent>, PortError>;
 }
 
 /// Polled ~period/2 (spec Appendix A) — loopback event mode is historically unreliable.

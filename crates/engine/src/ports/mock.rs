@@ -1,33 +1,93 @@
 //! Fake `AudioSystem` + ports. This is why the port traits live in `engine`,
 //! not `win-audio`: the whole graph runs on any platform against these fakes.
 
+use std::collections::HashMap;
 use std::f32::consts::TAU;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use audio_core::Format;
 
-use super::{AudioSystem, CapturePort, Endpoint, EndpointId, PortError, RenderPort, RtGuard};
+use super::{
+    AudioSystem, CapturePort, DeviceEvent, Endpoint, EndpointId, EndpointKind, PortError,
+    RenderPort, RtGuard,
+};
 
 pub struct MockSystem {
-    endpoints: Vec<Endpoint>,
+    /// `Mutex`, not a plain `Vec`: recovery-path tests simulate a device
+    /// disappearing/reappearing mid-run via `remove_endpoint`/`add_endpoint`,
+    /// observed by the engine's next `enumerate()` call on rebuild.
+    endpoints: Mutex<Vec<Endpoint>>,
+    default_output: Mutex<Option<EndpointId>>,
+    events: Mutex<Option<mpsc::Sender<DeviceEvent>>>,
+    /// One flag per currently-open render port, keyed by endpoint id —
+    /// `invalidate_render` flips it so the *already-running* `SinkRender`
+    /// fails on its next `wait_event`, simulating a real mid-stream format
+    /// change (as opposed to a device that's actually gone).
+    render_invalidated: Mutex<HashMap<EndpointId, Arc<AtomicBool>>>,
 }
 
 impl MockSystem {
     pub fn new(endpoints: Vec<Endpoint>) -> MockSystem {
-        MockSystem { endpoints }
+        MockSystem {
+            endpoints: Mutex::new(endpoints),
+            default_output: Mutex::new(None),
+            events: Mutex::new(None),
+            render_invalidated: Mutex::new(HashMap::new()),
+        }
     }
 
-    fn find(&self, id: &EndpointId) -> Result<&Endpoint, PortError> {
+    fn find(&self, id: &EndpointId) -> Result<Endpoint, PortError> {
         self.endpoints
+            .lock()
+            .unwrap()
             .iter()
             .find(|e| &e.id == id)
+            .cloned()
             .ok_or_else(|| PortError::NotFound(id.clone()))
+    }
+
+    /// Test hook: override which endpoint `default_output()` reports (defaults to
+    /// the first `Physical` endpoint in the list).
+    pub fn set_default_output(&self, id: EndpointId) {
+        *self.default_output.lock().unwrap() = Some(id);
+    }
+
+    /// Test hook: push a `DeviceEvent` to whatever `Receiver` `subscribe_device_events`
+    /// last handed out. No-op if nothing has subscribed yet.
+    pub fn emit_device_event(&self, event: DeviceEvent) {
+        if let Some(tx) = self.events.lock().unwrap().as_ref() {
+            let _ = tx.send(event);
+        }
+    }
+
+    /// Test hook: simulate a device disappearing — subsequent `enumerate()`
+    /// calls (and therefore any rebuild) won't see it.
+    pub fn remove_endpoint(&self, id: &EndpointId) {
+        self.endpoints.lock().unwrap().retain(|e| &e.id != id);
+    }
+
+    /// Test hook: simulate a device (re)appearing.
+    pub fn add_endpoint(&self, endpoint: Endpoint) {
+        self.endpoints.lock().unwrap().push(endpoint);
+    }
+
+    /// Test hook: simulate a format-change stream invalidation on the
+    /// *currently open* render port for `id` — the device stays in
+    /// `endpoints` (still enumerable), only the live stream faults. No-op if
+    /// nothing is currently open for `id`.
+    pub fn invalidate_render(&self, id: &EndpointId) {
+        if let Some(flag) = self.render_invalidated.lock().unwrap().get(id) {
+            flag.store(true, Ordering::Relaxed);
+        }
     }
 }
 
 impl AudioSystem for MockSystem {
     fn enumerate(&self) -> Result<Vec<Endpoint>, PortError> {
-        Ok(self.endpoints.clone())
+        Ok(self.endpoints.lock().unwrap().clone())
     }
 
     fn open_capture(&self, id: &EndpointId) -> Result<Box<dyn CapturePort>, PortError> {
@@ -37,11 +97,38 @@ impl AudioSystem for MockSystem {
 
     fn open_render(&self, id: &EndpointId) -> Result<Box<dyn RenderPort>, PortError> {
         let endpoint = self.find(id)?;
-        Ok(Box::new(SinkRender::new(endpoint.format)))
+        let flag = Arc::new(AtomicBool::new(false));
+        self.render_invalidated
+            .lock()
+            .unwrap()
+            .insert(id.clone(), Arc::clone(&flag));
+        Ok(Box::new(SinkRender::with_invalidation_flag(
+            endpoint.format,
+            flag,
+        )))
     }
 
     fn promote_rt_thread(&self) -> RtGuard {
         RtGuard::noop()
+    }
+
+    fn default_output(&self) -> Result<Endpoint, PortError> {
+        if let Some(id) = self.default_output.lock().unwrap().as_ref() {
+            return self.find(id);
+        }
+        self.endpoints
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|e| e.kind == EndpointKind::Physical)
+            .cloned()
+            .ok_or_else(|| PortError::Backend("no physical endpoint configured".into()))
+    }
+
+    fn subscribe_device_events(&self) -> Result<Receiver<DeviceEvent>, PortError> {
+        let (tx, rx) = mpsc::channel();
+        *self.events.lock().unwrap() = Some(tx);
+        Ok(rx)
     }
 }
 
@@ -85,10 +172,12 @@ impl CapturePort for SineCapture {
 }
 
 /// Records every frame written to it, for test assertions (gain applied?
-/// groups summed correctly?). Never returns an error or blocks `wait_event`.
+/// groups summed correctly?). Never blocks `wait_event`; errors only if
+/// `invalidated` is set (via `MockSystem::invalidate_render`).
 pub struct SinkRender {
     format: Format,
     recorded: Vec<f32>,
+    invalidated: Option<Arc<AtomicBool>>,
 }
 
 impl SinkRender {
@@ -96,6 +185,15 @@ impl SinkRender {
         SinkRender {
             format,
             recorded: Vec::new(),
+            invalidated: None,
+        }
+    }
+
+    fn with_invalidation_flag(format: Format, flag: Arc<AtomicBool>) -> SinkRender {
+        SinkRender {
+            format,
+            recorded: Vec::new(),
+            invalidated: Some(flag),
         }
     }
 
@@ -106,6 +204,13 @@ impl SinkRender {
 
 impl RenderPort for SinkRender {
     fn wait_event(&mut self, _timeout: Duration) -> Result<(), PortError> {
+        if let Some(flag) = &self.invalidated {
+            // One-shot: consume the flag so this port doesn't fault forever
+            // (real WASAPI invalidation is a single terminal event too).
+            if flag.swap(false, Ordering::Relaxed) {
+                return Err(PortError::DeviceInvalidated);
+            }
+        }
         Ok(())
     }
 
@@ -126,7 +231,6 @@ impl RenderPort for SinkRender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::EndpointKind;
 
     fn stereo(rate: u32) -> Format {
         Format {
@@ -182,5 +286,50 @@ mod tests {
         sink.write(&[0.1, 0.2]).unwrap();
         sink.write(&[0.3, 0.4]).unwrap();
         assert_eq!(sink.recorded(), &[0.1, 0.2, 0.3, 0.4]);
+    }
+
+    #[test]
+    fn default_output_falls_back_to_first_physical_endpoint() {
+        let sys = MockSystem::new(vec![
+            endpoint("bus-1", EndpointKind::Bus),
+            endpoint("out-1", EndpointKind::Physical),
+            endpoint("out-2", EndpointKind::Physical),
+        ]);
+        assert_eq!(sys.default_output().unwrap().id, EndpointId("out-1".into()));
+    }
+
+    #[test]
+    fn default_output_honors_explicit_override() {
+        let sys = MockSystem::new(vec![
+            endpoint("out-1", EndpointKind::Physical),
+            endpoint("out-2", EndpointKind::Physical),
+        ]);
+        sys.set_default_output(EndpointId("out-2".into()));
+        assert_eq!(sys.default_output().unwrap().id, EndpointId("out-2".into()));
+    }
+
+    #[test]
+    fn default_output_with_no_physical_endpoint_is_backend_error() {
+        let sys = MockSystem::new(vec![endpoint("bus-1", EndpointKind::Bus)]);
+        assert!(matches!(sys.default_output(), Err(PortError::Backend(_))));
+    }
+
+    #[test]
+    fn subscribed_events_are_delivered_to_the_receiver() {
+        let sys = MockSystem::new(vec![]);
+        let rx = sys.subscribe_device_events().unwrap();
+        sys.emit_device_event(DeviceEvent::Removed(EndpointId("out-1".into())));
+        assert_eq!(
+            rx.recv().unwrap(),
+            DeviceEvent::Removed(EndpointId("out-1".into()))
+        );
+    }
+
+    #[test]
+    fn emit_before_subscribe_is_dropped_silently() {
+        let sys = MockSystem::new(vec![]);
+        sys.emit_device_event(DeviceEvent::DefaultChanged(EndpointId("out-1".into()))); // no subscriber yet — must not panic
+        let rx = sys.subscribe_device_events().unwrap();
+        assert!(rx.try_recv().is_err());
     }
 }
