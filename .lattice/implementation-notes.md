@@ -428,16 +428,82 @@ impl AudioSystem for MockSystem {
 
 ---
 
+## 17. Channel matrix — layout order, normalization, in-place traps
+
+**Where:** `crates/audio-core/src/sample.rs` (`ChannelLayout`), `crates/audio-core/src/channel.rs` (`ChannelMatrix`), `crates/audio-core/src/mixer.rs` (integration), `crates/win-audio/src/format.rs` (mask probe). Blueprint: `.lattice/context/channel-mixdown.md`.
+
+```rust
+// GOTCHA 1 — column index ≠ bit position. WASAPI interleaves channels in ASCENDING
+// mask-bit order; the matrix column for a speaker is its RANK among set bits, not the
+// bit number. SPEAKER_BACK_LEFT (0x10) in 5.1 (mask 0x3F) is column 4; in quad (0x33) it's column 2.
+for (col, speaker) in layout.iter_set_bits_ascending().enumerate() { ... }
+
+// GOTCHA 2 — normalize GLOBALLY, not per row. Scale the WHOLE matrix by 1/max_row_sum
+// (only if max_row_sum > 1.0). Per-row normalization changes inter-channel balance
+// (rows with different sums get different attenuation → stereo image shifts).
+let max_sum = rows.iter().map(|r| r.iter().sum::<f32>()).fold(0.0, f32::max);
+if max_sum > 1.0 { for c in coef.iter_mut() { *c /= max_sum; } }
+
+// GOTCHA 3 — coefficient table (apply in this precedence; f32 consts, use FRAC_1_SQRT_2):
+// 1. same speaker in both layouts            → 1.0 (pass-through)
+// 2. FC missing in output                    → 0.7071 into FL and FR (NOT 0.5/0.5 power split)
+// 3. Ls/Sl missing → same-side front only    → 0.7071 into FL (never into FR); mirror for right
+// 4. BC missing                              → 0.7071 into both back/front-left+right per availability
+// 5. LFE missing in output                   → dropped, coefficient 0.0 (approved decision — never mix it in)
+// 6. unknown-position input channel          → 0.7071 into EVERY output (never discard, never error)
+// Stereo→mono falls out: FL,FR → FC at 1.0 each, row sum 2.0 → global normalize → 0.5·(L+R). Correct.
+// Mono→stereo: FC → FL,FR at 0.7071 each (rule 2). Do NOT special-case to 1.0 — that's +3 dB hot on round-trip.
+
+// GOTCHA 4 — process() is NEVER in-place. Input and output frame counts match but widths
+// differ; even at equal width, out[m] reads ALL in[n] per frame. Write to the dedicated
+// pre-allocated `matrixed` scratch. Plain overwrite (=) per output sample, not += —
+// or zero the frame first. += into stale scratch = garbage audio that passes unit tests
+// on zeroed test buffers.
+for f in 0..frames {
+    for m in 0..out_ch {
+        let mut acc = 0.0f32;
+        for n in 0..in_ch { acc += coef[m * in_ch + n] * input[f * in_ch + n]; }
+        output[f * out_ch + m] = acc;   // overwrite, not +=
+    }
+}
+
+// GOTCHA 5 — identity = layouts EQUAL, not counts equal. 5.1 (0x3F) and 6.0 (0x10F… differs)
+// are both 6ch but need a real matrix. Compare ChannelLayout values.
+// Identity path: skip the stage entirely (no copy through scratch).
+```
+
+**Mixer integration traps:**
+- `Src` after the matrix is built at **output** channel count on BOTH sides (`from = {in_rate, out_ch, out_layout}`, `to = {out_rate, out_ch, out_layout}`). Keep `Src::new`'s `ChannelMismatch` check as an internal invariant — do not delete it.
+- Per-group scratch sizing changes: `matrixed` = `max_block_frames * out_ch`; the existing `resampled` scratch must switch from group channels to **out_ch** too. Miss this on a downmix and it silently over-allocates (fine); miss it on an upmix (1→2) and it **undersizes** — the `debug_assert!(progress.consumed == n)` in `push_group` fires only in tests.
+- DSP chain (P5) and duck stay at **source** layout — the `Format` handed to `DspChain::process` keeps the input layout. Don't globally swap fmt to output format after the matrix lands in the chain.
+
+**win-audio mask probe (`format.rs`):**
+```rust
+// dwChannelMask exists ONLY on WAVEFORMATEXTENSIBLE. Check BEFORE casting:
+// wFormatTag == WAVE_FORMAT_EXTENSIBLE (0xFFFE) && cbSize >= 22, then cast
+// *const WAVEFORMATEX → *const WAVEFORMATEXTENSIBLE and read dwChannelMask.
+// Plain WAVEFORMATEX (or mask 0, or popcount(mask) != nChannels — real drivers do
+// both) → ChannelLayout::default_for_count(nChannels). Never trust popcount == count.
+```
+
+**Format field ripple:** adding `layout` to `Format` breaks every struct-literal construction — mocks (`engine/ports/mock.rs`), every unit test, `win-audio` open paths. Mechanical fix, but do it in the same commit as the field; a `ChannelLayout::default_for_count(channels)` one-liner per site is the correct filler everywhere except the win-audio probe (which reads the real mask).
+
+**Tests that catch the classic mistakes:** 5.1→stereo with only-FC input → both outputs equal at 0.7071·(1/max_row_sum); 5.1→stereo Ls-only input → right output exactly 0.0 (side leakage = rule 3 broken); quad vs 5.1 column indexing (GOTCHA 1); upmix mono→stereo scratch sizing; two different 6-ch layouts not treated as identity.
+
+---
+
 ## Quick cross-reference
 
 | Implementing… | Read §§ |
 |---|---|
-| `audio-core` mixer/gain | 1, 8, 12 |
+| `audio-core` mixer/gain | 1, 8, 12, 17 |
 | `audio-core` dsp | 8, 9 |
-| `audio-core` resample | 11 |
+| `audio-core` resample | 11, 17 |
+| `audio-core` channel matrix / layout | 17 |
 | `engine` runtime/rings/commands | 1, 5, 6, 7 |
 | `engine` clock | 10 |
 | `engine` tests | 16 |
 | `win-audio` com/capture/render | 2, 3, 4 |
+| `win-audio` format/mask probe | 17 |
 | `win-audio` sessions/router | 13, 14 |
 | `control` store | 15 |

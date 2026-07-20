@@ -107,12 +107,13 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use audio_core::Format;
+    use audio_core::{ChannelLayout, Format};
 
     fn stereo(rate: u32) -> Format {
         Format {
             sample_rate: rate,
             channels: 2,
+            layout: ChannelLayout::STEREO,
         }
     }
 

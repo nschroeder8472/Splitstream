@@ -181,3 +181,14 @@ impl DriftController {
 |---|---|
 | Splitstream-Engineering-Spec.md | Requirement/engineering spec (§3.2, §7.3, §10, N3) |
 | .lattice/context/engine-core.md | Approved P0–P1 design this feature extends (ports, EngineHandle, Src, supervisor) |
+| crates/audio-core/src/sample.rs | `ResampleRatio`, `MIN`/`MAX_RESAMPLE_RATIO` |
+| crates/audio-core/src/resample.rs | `Src` rewritten around `rubato::SincFixedIn` (variable-ratio) + `set_ratio` glide |
+| crates/audio-core/src/mixer.rs | `MixerCommand::SetOutputRatio` (fans out to every group's `Src` on that output) |
+
+## Implementation Notes (audio-core, P2 layer)
+
+- **`Src` no longer has a P1 fast-path for `from.sample_rate == to.sample_rate`.** L1 capability 1 ("hours-long stability... rings never slowly starve or overflow") applies to every output, not just format-mismatched ones — real device clocks drift even at nominally-identical rates, and `set_ratio` runs on the RT mixer thread via `Mixer::apply`, so a resampler can't be lazily constructed the first time drift correction is needed. Every `Src` is now a `rubato::SincFixedIn` from construction, even at ratio 1.0. This was anticipated in the P1 module doc comment ("layered on top of a different resampler") — not a surprise deviation, but worth flagging since it changes P1's `Src` internals, not just adds to them, and removes a performance fast-path.
+- **`ResampleRatio` values are *relative* to each `Src`'s construction ratio**, fed to rubato via `set_resample_ratio_relative`, not an absolute output/input rate ratio. Matches `DriftController`'s own math (notes §10: `let ratio = 1.0 + corr as f64`, corr small) — `ResampleRatio(1.0)` means "no correction, use the base ratio as built."
+- **`SincFixedIn`'s `max_resample_ratio_relative` parameter clamps `[1/max, max]`** — passing `MAX_RESAMPLE_RATIO` (1.1) directly would floor at `1/1.1 ≈ 0.909`, tighter than our own `MIN_RESAMPLE_RATIO` (0.9), so a value we'd accept could panic the resampler. Fixed by passing `MAX_RESAMPLE_RATIO.max(1.0 / MIN_RESAMPLE_RATIO)` instead — caught during implementation, not left in.
+- **Sinc interpolation parameters (`sinc_len=256`, `f_cutoff=0.95`, `oversampling_factor=128`, `Linear` interpolation, `BlackmanHarris2` window) are rubato's own suggested starting points**, not project-tuned — no spec/notes guidance exists for this. Revisit if the 8-hour soak test surfaces audible artifacts or excess CPU.
+- **P1's `audio-core` mixer tests assumed instant passthrough** (unity gain + matching format = exact sample-for-sample output on the same tick). That assumption is gone now that every `Src` chunks: a single `push_group`/`take_output` cycle may legitimately produce zero output while the resampler's first input chunk fills. Rewrote the three affected tests to collect output across many ticks and assert on the settled tail, rather than one tick's exact count.
