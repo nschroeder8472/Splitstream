@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use audio_core::{Gain, GroupId, MixerCommand};
-use engine::{ConfigSnapshot, GroupConfig, GroupRules, MatchRule};
+use engine::{AppConfig, ConfigSnapshot, GroupConfig, GroupRules, HotkeyChord, HotkeyMap, MatchRule};
 
 pub const SUPPORTED_SCHEMA_VERSION: u32 = 2;
 
@@ -33,7 +33,25 @@ struct RawConfig {
     #[serde(default = "default_gain")]
     master: f32,
     #[serde(default)]
+    muted: bool,
+    #[serde(default)]
     group: Vec<RawGroup>,
+    #[serde(default)]
+    app: RawAppConfig,
+    #[serde(default)]
+    hotkeys: RawHotkeys,
+}
+
+#[derive(Deserialize, Default)]
+struct RawAppConfig {
+    #[serde(default)]
+    autostart: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct RawHotkeys {
+    #[serde(default)]
+    mute_master: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -62,7 +80,7 @@ pub fn load(path: &Path) -> Result<ConfigSnapshot, ConfigError> {
     parse(&text)
 }
 
-fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
+pub(crate) fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
     let raw: RawConfig = toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
 
     if raw.schema_version > SUPPORTED_SCHEMA_VERSION {
@@ -89,10 +107,23 @@ fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
         })
         .collect::<Result<Vec<_>, ConfigError>>()?;
 
+    let mute_master = raw
+        .hotkeys
+        .mute_master
+        .as_deref()
+        .map(HotkeyChord::parse)
+        .transpose()
+        .map_err(ConfigError::Invalid)?;
+
     Ok(ConfigSnapshot {
         schema_version: raw.schema_version,
         master,
+        muted: raw.muted,
         groups,
+        app: AppConfig {
+            autostart: raw.app.autostart,
+            hotkeys: HotkeyMap { mute_master },
+        },
     })
 }
 
@@ -290,6 +321,54 @@ mod tests {
     }
 
     #[test]
+    fn parses_muted_app_and_hotkeys() {
+        let toml = r#"
+            schema_version = 2
+            master = 0.8
+            muted = true
+
+            [app]
+            autostart = true
+
+            [hotkeys]
+            mute_master = "Ctrl+Alt+M"
+        "#;
+        let snapshot = parse(toml).unwrap();
+        assert!(snapshot.muted);
+        assert!(snapshot.app.autostart);
+        assert_eq!(
+            snapshot.app.hotkeys.mute_master,
+            Some(HotkeyChord {
+                ctrl: true,
+                alt: true,
+                shift: false,
+                key: 'M',
+            })
+        );
+    }
+
+    #[test]
+    fn missing_muted_app_and_hotkeys_default_to_unset() {
+        let toml = "schema_version = 2\nmaster = 1.0\n";
+        let snapshot = parse(toml).unwrap();
+        assert!(!snapshot.muted);
+        assert!(!snapshot.app.autostart);
+        assert!(snapshot.app.hotkeys.mute_master.is_none());
+    }
+
+    #[test]
+    fn invalid_hotkey_chord_is_a_validation_error() {
+        let toml = r#"
+            schema_version = 2
+            master = 1.0
+
+            [hotkeys]
+            mute_master = "NotAChord"
+        "#;
+        assert!(matches!(parse(toml), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
     fn missing_schema_version_defaults_to_supported() {
         let toml = r#"
             master = 1.0
@@ -341,11 +420,15 @@ mod tests {
         let a = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
             groups: vec![group("Game", "Bus", "Out", 1.0, true)],
         };
         let b = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
             groups: vec![group("Game", "Bus", "Out", 1.0, true)],
         };
         assert!(diff(&a, &b).is_unchanged());
@@ -356,11 +439,15 @@ mod tests {
         let a = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
             groups: vec![group("Game", "Bus", "Out", 1.0, true)],
         };
         let b = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
             groups: vec![group("Game", "Bus", "Out", 0.5, true)],
         };
         let delta = diff(&a, &b);
@@ -375,11 +462,15 @@ mod tests {
         let a = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
             groups: vec![group("Game", "Bus", "Out", 1.0, true)],
         };
         let b = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
             groups: vec![group("Music", "Bus", "Out", 1.0, true)],
         };
         let delta = diff(&a, &b);
@@ -393,11 +484,15 @@ mod tests {
         let a = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
             groups: vec![group("Game", "Bus", "Speakers", 1.0, true)],
         };
         let b = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
             groups: vec![group("Game", "Bus", "Headphones", 1.0, true)],
         };
         assert!(diff(&a, &b).structural);
@@ -408,11 +503,15 @@ mod tests {
         let a = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
             groups: vec![group_with_rules("Game", "Bus", "Out", 1.0, true, &[])],
         };
         let b = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
             groups: vec![group_with_rules("Game", "Bus", "Out", 1.0, true, &["game.exe"])],
         };
         let delta = diff(&a, &b);
@@ -432,11 +531,15 @@ mod tests {
         let a = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
             groups: vec![group_with_rules("Game", "Bus", "Out", 1.0, true, &[])],
         };
         let b = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
             groups: vec![group_with_rules("Game", "Bus", "Out", 0.5, true, &["game.exe"])],
         };
         let delta = diff(&a, &b);
@@ -451,6 +554,8 @@ mod tests {
         let snapshot = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
             groups: vec![
                 group_with_rules("Game", "Bus", "Out", 1.0, true, &["game.exe"]),
                 group_with_rules("Music", "Bus", "Out", 1.0, true, &["music*.exe"]),

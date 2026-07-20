@@ -12,14 +12,19 @@ use audio_core::{Gain, GroupId, GroupSpec, OutputId, OutputSpec, Topology};
 use crate::ports::{Endpoint, EndpointId, EndpointKind};
 use crate::runtime::EngineError;
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ConfigSnapshot {
     pub schema_version: u32,
     pub master: Gain,
+    /// Effective master = `muted ? 0 : master` — kept as its own flag (not
+    /// folded into `master`) so the pre-mute gain value survives a mute
+    /// round-trip; see app-shell.md's mute schema decision.
+    pub muted: bool,
     pub groups: Vec<GroupConfig>,
+    pub app: AppConfig,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GroupConfig {
     pub name: String,
     pub bus_endpoint: String,
@@ -29,6 +34,65 @@ pub struct GroupConfig {
     /// Raw config strings — parsed into `rules::MatchRule` by `control::group_rules`,
     /// not here (this type only mirrors the TOML shape; see session-routing.md).
     pub match_rules: Vec<String>,
+}
+
+/// `AppConfig`/`HotkeyMap`/`HotkeyChord` live here rather than `control` (where
+/// app-shell.md's L4 contract text placed `HotkeyMap`) — same interface-at-consumer
+/// idiom already applied to `GroupRules`/`MatchRule` (see session-routing.md's
+/// 2026-07-20 decision): `ConfigSnapshot` is `engine`'s type, so a field on it
+/// must be resolvable without `engine` depending back on `control`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AppConfig {
+    pub autostart: bool,
+    pub hotkeys: HotkeyMap,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HotkeyMap {
+    pub mute_master: Option<HotkeyChord>,
+}
+
+/// A validated global hotkey chord, e.g. spec §11.3's `"Ctrl+Alt+M"`. At least
+/// one modifier is required — a bare-key global hotkey would capture every
+/// keypress system-wide, which no OS hotkey API allows unconditionally anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotkeyChord {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub key: char,
+}
+
+impl HotkeyChord {
+    pub fn parse(s: &str) -> Result<HotkeyChord, String> {
+        let mut ctrl = false;
+        let mut alt = false;
+        let mut shift = false;
+        let mut key = None;
+
+        for token in s.split('+').map(str::trim) {
+            match token.to_ascii_lowercase().as_str() {
+                "" => return Err(format!("empty token in hotkey chord {s:?}")),
+                "ctrl" | "control" => ctrl = true,
+                "alt" => alt = true,
+                "shift" => shift = true,
+                _ => {
+                    let mut chars = token.chars();
+                    let first = chars.next().filter(|c| c.is_ascii_alphanumeric());
+                    if key.is_some() || first.is_none() || chars.next().is_some() {
+                        return Err(format!("invalid key token {token:?} in hotkey chord {s:?}"));
+                    }
+                    key = first.map(|c| c.to_ascii_uppercase());
+                }
+            }
+        }
+
+        let key = key.ok_or_else(|| format!("hotkey chord {s:?} has no key"))?;
+        if !(ctrl || alt || shift) {
+            return Err(format!("hotkey chord {s:?} needs at least one modifier"));
+        }
+        Ok(HotkeyChord { ctrl, alt, shift, key })
+    }
 }
 
 /// Config with names resolved to endpoint ids, ready for `runtime` to open
@@ -172,9 +236,40 @@ mod tests {
     }
 
     #[test]
+    fn hotkey_chord_parses_modifiers_and_key_case_insensitively() {
+        let chord = HotkeyChord::parse("ctrl+alt+m").unwrap();
+        assert_eq!(
+            chord,
+            HotkeyChord {
+                ctrl: true,
+                alt: true,
+                shift: false,
+                key: 'M',
+            }
+        );
+    }
+
+    #[test]
+    fn hotkey_chord_rejects_a_bare_key_with_no_modifier() {
+        assert!(HotkeyChord::parse("M").is_err());
+    }
+
+    #[test]
+    fn hotkey_chord_rejects_a_multi_character_key_token() {
+        assert!(HotkeyChord::parse("Ctrl+Home").is_err());
+    }
+
+    #[test]
+    fn hotkey_chord_rejects_two_key_tokens() {
+        assert!(HotkeyChord::parse("Ctrl+M+N").is_err());
+    }
+
+    #[test]
     fn resolves_group_to_bus_and_output_ids() {
         let snapshot = ConfigSnapshot {
             schema_version: 2,
+            muted: false,
+            app: AppConfig::default(),
             master: Gain::UNITY,
             groups: vec![group("Game", "Game", "Speakers")],
         };
@@ -189,6 +284,8 @@ mod tests {
     fn two_groups_sharing_a_device_share_one_output_id() {
         let snapshot = ConfigSnapshot {
             schema_version: 2,
+            muted: false,
+            app: AppConfig::default(),
             master: Gain::UNITY,
             groups: vec![
                 group("Game", "Game", "Speakers"),
@@ -211,6 +308,8 @@ mod tests {
     fn missing_bus_endpoint_is_a_resolve_error() {
         let snapshot = ConfigSnapshot {
             schema_version: 2,
+            muted: false,
+            app: AppConfig::default(),
             master: Gain::UNITY,
             groups: vec![group("Game", "Nonexistent", "Speakers")],
         };
@@ -224,6 +323,8 @@ mod tests {
     fn missing_output_device_is_a_resolve_error() {
         let snapshot = ConfigSnapshot {
             schema_version: 2,
+            muted: false,
+            app: AppConfig::default(),
             master: Gain::UNITY,
             groups: vec![group("Game", "Game", "Nonexistent")],
         };
@@ -237,6 +338,8 @@ mod tests {
     fn parked_group_is_excluded_without_erroring() {
         let snapshot = ConfigSnapshot {
             schema_version: 2,
+            muted: false,
+            app: AppConfig::default(),
             master: Gain::UNITY,
             groups: vec![group("Game", "Game", "Nonexistent")],
         };
@@ -251,6 +354,8 @@ mod tests {
     fn parking_an_earlier_group_keeps_later_groups_ids_stable() {
         let snapshot = ConfigSnapshot {
             schema_version: 2,
+            muted: false,
+            app: AppConfig::default(),
             master: Gain::UNITY,
             groups: vec![
                 group("Parked", "Game", "Speakers"),

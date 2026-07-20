@@ -15,6 +15,10 @@ pub enum MixerCommand {
     /// Fans out to every group's `Src` feeding that output — the drift loop
     /// measures fill per output, but each group has its own resampler.
     SetOutputRatio(OutputId, ResampleRatio),
+    /// Global output-stage kill, independent of `follow_master` — silences
+    /// every group's contribution to every output. Gain/master smoothers
+    /// keep running so unmute resumes at the same value with no re-ramp.
+    SetMuted(bool),
 }
 
 const GAIN_TIME_CONSTANT_S: f32 = 0.01; // 10ms — inaudible as a ramp, kills zipper noise
@@ -86,6 +90,7 @@ pub struct Mixer {
     max_block_frames: usize,
     groups: Vec<GroupState>,
     outputs: Vec<OutputState>,
+    muted: bool,
 }
 
 /// A `Format`'s `layout` must describe exactly as many speakers as
@@ -178,6 +183,7 @@ impl Mixer {
             max_block_frames,
             groups,
             outputs,
+            muted: false,
         })
     }
 
@@ -204,6 +210,9 @@ impl Mixer {
                 for g in self.groups.iter_mut().filter(|g| g.output == output_id) {
                     g.src.set_ratio(ratio);
                 }
+            }
+            MixerCommand::SetMuted(muted) => {
+                self.muted = muted;
             }
         }
     }
@@ -248,6 +257,13 @@ impl Mixer {
             progress.consumed, matrix_len,
             "resampled scratch undersized for one block"
         );
+
+        // Output-stage kill: gain/matrix/SRC still ran above (smoothers and
+        // resampler state stay warm), only the write into the shared output
+        // accumulator is skipped — unmute resumes with no re-ramp or glitch.
+        if self.muted {
+            return;
+        }
 
         let output = g.output;
         let produced = progress.produced;
@@ -465,6 +481,42 @@ mod tests {
 
         assert!(!collected.is_empty(), "downmixed output never produced any samples");
         assert!(collected.iter().any(|&s| s.abs() > 1e-3), "downmixed output is silent");
+    }
+
+    #[test]
+    fn set_muted_true_produces_no_output_samples() {
+        // follow_master = false here on purpose: mute must silence a group
+        // even when it isn't bound to master, per the "global kill" decision.
+        let topo = single_group_topology(1.0, false, 1.0);
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        mixer.apply(MixerCommand::SetMuted(true));
+        let frames = vec![0.5f32; 64 * 2];
+
+        let collected = run_ticks(&mut mixer, GroupId(1), OutputId(1), &frames, 80);
+
+        assert!(
+            collected.is_empty(),
+            "muted mixer must produce zero output samples, got {} samples",
+            collected.len()
+        );
+    }
+
+    #[test]
+    fn unmuting_restores_output_at_the_original_gain() {
+        let topo = single_group_topology(1.0, false, 1.0);
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        let frames = vec![0.5f32; 64 * 2];
+
+        mixer.apply(MixerCommand::SetMuted(true));
+        run_ticks(&mut mixer, GroupId(1), OutputId(1), &frames, 40);
+        mixer.apply(MixerCommand::SetMuted(false));
+        let collected = run_ticks(&mut mixer, GroupId(1), OutputId(1), &frames, 80);
+
+        assert!(!collected.is_empty(), "unmuted mixer produced no output");
+        let tail = &collected[collected.len().saturating_sub(64)..];
+        for &s in tail {
+            assert!((s - 0.5).abs() < 1e-3, "expected ~0.5 after unmute, got {s}");
+        }
     }
 
     #[test]

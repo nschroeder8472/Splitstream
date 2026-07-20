@@ -8,7 +8,15 @@ name = "splitstream"
 path = "src/main.rs"
 
 [dependencies]
+audio-core = { version = "0.1.0", path = "../audio-core" }
+auto-launch = "0.6.0"
 control = { version = "0.1.0", path = "../control" }
 ctrlc = "3.5.2"
+eframe = "0.35.0"
 engine = { version = "0.1.0", path = "../engine" }
-win-audio = { version = "0.1.0", path = "../win-audio" }
+global-hotkey = "0.8.0"
+interprocess = "2.4.2"
+single-instance = "0.3.3"
+tao = "0.35.3"
+tray-icon = "0.24.1"
+win-audio = { version = "0.1.0", path = "../win-audio", features = ["policy-routing"] }

@@ -1263,6 +1263,8 @@ mod tests {
         ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
+            muted: false,
+            app: graph::AppConfig::default(),
             groups: vec![graph::GroupConfig {
                 name: "Game".into(),
                 bus_endpoint: "Game".into(),

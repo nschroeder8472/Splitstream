@@ -2,7 +2,7 @@
 feature: session-routing
 requirement_doc: Splitstream-Engineering-Spec.md
 created: 2026-07-18
-status: approved
+status: complete
 ---
 
 # Session Routing (P3)
