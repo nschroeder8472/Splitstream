@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use audio_core::Format;
 
+use crate::rules::SessionInfo;
+
 #[cfg(any(test, feature = "test-support"))]
 pub mod mock;
 
@@ -82,6 +84,47 @@ pub trait AudioSystem: Send + Sync {
     /// facade method, not a second port trait — single consumer, the recovery supervisor).
     /// Callable once; a second call replaces the previous subscription in real `win-audio`.
     fn subscribe_device_events(&self) -> Result<Receiver<DeviceEvent>, PortError>;
+}
+
+/// `IAudioSessionManager2` notifications (session-routing L4).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionEvent {
+    New(SessionInfo),
+    Ended(u32),
+}
+
+/// Separate from `AudioSystem` (session-routing decision, deliberate exception
+/// to the grow-facade learning): session enumeration is a distinct,
+/// always-available concern from policy routing below — best-effort and
+/// possibly unavailable — and RoutingCoordinator owns each behind its own
+/// `Box<dyn _>`, not a shared facade.
+pub trait SessionPort: Send {
+    /// Must prime new-session notifications (real `win-audio` impl: calls
+    /// `GetSessionEnumerator` at least once — notes §14 gotcha 1).
+    fn enumerate(&mut self) -> Result<Vec<SessionInfo>, PortError>;
+    /// Single-consume, same pattern as `EngineHandle::take_events`.
+    fn take_events(&mut self) -> Receiver<SessionEvent>;
+}
+
+/// `AudioPolicyConfig`/`IPolicyConfig` are undocumented (spec §9.3–9.4) — every
+/// call is best-effort. `Unavailable` = the surface itself isn't usable
+/// (feature off, activation failed); `Failed` = the surface is usable but
+/// this particular call didn't succeed. RoutingCoordinator's degradation
+/// posture treats both the same (one notice, skip further calls).
+#[derive(Debug)]
+pub enum PolicyError {
+    Unavailable(String),
+    Failed(String),
+}
+
+/// All methods best-effort (spec §9.3–9.4) — a failure degrades routing
+/// polish, never audio. Separate from `AudioSystem` for the same reason as
+/// `SessionPort`.
+pub trait PolicyPort: Send {
+    fn route(&mut self, pid: u32, bus: &EndpointId) -> Result<(), PolicyError>;
+    fn clear_route(&mut self, pid: u32) -> Result<(), PolicyError>;
+    fn set_visibility(&mut self, endpoint: &EndpointId, visible: bool) -> Result<(), PolicyError>;
+    fn set_default(&mut self, endpoint: &EndpointId) -> Result<(), PolicyError>;
 }
 
 /// Polled ~period/2 (spec Appendix A) — loopback event mode is historically unreliable.

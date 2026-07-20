@@ -25,6 +25,12 @@ status: approved
 | 2026-07-18 | Design approved at Level 4. Status set to approved — ready for implementation. | All four levels approved and persisted; drift check vs spec complete. | — |
 | 2026-07-18 | **Revision (cross-blueprint review):** new flow + contract `RoutingHandle::update_topology(buses, rules)` — called after every structural rebuild. Coordinator re-enumerates sessions and reconciles desired state against the fresh (possibly re-numbered) GroupIds; applied-routes map rebuilt. | L3 only handled rules changes; group add/remove/rename never reached the coordinator — stale `buses` map and applied-map keyed by shifted positional GroupIds. Desired-state reconcile pattern already in place makes this cheap. | Restarting the coordinator on structural change (loses degraded flag + notification dedup state); persistent group ids (rejected in P4). |
 | 2026-07-18 | **Revision (cross-blueprint review):** `SessionPort::events(&self)` becomes `take_events(&mut self) -> Receiver<SessionEvent>` — single-consume, same fix as EngineHandle. | Same single-consumer Receiver issue found in the seam review. | — |
+| 2026-07-20 | **Implementation-time decision (code-forge):** `MatchRule`, `GroupRules`, `SessionInfo`, `match_session` live in `engine` (`engine::rules`), not `control` as the L4 text literally implied. `control` depends on `engine`, not the reverse — `engine::routing::RoutingCoordinator`'s own contract takes `GroupRules` as a parameter, so the type must live where `engine` can use it without a reverse/cyclic dependency. Identical shape and identical fix to the `ConfigSnapshot`/`GroupConfig` "Config type home" decision in `.lattice/context/engine-core.md`. Asked the user directly (real fork, lasting API-shape consequence); confirmed. | Fully decoupling with mirrored types converted at the app boundary (more boilerplate, no other consumer needs the separation; P4/app not built yet to host the conversion). | 
+| 2026-07-20 | **Implementation-time decision (code-forge):** `start_routing`/`RoutingHandle::update_topology` gain an added `default_output: Option<EndpointId>` parameter — L4's signature had no way to supply the physical endpoint flow A's "sets branded default" step needs; coordinator no-ops `PolicyPort::set_default` when `None`. `app` (P4, not yet built) will supply it from `AudioSystem::default_output()`. Asked the user directly; confirmed. | Dropping "sets branded default" from P3 scope entirely (defers a designed L3 flow to P4 for no structural reason — the param is cheap and optional). | 
+| 2026-07-20 | **Implementation-time decision (code-forge):** `ConfigDelta` restructured from a flat enum (`Params \| Rules \| Structural \| Unchanged`) to a struct (`structural: bool, params: Vec<MixerCommand>, rules: Option<Vec<GroupRules>>`) so one `diff()` call can deliver a simultaneous gain+rule edit without silently dropping one half. Deviates from L4's literal enum text. Asked the user directly; confirmed. | Keeping the flat enum with either precedence order (Params-over-Rules or Rules-over-Params) — both silently drop one class of change on a simultaneous edit; nothing consumes `ConfigDelta` yet (P4/app not built) so the blast radius of restructuring now is minimal. |
+| 2026-07-20 | **Implementation-time decision (code-forge):** `WasapiSessions` activates `IAudioSessionManager2` (enumeration + new-session notification) on *every* bus and physical endpoint the enumerator reports, not just the default output, merging by pid. | `IAudioSessionManager2` is per-endpoint. An app already redirected to a Splitstream bus in a prior run (Windows persists the pref — see the earlier "no un-route" decision) gets WASAPI-redirected straight to that bus on relaunch, before its session would ever appear in the *default* device's session list. Scanning only the default endpoint would silently miss every already-routed app on relaunch — recurring, not an edge case, given P3's own persistence design. Asked the user directly; confirmed. | Scanning only the default output endpoint — simpler (one manager, one registration) but reintroduces the exact gap the "no un-route on session end" decision was designed around. |
+| 2026-07-20 | **Implementation-time discovery (code-forge):** `IPolicyConfigWin7`/`AudioPolicyConfig` vtable shapes verified against EarTrumpet's live source (`github.com/File-New-Project/EarTrumpet/Interop/MMDeviceAPI/`) via WebFetch, not from memory — implementation-notes.md's own hand-written pattern sketch for `IPolicyConfig` undercounted the real vtable by several slots (8 unused + GetPropertyValue + SetPropertyValue + SetDefaultEndpoint + SetEndpointVisibility = 12 own slots, not the sketch's 2). Using the sketch as written would have corrupted memory, not just returned an error. | Confirms the notes' own warning was correct and necessary — the sketch was illustrative shorthand, never meant to be trusted verbatim. | — |
+| 2026-07-20 | **Implementation-time discovery (code-forge):** `AudioPolicyConfigFactory*` interfaces are `IInspectable`-derived (WinRT) in the real ABI, but windows-core 0.62's `#[interface]` macro has no generated `IInspectable_Impl` trait to satisfy the parent-trait bound it requires for any non-`IUnknown` parent. Worked around by declaring `: IUnknown` and manually placeholder-slotting `IInspectable`'s own 3 methods (`GetIids`/`GetRuntimeClassName`/`GetTrustLevel`) ahead of the interface's real slots — produces an identical vtable layout since ABI correctness depends on memory layout, not which Rust trait hierarchy describes it. | `windows-core`/`windows-interface` crate version limitation (0.62.2), not a project design choice — worth knowing if a future `windows`/`windows-core` upgrade adds `IInspectable_Impl` and this workaround can be simplified back to `: IInspectable`. | — |
 
 ## Design: Level 1 -- Capabilities
 
@@ -44,14 +50,14 @@ Approved 2026-07-18. Control-plane only; audio path untouched.
 
 | Component | Home / layer | Single responsibility |
 |---|---|---|
-| RuleMatcher | `control/rules.rs` (application, pure) | `(pid, process_path, display_name) × rules → Option<GroupId>` |
+| RuleMatcher | `engine/rules.rs` (application, pure — relocated from `control/rules.rs`, see 2026-07-20 decision) | `(pid, process_path, display_name) × rules → Option<GroupId>` |
 | SessionPort + PolicyPort | `engine::ports` | Session enumeration/notifications; route-session + visibility/default (separate trait — best-effort concern) |
 | RoutingCoordinator | `engine/routing.rs` (application) | Desired-state reconciliation; re-apply on rule/session change; degradation posture (one notice, no retry storm); bus hiding at startup |
 | WasapiSessions + PolicyRouter | `win-audio` (infrastructure) | IAudioSessionManager2 + priming (§9.2); hand-declared AudioPolicyConfig/IPolicyConfig vtables, feature-gated (§9.3–9.4) |
 
 ```mermaid
 graph TD
-    CFG[control: match_rules] --> RM[control: RuleMatcher]
+    CFG[control: config rules] --> RM[engine: RuleMatcher]
     RM --> RC[engine: RoutingCoordinator]
     WS[win-audio: WasapiSessions] -->|SessionEvent| RC
     RC -->|route/hide via PolicyPort| PR[win-audio: PolicyRouter]
@@ -80,7 +86,7 @@ Approved 2026-07-18.
 
 Approved 2026-07-18. Deltas on approved P0–P2 contracts; signatures only.
 
-### `control`
+### `engine::rules` (relocated from `control` — see 2026-07-20 decision above)
 
 ```rust
 pub enum MatchRule { ExactName(String), Glob(GlobPattern) }
@@ -89,8 +95,18 @@ pub struct SessionInfo { pub pid: u32, pub process_path: PathBuf, pub display_na
 
 /// Exact name > glob; ties broken by config order. None → leave on default.
 pub fn match_session(info: &SessionInfo, rules: &[GroupRules]) -> Option<GroupId>;
+```
 
-pub enum ConfigDelta { Params(Vec<MixerCommand>), Rules(Vec<GroupRules>), Structural, Unchanged }
+### `control`
+
+```rust
+/// Restructured from a flat enum (2026-07-20 decision above) so one `diff()` call
+/// can carry a simultaneous params+rules edit without dropping either half.
+pub struct ConfigDelta {
+    pub structural: bool,
+    pub params: Vec<MixerCommand>,
+    pub rules: Option<Vec<engine::GroupRules>>,
+}
 ```
 
 ### `engine::ports` additions (win-audio implements)
@@ -116,12 +132,19 @@ pub trait PolicyPort: Send {                                          // all bes
 ### `engine/routing.rs`
 
 ```rust
+/// `default_output` (2026-07-20 decision above): physical endpoint for the
+/// "sets branded default" step of flow A. `None` no-ops that PolicyPort call
+/// — bus hiding still proceeds. `app` (P4) supplies it from
+/// `AudioSystem::default_output()`.
 pub fn start_routing(rules: Vec<GroupRules>, buses: HashMap<GroupId, EndpointId>,
+                     default_output: Option<EndpointId>,
                      session: Box<dyn SessionPort>, policy: Box<dyn PolicyPort>,
                      events: Sender<EngineEvent>) -> Result<RoutingHandle, EngineError>;
 
 impl RoutingHandle {
     pub fn update_rules(&self, rules: Vec<GroupRules>);
+    pub fn update_topology(&self, buses: HashMap<GroupId, EndpointId>, rules: Vec<GroupRules>,
+                            default_output: Option<EndpointId>);
     pub fn is_degraded(&self) -> bool;
     pub fn shutdown(self);
 }
@@ -165,8 +188,8 @@ New flow **H — Structural rebuild:** engine completes rebuild → app calls `u
 
 ## Design Summary
 
-- **Components/layers:** `RuleMatcher` pure fn (`control/rules.rs`); `SessionPort` + `PolicyPort` traits (`engine::ports`); `RoutingCoordinator` (`engine/routing.rs`, desired-state reconciliation + degradation + bus hiding); `WasapiSessions` + `PolicyRouter` (`win-audio`, feature-gated).
-- **Key contracts:** `match_session(info, rules) -> Option<GroupId>`; `SessionPort::{enumerate, events}`; `PolicyPort::{route, clear_route, set_visibility, set_default}` (all best-effort, `PolicyError`); `start_routing`/`RoutingHandle::{update_rules, is_degraded}`; `ConfigDelta::Rules`; `EngineEvent::RoutingDegraded`.
+- **Components/layers:** `RuleMatcher` pure fn (`engine/rules.rs` — relocated from `control/rules.rs`, see 2026-07-20 decision); `SessionPort` + `PolicyPort` traits (`engine::ports`); `RoutingCoordinator` (`engine/routing.rs`, desired-state reconciliation + degradation + bus hiding); `WasapiSessions` + `PolicyRouter` (`win-audio`, feature-gated).
+- **Key contracts:** `match_session(info, rules) -> Option<GroupId>`; `SessionPort::{enumerate, take_events}`; `PolicyPort::{route, clear_route, set_visibility, set_default}` (all best-effort, `PolicyError`); `start_routing`/`RoutingHandle::{update_rules, update_topology, is_degraded}` (both take `default_output: Option<EndpointId>`, see 2026-07-20 decision); `ConfigDelta` (struct: `structural`/`params`/`rules`, see 2026-07-20 decision); `EngineEvent::RoutingDegraded`.
 - **Architectural constraints:** control-plane only — audio path untouched; undocumented surfaces isolated in win-audio behind `policy-routing` feature; one degradation notice, retry only on config reload; no elevation.
 - **Domain decisions:** `MatchRule` value objects (validated globs); exact > glob > config-order precedence (resolves spec §15.5); persisted routes left in place on session end.
 - **Resolved during design:** §15.5 rule precedence; port shape (separate PolicyPort — deliberate exception to grow-facade learning); un-route semantics; degradation/retry policy; feature gate.
@@ -179,3 +202,12 @@ New flow **H — Structural rebuild:** engine completes rebuild → app calls `u
 | Splitstream-Engineering-Spec.md | Requirement spec (§9.2–9.4, F5–F7, N4, §15.5) |
 | .lattice/context/engine-core.md | Approved P0–P1 design (ports facade, control plane, ConfigSnapshot.match_rules) |
 | .lattice/context/drift-and-recovery.md | Approved P2 design (EngineEvent channel, supervisor patterns) |
+| crates/engine/src/rules.rs | `GlobPattern`/`MatchRule`/`GroupRules`/`SessionInfo`/`match_session` — pure, relocated from `control` (application layer) |
+| crates/engine/src/ports/mod.rs | `SessionEvent`/`SessionPort`, `PolicyError`/`PolicyPort` additions |
+| crates/engine/src/ports/mock.rs | `MockSessionPort`/`MockPolicyPort` — `Arc`-backed state + `Clone` so a test keeps an observer handle after the mock moves into `Box<dyn _>` |
+| crates/engine/src/routing.rs | `RoutingCoordinator` (`start_routing`/`RoutingHandle`) — flows A–H against the mocks above; not yet wired to real `win-audio` ports |
+| crates/engine/src/runtime.rs | `EngineEvent::RoutingDegraded` variant added |
+| crates/control/src/config.rs | `ConfigDelta` restructured to struct; `group_rules(snapshot)` builder (positional `GroupId`, same convention as `diff`) |
+| crates/app/src/main.rs | Updated for `ConfigDelta` struct shape; `delta.rules` intentionally unhandled — RoutingCoordinator wiring is P4/app-shell scope |
+| crates/win-audio/src/sessions.rs | `WasapiSessions: SessionPort` — scans every bus+physical endpoint's `IAudioSessionManager2` (2026-07-20 decision), not just the default; per-session `IAudioSessionEvents` for ended-detection |
+| crates/win-audio/src/router.rs | `PolicyRouter: PolicyPort`, behind `policy-routing` feature — `IPolicyConfigWin7` (classic COM) for visibility/default, `AudioPolicyConfig` (WinRT, two IIDs w/ fallback) for per-app routing; every GUID/slot verified against EarTrumpet's real source, not memory |

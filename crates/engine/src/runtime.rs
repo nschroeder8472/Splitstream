@@ -120,6 +120,11 @@ pub enum EngineEvent {
     DeviceLost {
         groups: Vec<GroupId>,
     },
+    /// Session-routing (P3) degradation notice — sent once per degradation
+    /// episode by `routing::RoutingCoordinator`; audio path is unaffected.
+    RoutingDegraded {
+        reason: String,
+    },
 }
 
 pub struct EngineStats {
