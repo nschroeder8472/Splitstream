@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 use crossbeam_queue::ArrayQueue;
 use rtrb::RingBuffer;
 
-use audio_core::{DomainError, GroupId, Mixer, MixerCommand, OutputId, Topology};
+use audio_core::{
+    DomainError, DspChain, DspSpec, Format, GroupId, Mixer, MixerCommand, OutputId, Topology,
+};
 
 use crate::clock::{DriftConfig, DriftController, FillSample};
 use crate::graph::{self, ConfigSnapshot, GraphPlan};
@@ -97,7 +99,8 @@ impl From<DomainError> for EngineError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Epoch(pub u64);
 
-#[derive(Clone, Copy)]
+/// Not `Clone`/`Copy` — P5's `SwapChain` variant carries a `Box<DspChain>`,
+/// moved through the queue as a pointer, never copied (notes §7).
 struct Envelope {
     epoch: Epoch,
     cmd: MixerCommand,
@@ -132,6 +135,12 @@ pub struct EngineStats {
     pub ring_fill: Vec<(OutputId, f32)>,
     pub applied_ratio: Vec<(OutputId, f64)>,
     pub group_faults: Vec<GroupId>,
+    /// Always-on per-output headroom limiter engagement count (P5) — a
+    /// running total, same style as `xruns`, not reset on read.
+    pub limiter_engaged: Vec<(OutputId, u64)>,
+    /// Current duck gain reduction per group, in dB (0 = not reduced / not a
+    /// duck target).
+    pub duck_depth_db: Vec<(GroupId, f32)>,
 }
 
 const COMMAND_QUEUE_CAPACITY: usize = 256;
@@ -140,6 +149,11 @@ const RING_PERIOD_MARGIN: usize = 4;
 /// Headroom added on top of the tick-period frame count when sizing `Mixer`'s
 /// per-group scratch buffers, to absorb scheduling jitter between ticks.
 const BLOCK_FRAME_MARGIN: usize = 8;
+/// Retired `DspChain`s awaiting an off-RT drop (notes §7) — sized generously
+/// against simultaneous swaps between supervisor drain ticks; the mixer
+/// thread's push is best-effort (drop-on-full, same tolerance as every other
+/// ring/queue here), so this only needs to absorb a burst, not hold forever.
+const RETIRED_CHAIN_QUEUE_CAPACITY: usize = 32;
 
 struct RingGauge {
     fill_permille: AtomicU32,
@@ -174,6 +188,10 @@ struct Persistent {
     /// to `endpoint`; `None` = parked (no fallback device available).
     /// Cleared whenever the app sets a new canonical snapshot.
     overrides: Mutex<HashMap<GroupId, Option<Endpoint>>>,
+    /// Retired `DspChain`s from `SwapChain` applies, drained and dropped by
+    /// the supervisor thread — dealloc never happens on the mixer's RT
+    /// thread (notes §7).
+    retired: ArrayQueue<Box<DspChain>>,
 }
 
 struct RunningGraph {
@@ -194,6 +212,16 @@ struct RunningGraph {
     output_endpoints: Vec<(OutputId, EndpointId)>,
     /// Drained by the recovery supervisor thread.
     fault_rx: Receiver<Fault>,
+    /// Each group's source `Format` and the graph's `max_block_frames` — the
+    /// exact construction parameters `Mixer`'s per-group `DspChain`s were
+    /// built with, so `EngineHandle::apply_dsp_chains` can build a
+    /// replacement chain off-RT with matching buffer sizes (notes §7).
+    group_formats: Vec<(GroupId, Format)>,
+    max_block_frames: usize,
+    /// Telemetry gauges, written by the mixer thread each tick, read
+    /// cross-thread by `EngineHandle::stats` — same pattern as `ring_fill`.
+    duck_depth_db: Arc<Vec<AtomicU32>>,
+    limiter_engaged: Arc<Vec<AtomicU64>>,
 }
 
 pub struct EngineHandle {
@@ -219,8 +247,10 @@ pub fn start(
         events_tx,
         canonical_snapshot: Mutex::new(snapshot.clone()),
         overrides: Mutex::new(HashMap::new()),
+        retired: ArrayQueue::new(RETIRED_CHAIN_QUEUE_CAPACITY),
     });
     let running_graph = build_running_graph(snapshot, &sys, &persistent, &HashSet::new())?;
+    queue_initial_dsp_bypass(&persistent, snapshot);
     let running = Arc::new(Mutex::new(Some(running_graph)));
 
     let supervisor_stop = Arc::new(AtomicBool::new(false));
@@ -243,13 +273,15 @@ pub fn start(
 }
 
 impl EngineHandle {
-    pub fn apply_params(&self, cmds: &[MixerCommand]) -> Result<(), EngineError> {
+    /// Takes ownership of `cmds` (not `&[MixerCommand]`): `SwapChain` carries
+    /// a `Box<DspChain>`, moved into the queue's `Envelope`, never copied.
+    pub fn apply_params(&self, cmds: Vec<MixerCommand>) -> Result<(), EngineError> {
         let running = self.running.lock().unwrap();
         if running.is_none() {
             return Err(EngineError::AlreadyStopped);
         }
         let epoch = Epoch(self.persistent.epoch.load(Ordering::Relaxed));
-        for &cmd in cmds {
+        for cmd in cmds {
             self.persistent
                 .commands
                 .push(Envelope { epoch, cmd })
@@ -283,6 +315,8 @@ impl EngineHandle {
                 ring_fill: Vec::new(),
                 applied_ratio: Vec::new(),
                 group_faults: Vec::new(),
+                limiter_engaged: Vec::new(),
+                duck_depth_db: Vec::new(),
             },
             Some(rg) => EngineStats {
                 xruns: rg.xruns.load(Ordering::Relaxed),
@@ -315,8 +349,56 @@ impl EngineHandle {
                     .filter(|(_, faulted)| faulted.load(Ordering::Relaxed))
                     .map(|(id, _)| *id)
                     .collect(),
+                limiter_engaged: rg
+                    .output_ids
+                    .iter()
+                    .zip(rg.limiter_engaged.iter())
+                    .map(|(id, count)| (*id, count.load(Ordering::Relaxed)))
+                    .collect(),
+                duck_depth_db: rg
+                    .group_ids
+                    .iter()
+                    .zip(rg.duck_depth_db.iter())
+                    .map(|(id, bits)| (*id, f32::from_bits(bits.load(Ordering::Relaxed))))
+                    .collect(),
             },
         }
+    }
+
+    /// Add/remove-stage change (P5): builds each group's new `DspChain`
+    /// off-RT (this call's thread, never the mixer thread — notes §7), then
+    /// funnels the swaps through the same command path as `apply_params`.
+    /// The epoch bump that invalidates stale in-flight commands for the old
+    /// chain shape happens on the mixer thread as a side effect of applying
+    /// the swap (`drain_commands`), not here.
+    pub fn apply_dsp_chains(&self, chains: Vec<(GroupId, Vec<DspSpec>)>) -> Result<(), EngineError> {
+        // Known race (accepted, same tolerance as `apply_rebuild`'s own
+        // documented one): the lock is dropped after this read, so a
+        // concurrent rebuild between here and `apply_params` below could
+        // build a chain against a `max_block_frames`/format that's already
+        // stale. Individually-correct racing calls, eventually consistent —
+        // not worth a stricter lock-holding scheme for how rarely a DSP edit
+        // and a structural rebuild would actually land in the same instant.
+        let (max_block_frames, group_formats) = {
+            let guard = self.running.lock().unwrap();
+            let Some(rg) = guard.as_ref() else {
+                return Err(EngineError::AlreadyStopped);
+            };
+            (rg.max_block_frames, rg.group_formats.clone())
+        };
+
+        let mut commands = Vec::with_capacity(chains.len());
+        for (group, specs) in chains {
+            let Some(&(_, fmt)) = group_formats.iter().find(|(g, _)| *g == group) else {
+                continue; // unknown group id — dropped silently, same convention as everywhere else
+            };
+            let chain = DspChain::new(&specs, fmt, max_block_frames)?;
+            commands.push(MixerCommand::SwapChain {
+                group,
+                chain: Box::new(chain),
+            });
+        }
+        self.apply_params(commands)
     }
 
     pub fn epoch(&self) -> Epoch {
@@ -434,6 +516,7 @@ fn apply_rebuild(
     persistent.epoch.fetch_add(1, Ordering::Relaxed);
     let new_running = build_running_graph(&effective, sys, persistent, &parked)?;
     *guard = Some(new_running);
+    queue_initial_dsp_bypass(persistent, &effective);
     Ok(())
 }
 
@@ -589,6 +672,25 @@ fn build_running_graph(
         .map(|g| (g.id, g.output))
         .collect();
     let output_endpoints: Vec<(OutputId, EndpointId)> = opened.plan.output_endpoints.clone();
+    let group_formats: Vec<(GroupId, Format)> = opened
+        .plan
+        .topology
+        .groups
+        .iter()
+        .map(|g| (g.id, g.input_format))
+        .collect();
+    let duck_depth_db = Arc::new(
+        group_ids
+            .iter()
+            .map(|_| AtomicU32::new(0))
+            .collect::<Vec<_>>(),
+    );
+    let limiter_engaged = Arc::new(
+        output_ids
+            .iter()
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>(),
+    );
 
     let (fault_tx, fault_rx) = mpsc::channel();
     let (capture_threads, group_consumers) = spawn_capture_threads(
@@ -610,6 +712,8 @@ fn build_running_graph(
         stop: Arc::clone(&stop),
         tick_period,
         sys: Arc::clone(sys),
+        duck_depth_db: Arc::clone(&duck_depth_db),
+        limiter_engaged: Arc::clone(&limiter_engaged),
     };
     let mixer_thread = thread::spawn(move || {
         mixer_loop(mixer, group_consumers, output_producers, mixer_args);
@@ -628,6 +732,10 @@ fn build_running_graph(
         group_outputs,
         output_endpoints,
         fault_rx,
+        group_formats,
+        max_block_frames,
+        duck_depth_db,
+        limiter_engaged,
     })
 }
 
@@ -762,6 +870,8 @@ struct MixerThreadArgs {
     stop: Arc<AtomicBool>,
     tick_period: Duration,
     sys: Arc<dyn AudioSystem>,
+    duck_depth_db: Arc<Vec<AtomicU32>>,
+    limiter_engaged: Arc<Vec<AtomicU64>>,
 }
 
 fn mixer_loop(
@@ -784,6 +894,11 @@ fn mixer_loop(
     // Hysteresis state for RingGauge.active — mixer-thread-owned, no per-tick alloc.
     let mut real_this_tick = vec![false; output_producers.len()];
     let mut ticks_since_real = vec![ACTIVE_HOLD_TICKS; output_producers.len()];
+    // Built once at thread start (not per-tick — plain lookups only below):
+    // parallel id lists matching `args.duck_depth_db`/`args.limiter_engaged`'s
+    // index order, which was built from the same topology.
+    let group_ids: Vec<GroupId> = group_consumers.iter().map(|(id, ..)| *id).collect();
+    let output_ids: Vec<OutputId> = output_producers.iter().map(|(id, ..)| *id).collect();
 
     while !args.stop.load(Ordering::Relaxed) {
         let tick_start = Instant::now();
@@ -795,6 +910,8 @@ fn mixer_loop(
             &mut mixer,
             &mut real_this_tick,
         );
+        mixer.mix_tick();
+        update_dsp_telemetry(&mixer, &group_ids, &args.duck_depth_db, &output_ids, &args.limiter_engaged);
         flush_outputs(
             &mut output_producers,
             &mut output_scratch,
@@ -809,6 +926,28 @@ fn mixer_loop(
     }
 }
 
+/// Copies this tick's DSP telemetry (P5) out of the `Mixer` into the
+/// cross-thread gauges `EngineHandle::stats` reads — same pattern as
+/// `RingGauge`. Must run after `mix_tick` (duck depth) and before
+/// `take_output` isn't required (limiter engagement reflects the buffer
+/// `mix_tick` already finished processing).
+fn update_dsp_telemetry(
+    mixer: &Mixer,
+    group_ids: &[GroupId],
+    duck_depth_db: &[AtomicU32],
+    output_ids: &[OutputId],
+    limiter_engaged: &[AtomicU64],
+) {
+    for (i, id) in group_ids.iter().enumerate() {
+        duck_depth_db[i].store(mixer.group_duck_depth_db(*id).to_bits(), Ordering::Relaxed);
+    }
+    for (i, id) in output_ids.iter().enumerate() {
+        if mixer.output_limiter_engaged(*id) {
+            limiter_engaged[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 fn drain_commands(
     persistent: &Persistent,
     mixer: &mut Mixer,
@@ -819,16 +958,32 @@ fn drain_commands(
         if envelope.epoch.0 != persistent.epoch.load(Ordering::Relaxed) {
             continue; // stale — dropped, not applied (topology epoch, notes §7)
         }
-        if let MixerCommand::SetOutputRatio(output_id, ratio) = envelope.cmd {
+        // Matches on a reference: `MixerCommand` is no longer `Copy` (P5's
+        // `SwapChain` carries a `Box<DspChain>`), and `envelope.cmd` is still
+        // needed whole by `mixer.apply` below.
+        if let MixerCommand::SetOutputRatio(output_id, ratio) = &envelope.cmd {
             // Surfaced via EngineStats::applied_ratio; output_index_of is a
             // plain lookup (no alloc/lock), safe on the mixer's RT thread.
-            if let Some(&index) = output_index_of.get(&output_id) {
+            if let Some(&index) = output_index_of.get(output_id) {
                 ring_fill[index]
                     .applied_ratio_bits
                     .store(ratio.value().to_bits(), Ordering::Relaxed);
             }
         }
-        mixer.apply(envelope.cmd);
+        if let Some(retired_chain) = mixer.apply(envelope.cmd) {
+            // Epoch bump happens HERE, as a side effect of applying the
+            // swap — not when the command was sent (dsp-pipeline.md
+            // revision). Any command still queued behind this one that
+            // targeted the pre-swap chain shape (e.g. a stage index that no
+            // longer exists) is dropped by the epoch check above on the
+            // next iteration of this loop.
+            persistent.epoch.fetch_add(1, Ordering::Relaxed);
+            // Retired chain's `Drop` deallocates — never on this RT thread.
+            // Best-effort push: a full queue means the supervisor hasn't
+            // drained recently; the chain leaks until it does, same
+            // tolerance as every other ring/queue in this codebase.
+            let _ = persistent.retired.push(retired_chain);
+        }
     }
 }
 
@@ -970,6 +1125,29 @@ fn push_envelope(persistent: &Persistent, cmd: MixerCommand) {
     let _ = persistent.commands.push(Envelope { epoch, cmd });
 }
 
+/// A fresh `DspChain` always starts un-bypassed (`BypassRamp::new`) — this
+/// re-applies any `bypassed: true` persisted in config right after a build,
+/// via the same `SetDspBypass` command path a live UI toggle uses. Called
+/// after both `start()` and every successful `apply_rebuild()`; a stray
+/// command for a group that got parked out of the actual topology is
+/// silently dropped by `Mixer::apply`, same as any other unknown-id command.
+fn queue_initial_dsp_bypass(persistent: &Persistent, snapshot: &ConfigSnapshot) {
+    for (i, group) in snapshot.groups.iter().enumerate() {
+        for (stage, cfg) in group.dsp.iter().enumerate() {
+            if cfg.bypassed {
+                push_envelope(
+                    persistent,
+                    MixerCommand::SetDspBypass {
+                        group: GroupId(i as u16),
+                        stage,
+                        bypassed: true,
+                    },
+                );
+            }
+        }
+    }
+}
+
 /// Recovery supervisor (drift-and-recovery, notes §10 + L3 interactions
 /// A-E): the only thread that ticks `DriftController`, watches for RT-thread
 /// faults and OS device-change notifications, and triggers rebuilds to
@@ -990,6 +1168,13 @@ fn supervisor_loop(
     let sleeper = spin_sleep::SpinSleeper::default();
 
     while !stop.load(Ordering::Relaxed) {
+        // Off-RT drop of chains retired by a `SwapChain` apply (notes §7) —
+        // runs every tick regardless of graph state, independent of the
+        // `running` lock below.
+        while let Some(chain) = persistent.retired.pop() {
+            drop(chain);
+        }
+
         let snapshot = {
             let guard = running.lock().unwrap();
             guard.as_ref().map(|rg| SupervisorSnapshot {
@@ -1272,6 +1457,8 @@ mod tests {
                 gain: Gain::UNITY,
                 follow_master: true,
                 match_rules: vec![],
+                dsp: Vec::new(),
+                duck: None,
             }],
         }
     }
@@ -1318,7 +1505,7 @@ mod tests {
         ));
 
         assert!(matches!(
-            handle.apply_params(&[]),
+            handle.apply_params(vec![]),
             Err(EngineError::AlreadyStopped)
         ));
     }
@@ -1338,12 +1525,66 @@ mod tests {
         let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(mock_endpoints()));
         let handle = start(&snapshot(), sys).unwrap();
         handle
-            .apply_params(&[MixerCommand::SetGroupGain(GroupId(0), Gain::SILENT)])
+            .apply_params(vec![MixerCommand::SetGroupGain(GroupId(0), Gain::SILENT)])
             .unwrap();
         // No panic / no error is the assertion here: apply_params round-trips
         // through the real lock-free queue into a live mixer thread.
         sleep(Duration::from_millis(30));
         handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn healthy_run_reports_dsp_telemetry_for_every_group_and_output() {
+        let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(mock_endpoints()));
+        let handle = start(&snapshot(), sys).unwrap();
+        sleep(Duration::from_millis(50));
+        let stats = handle.stats();
+        assert_eq!(stats.duck_depth_db.len(), 1); // one group in `snapshot()`
+        assert_eq!(stats.duck_depth_db[0], (GroupId(0), 0.0)); // no duck configured
+        assert_eq!(stats.limiter_engaged.len(), 1); // one output in `snapshot()`
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn apply_dsp_chains_swaps_the_running_groups_chain() {
+        let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(mock_endpoints()));
+        let handle = start(&snapshot(), sys).unwrap();
+        handle
+            .apply_dsp_chains(vec![(GroupId(0), vec![DspSpec::Limiter { ceiling_db: -6.0 }])])
+            .unwrap();
+        // No panic / no error is the assertion here — the swap round-trips
+        // through the same command queue as apply_params, is applied by the
+        // mixer thread, and the retired original chain is dropped off-RT by
+        // the supervisor (asserting the drop itself would need instrumenting
+        // DspChain's Drop, which is more than this integration boundary needs).
+        sleep(Duration::from_millis(30));
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn apply_dsp_chains_on_unknown_group_is_a_silent_no_op() {
+        let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(mock_endpoints()));
+        let handle = start(&snapshot(), sys).unwrap();
+        assert!(handle
+            .apply_dsp_chains(vec![(GroupId(99), vec![DspSpec::Limiter { ceiling_db: -6.0 }])])
+            .is_ok());
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn apply_dsp_chains_after_the_engine_has_stopped_is_an_error() {
+        // Same trigger as `failed_rebuild_leaves_the_engine_stopped_not_rolled_back`:
+        // a rebuild that fails to resolve leaves the graph stopped with no rollback.
+        let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(mock_endpoints()));
+        let handle = start(&snapshot(), sys).unwrap();
+        let mut broken = snapshot();
+        broken.groups[0].bus_endpoint = "does-not-exist".into();
+        assert!(handle.rebuild(&broken).is_err());
+
+        assert!(matches!(
+            handle.apply_dsp_chains(vec![(GroupId(0), vec![])]),
+            Err(EngineError::AlreadyStopped)
+        ));
     }
 
     #[test]
@@ -1458,6 +1699,7 @@ mod tests {
             events_tx,
             canonical_snapshot: Mutex::new(snapshot.clone()),
             overrides: Mutex::new(HashMap::new()),
+            retired: ArrayQueue::new(RETIRED_CHAIN_QUEUE_CAPACITY),
         })
     }
 
@@ -1543,7 +1785,7 @@ mod tests {
         }
 
         // Engine is still alive against the rebuilt graph, not stopped.
-        handle.apply_params(&[]).unwrap();
+        handle.apply_params(vec![]).unwrap();
         assert_eq!(handle.stats().ring_fill.len(), 1);
         handle.shutdown().unwrap();
     }
@@ -1568,7 +1810,7 @@ mod tests {
 
         // Engine survives with a degenerate empty graph (L1 capability 2:
         // "removing an in-use output device never kills the engine").
-        handle.apply_params(&[]).unwrap();
+        handle.apply_params(vec![]).unwrap();
         assert!(handle.stats().ring_fill.is_empty());
         handle.shutdown().unwrap();
     }
@@ -1617,7 +1859,7 @@ mod tests {
             other => panic!("expected Recovered, got {other:?}"),
         }
 
-        handle.apply_params(&[]).unwrap();
+        handle.apply_params(vec![]).unwrap();
         assert_eq!(handle.stats().ring_fill.len(), 1);
         handle.shutdown().unwrap();
     }
@@ -1702,7 +1944,7 @@ mod tests {
             other => panic!("expected Recovered, got {other:?}"),
         }
 
-        handle.apply_params(&[]).unwrap();
+        handle.apply_params(vec![]).unwrap();
         assert_eq!(handle.stats().ring_fill.len(), 1);
         handle.shutdown().unwrap();
     }

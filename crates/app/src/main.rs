@@ -33,6 +33,12 @@ use lifecycle::{InstanceGuard, InstanceOutcome};
 pub enum ShellAction {
     EditParams(Vec<ConfigEdit>),
     EditStructure(Vec<ConfigEdit>),
+    /// `AddDspStage`/`RemoveDspStage` edits only — RT-safe chain swap
+    /// (dsp-pipeline.md), not `EditParams`' plain fast path (the replacement
+    /// `DspChain` needs the group's *post-edit* stage list, so the store
+    /// write has to happen before the engine call, the opposite order from
+    /// `EditParams`) and not `EditStructure`'s full rebuild.
+    EditDspChains(Vec<ConfigEdit>),
     ToggleMute,
     ShowSettings,
     Quit,
@@ -122,7 +128,7 @@ impl Dispatcher {
                 .update_topology(buses, group_rules(&new_snapshot), self.default_output.clone());
         } else {
             if !delta.params.is_empty() {
-                if let Err(e) = self.handle.apply_params(&delta.params) {
+                if let Err(e) = self.handle.apply_params(delta.params) {
                     eprintln!("apply_params failed: {e:?}");
                 }
             }
@@ -158,7 +164,7 @@ impl Dispatcher {
     fn apply_params(&mut self, edits: &[ConfigEdit]) {
         let commands = edits_to_mixer_commands(edits, &self.current);
         if !commands.is_empty() {
-            if let Err(e) = self.handle.apply_params(&commands) {
+            if let Err(e) = self.handle.apply_params(commands) {
                 eprintln!("apply_params failed: {e:?}");
             }
         }
@@ -175,10 +181,54 @@ impl Dispatcher {
         }
     }
 
+    /// Add/remove-stage edits: write to `ConfigStore` first (so the group's
+    /// dsp list reflects the edit), then hand the *whole new list* per
+    /// affected group to `EngineHandle::apply_dsp_chains`, which builds the
+    /// replacement `DspChain` off-RT and swaps it in.
+    fn apply_dsp_chain_edits(&mut self, edits: &[ConfigEdit]) {
+        let affected: Vec<&str> = edits
+            .iter()
+            .filter_map(|e| match e {
+                ConfigEdit::AddDspStage(name, _) | ConfigEdit::RemoveDspStage(name, _) => {
+                    Some(name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+
+        match self.store.apply(edits) {
+            Ok(new_snapshot) => {
+                let chains: Vec<(audio_core::GroupId, Vec<audio_core::DspSpec>)> = affected
+                    .iter()
+                    .filter_map(|name| {
+                        let id = control::group_id_for(&new_snapshot, name)?;
+                        let dsp = new_snapshot
+                            .groups
+                            .iter()
+                            .find(|g| g.name == *name)?
+                            .dsp
+                            .iter()
+                            .map(|s| s.spec.clone())
+                            .collect();
+                        Some((id, dsp))
+                    })
+                    .collect();
+                if !chains.is_empty() {
+                    if let Err(e) = self.handle.apply_dsp_chains(chains) {
+                        eprintln!("apply_dsp_chains failed: {e:?}");
+                    }
+                }
+                self.set_current(new_snapshot);
+            }
+            Err(e) => eprintln!("dsp chain edit rejected: {e:?}"),
+        }
+    }
+
     fn handle_action(&mut self, action: ShellAction) -> Outcome {
         match action {
             ShellAction::EditParams(edits) => self.apply_params(&edits),
             ShellAction::EditStructure(edits) => self.apply_structural(&edits),
+            ShellAction::EditDspChains(edits) => self.apply_dsp_chain_edits(&edits),
             ShellAction::ToggleMute => {
                 let muted = !self.current.muted;
                 self.apply_params(&[ConfigEdit::SetMuted(muted)]);
@@ -206,9 +256,56 @@ fn edits_to_mixer_commands(edits: &[ConfigEdit], current: &ConfigSnapshot) -> Ve
             ConfigEdit::SetFollowMaster(name, follow) => {
                 control::group_id_for(current, name).map(|id| MixerCommand::SetFollowMaster(id, *follow))
             }
+            ConfigEdit::SetEqBand(name, band, spec) => {
+                let group = current.groups.iter().find(|g| &g.name == name)?;
+                let id = control::group_id_for(current, name)?;
+                let stage = group
+                    .dsp
+                    .iter()
+                    .position(|s| matches!(s.spec, audio_core::DspSpec::Eq { .. }))?;
+                Some(MixerCommand::SetDspParam {
+                    group: id,
+                    stage,
+                    param: audio_core::DspParam::EqBand { band: *band, spec: *spec },
+                })
+            }
+            ConfigEdit::SetLimiterCeiling(name, ceiling_db) => {
+                let group = current.groups.iter().find(|g| &g.name == name)?;
+                let id = control::group_id_for(current, name)?;
+                let stage = group
+                    .dsp
+                    .iter()
+                    .position(|s| matches!(s.spec, audio_core::DspSpec::Limiter { .. }))?;
+                Some(MixerCommand::SetDspParam {
+                    group: id,
+                    stage,
+                    param: audio_core::DspParam::LimiterCeilingDb(*ceiling_db),
+                })
+            }
+            ConfigEdit::SetDspBypass(name, stage, bypassed) => control::group_id_for(current, name)
+                .map(|id| MixerCommand::SetDspBypass {
+                    group: id,
+                    stage: *stage,
+                    bypassed: *bypassed,
+                }),
+            ConfigEdit::SetDuck(name, duck) => {
+                let id = control::group_id_for(current, name)?;
+                let resolved = duck.as_ref().and_then(|d| {
+                    control::group_id_for(current, &d.trigger).map(|trigger| audio_core::DuckSpec {
+                        trigger,
+                        amount_db: d.amount_db,
+                        threshold_db: d.threshold_db,
+                        attack_ms: d.attack_ms,
+                        release_ms: d.release_ms,
+                    })
+                });
+                Some(MixerCommand::SetDuck { group: id, duck: resolved })
+            }
             ConfigEdit::SetGroupOutput(..)
             | ConfigEdit::AddGroup(..)
             | ConfigEdit::RemoveGroup(..)
+            | ConfigEdit::RemoveDspStage(..)
+            | ConfigEdit::AddDspStage(..)
             | ConfigEdit::SetRules(..) => None,
         })
         .collect()
@@ -440,6 +537,8 @@ mod tests {
                 gain: Gain::UNITY,
                 follow_master: true,
                 match_rules: vec![],
+                dsp: Vec::new(),
+                duck: None,
             }],
             app: engine::AppConfig::default(),
         }

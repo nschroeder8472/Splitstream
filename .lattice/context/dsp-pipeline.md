@@ -2,7 +2,7 @@
 feature: dsp-pipeline
 requirement_doc: Splitstream-Engineering-Spec.md
 created: 2026-07-18
-status: approved
+status: complete
 ---
 
 # DSP Pipeline (P5)
@@ -24,6 +24,12 @@ status: approved
 | 2026-07-18 | `Mixer::apply` returns `Option<Box<DspChain>>` — retired chain handed back to caller for off-RT drop; `ConfigDelta` gains explicit `DspChains` variant. | Alloc and dealloc both stay off RT thread with a plain return value — no extra channel type in the domain contract (transport-free learning). | Retire channel injected into Mixer::new (transport type in domain contract); implicit reuse of Structural (supervisor would need to re-diff). |
 | 2026-07-18 | Design approved at Level 4. Status set to approved — ready for implementation. | All four levels approved and persisted; drift check vs spec complete. | — |
 | 2026-07-18 | **Revision (cross-blueprint review):** DSP commands are epoch-checked (engine-core `Epoch`). Epoch bumps on structural rebuild **and** on each `SwapChain` apply; `SetDspParam`/`SetDspBypass` carrying a stale epoch are dropped by the mixer. | In-flight `SetDspParam { stage: usize }` racing a chain swap would index the wrong/missing stage. Epoch check makes the race harmless; UI re-sends against fresh state. | Stage ids instead of indices (registry overhead); locking around swap (violates RT no-lock). |
+| 2026-07-20 | **Implementation deviation:** `ConfigDelta` gains `dsp_chains: Option<Vec<(GroupId, Vec<DspSpec>)>>` as a field on the existing struct, not a `DspChains` enum variant as the L4 contract text literally shows. | The contract text predates session-routing's 2026-07-20 revision, which already turned `ConfigDelta` from enum to struct so one config save can carry gain + rules changes simultaneously without one silently dropping the other. Adding an enum variant back would re-break that. | Reintroducing the enum shape (rejected — regresses the simultaneous-edit fix). |
+| 2026-07-20 | Per-stage `bypassed: bool` persists to TOML (`DspStageConfig { spec, bypassed }`, written by `control::store`); `engine::start()`/`apply_rebuild()` re-applies any `bypassed: true` via `queue_initial_dsp_bypass` right after building the graph, since a fresh `DspChain` always constructs un-bypassed. | Explicit user choice (asked directly): matches the existing precedent that group-level mute survives a restart: a bypass toggle is a mix decision, not session-only state. | Runtime-only bypass, not persisted (rejected — user's choice reverts every relaunch). |
+| 2026-07-20 | `Mixer::push_group` does gain + `DspChain` only; a new `Mixer::mix_tick()`, called once per tick after every group's `push_group`, does duck → matrix → SRC → sum → per-output headroom limiter. | L3's ordering constraint (every duck trigger's envelope computed before any target's duck gain is applied, within one block) is impossible to satisfy from the old single-pass-per-group `push_group` shape — this ordering is load-bearing, not a style choice. | None viable — considered and rejected an alternative of using the *previous* tick's envelope (one-tick-delayed sidechain) to avoid the split, but the approved L3 text explicitly requires same-block ordering. |
+| 2026-07-20 | `SwapChain`'s epoch bump happens on the mixer thread (`drain_commands`), as a side effect of `mixer.apply` returning `Some`, not when the caller constructs/sends the command. | Matches the already-logged 2026-07-18 revision literally ("epoch bumps ... on each SwapChain apply"); keeps `EngineHandle::apply_dsp_chains` a thin wrapper around the existing `apply_params` — no separate epoch-bumping call needed on the sender side. | Bumping epoch in `apply_dsp_chains` before sending (rejected — doesn't match the documented revision and races the actual mixer-side swap). |
+| 2026-07-20 | **Review finding, fixed:** `EnvFollower`, `DuckTargetGain`, and `BypassRamp` each originally advanced their one-pole smoother once per *interleaved sample* (or, for `EqBand`'s coefficient recompute, once per 32-frame sub-block) instead of once per *frame* — made duck/bypass timing scale with channel count and EQ param ramps 32x slower than documented. Fixed to advance once per frame, matching `push_group`'s own established pattern. | Caught via `/lattice:review`, confirmed by a channel-count-comparison regression test before fixing. | — |
+| 2026-07-20 | **Review finding, fixed:** `control::store`'s `dsp`/`bands`/`duck` TOML mutation helpers used `.expect()` assuming an array-of-tables/table on-disk shape; a hand-written inline-array/table shape (equally valid, accepted by `parse()`) panicked the app on the first live edit. Fixed to return `StoreError::Validation` instead. | Caught via `/lattice:review`, confirmed by direct reproduction against a hand-written inline-shape config file before fixing. | — |
 
 ## Design: Level 1 -- Capabilities
 
@@ -187,3 +193,13 @@ P5-specific (spec §6.1, §8, §13):
 | Splitstream-Engineering-Spec.md | Requirement spec (§6.1, §8, §11.3, P5) |
 | .lattice/context/engine-core.md | Approved P0–P1 (Mixer contract DSP slots into; MixerCommand ring) |
 | .lattice/context/app-shell.md | Approved P4 (ConfigEdit path for live DSP param changes) |
+| crates/audio-core/src/dsp.rs | `DspStage` trait, `Biquad`/`ParametricEq`, `Limiter`, `DspChain` (domain, pure) |
+| crates/audio-core/src/smoothing.rs | Shared one-pole `Smoothed`, extracted from `mixer.rs` to avoid duplicating it into `dsp.rs` |
+| crates/audio-core/src/mixer.rs | `EnvFollower`, `DuckTargetGain`, two-phase `push_group`/`mix_tick` split, new `MixerCommand` variants, `Mixer::apply` retire-return |
+| crates/audio-core/src/sample.rs | `DuckSpec`, `GroupSpec.dsp`/`.duck`, `DomainError::InvalidEqBand`/`DanglingDuckTrigger` |
+| crates/engine/src/graph.rs | `DuckSpecConfig`, `DspStageConfig`, `GroupConfig.dsp`/`.duck`, trigger-name resolution in `resolve()` |
+| crates/engine/src/runtime.rs | `EngineHandle::apply_dsp_chains`, epoch-bump-on-swap in `drain_commands`, `Persistent::retired` drained by the supervisor, `EngineStats::{limiter_engaged, duck_depth_db}`, `queue_initial_dsp_bypass` |
+| crates/control/src/config.rs | `[[group.dsp]]`/duck TOML parsing, `validate_duck_config` (cycles + unknown triggers), `ConfigDelta.dsp_chains`, three-way `diff()` branching (chain rebuild vs bypass vs duck param) |
+| crates/control/src/store.rs | New `ConfigEdit` variants, TOML-writing helpers for dsp stages/duck (fallible, not `.expect()`-panicking) |
+| crates/app/src/main.rs | `ShellAction::EditDspChains`, `edits_to_mixer_commands` fast-path mapping for EQ/limiter/duck/bypass edits |
+| crates/app/src/ui.rs | Settings-panel EQ/limiter/duck controls (`dsp_controls`, `duck_controls`) |

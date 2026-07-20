@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use audio_core::{Gain, GroupId, GroupSpec, OutputId, OutputSpec, Topology};
+use audio_core::{DspSpec, DuckSpec, Gain, GroupId, GroupSpec, OutputId, OutputSpec, Topology};
 
 use crate::ports::{Endpoint, EndpointId, EndpointKind};
 use crate::runtime::EngineError;
@@ -34,6 +34,31 @@ pub struct GroupConfig {
     /// Raw config strings — parsed into `rules::MatchRule` by `control::group_rules`,
     /// not here (this type only mirrors the TOML shape; see session-routing.md).
     pub match_rules: Vec<String>,
+    pub dsp: Vec<DspStageConfig>,
+    pub duck: Option<DuckSpecConfig>,
+}
+
+/// Pairs a stage's construction spec with its persisted bypass state.
+/// `bypassed` has no place on `audio_core::DspSpec` itself — that type is
+/// pure construction input (notes: `DspChain::new` always starts a stage
+/// un-bypassed); `bypassed` is applied afterward via a `SetDspBypass`
+/// command, same fast-path a live UI toggle uses (see `queue_initial_dsp_bypass`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DspStageConfig {
+    pub spec: DspSpec,
+    pub bypassed: bool,
+}
+
+/// Config-side mirror of `audio_core::DuckSpec` with an unresolved trigger
+/// **name** instead of a `GroupId` — same shape as `bus_endpoint`/
+/// `output_device`, resolved against `snapshot.groups` in [`resolve`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct DuckSpecConfig {
+    pub trigger: String,
+    pub amount_db: f32,
+    pub threshold_db: f32,
+    pub attack_ms: f32,
+    pub release_ms: f32,
 }
 
 /// `AppConfig`/`HotkeyMap`/`HotkeyChord` live here rather than `control` (where
@@ -163,12 +188,38 @@ pub fn resolve(
             }
         };
 
+        let duck = match &g.duck {
+            Some(d) => {
+                let trigger = snapshot
+                    .groups
+                    .iter()
+                    .position(|gg| gg.name == d.trigger)
+                    .map(|i| GroupId(i as u16))
+                    .ok_or_else(|| {
+                        EngineError::Resolve(format!(
+                            "group '{}': duck trigger '{}' not found",
+                            g.name, d.trigger
+                        ))
+                    })?;
+                Some(DuckSpec {
+                    trigger,
+                    amount_db: d.amount_db,
+                    threshold_db: d.threshold_db,
+                    attack_ms: d.attack_ms,
+                    release_ms: d.release_ms,
+                })
+            }
+            None => None,
+        };
+
         groups.push(GroupSpec {
             id: group_id,
             gain: g.gain,
             follow_master: g.follow_master,
             output: output_id,
             input_format: bus.format,
+            dsp: g.dsp.iter().map(|s| s.spec.clone()).collect(),
+            duck,
         });
         group_endpoints.push((group_id, bus.id.clone()));
     }
@@ -232,6 +283,8 @@ mod tests {
             gain: Gain::UNITY,
             follow_master: true,
             match_rules: vec![],
+            dsp: Vec::new(),
+            duck: None,
         }
     }
 
@@ -369,5 +422,55 @@ mod tests {
         // "Music" is snapshot.groups[1] — its GroupId must stay GroupId(1)
         // even though "Parked" (index 0) was skipped, not renumbered to 0.
         assert_eq!(plan.topology.groups[0].id, GroupId(1));
+    }
+
+    #[test]
+    fn resolves_duck_trigger_name_to_the_triggers_positional_group_id() {
+        let snapshot = ConfigSnapshot {
+            schema_version: 2,
+            muted: false,
+            app: AppConfig::default(),
+            master: Gain::UNITY,
+            groups: vec![
+                group("Voice", "Game", "Speakers"),
+                GroupConfig {
+                    duck: Some(DuckSpecConfig {
+                        trigger: "Voice".into(),
+                        amount_db: 12.0,
+                        threshold_db: -40.0,
+                        attack_ms: 5.0,
+                        release_ms: 200.0,
+                    }),
+                    ..group("Music", "Game", "Speakers")
+                },
+            ],
+        };
+        let plan = resolve(&snapshot, &endpoints(), &no_parked()).unwrap();
+        let music = &plan.topology.groups[1];
+        assert_eq!(music.duck.unwrap().trigger, GroupId(0), "Voice is snapshot.groups[0]");
+    }
+
+    #[test]
+    fn unknown_duck_trigger_name_is_a_resolve_error() {
+        let snapshot = ConfigSnapshot {
+            schema_version: 2,
+            muted: false,
+            app: AppConfig::default(),
+            master: Gain::UNITY,
+            groups: vec![GroupConfig {
+                duck: Some(DuckSpecConfig {
+                    trigger: "Nonexistent".into(),
+                    amount_db: 12.0,
+                    threshold_db: -40.0,
+                    attack_ms: 5.0,
+                    release_ms: 200.0,
+                }),
+                ..group("Music", "Game", "Speakers")
+            }],
+        };
+        assert!(matches!(
+            resolve(&snapshot, &endpoints(), &no_parked()),
+            Err(EngineError::Resolve(_))
+        ));
     }
 }
