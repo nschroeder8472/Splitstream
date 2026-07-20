@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use crossbeam_queue::ArrayQueue;
 use rtrb::RingBuffer;
 
-use audio_core::{DomainError, GroupId, Mixer, MixerCommand, OutputId};
+use audio_core::{DomainError, GroupId, Mixer, MixerCommand, OutputId, Topology};
 
 use crate::graph::{self, ConfigSnapshot, GraphPlan};
 use crate::ports::{AudioSystem, CapturePort, PortError, RenderPort};
@@ -305,6 +305,7 @@ fn build_running_graph(
     let tick_period = compute_tick_period(&opened.captures, &opened.renders);
     let max_block_frames = compute_max_block_frames(&opened.plan, tick_period);
     let mixer = Mixer::new(&opened.plan.topology, max_block_frames)?;
+    log_channel_conversions(&opened.plan.topology);
 
     let stop = Arc::new(AtomicBool::new(false));
     let xruns = Arc::new(AtomicU64::new(0));
@@ -352,6 +353,24 @@ fn build_running_graph(
         group_faulted,
         group_ids,
     })
+}
+
+/// Off-RT, called once at graph build (startup/rebuild) — never on the mixer
+/// thread. Surfaces silently-inserted channel conversions (L3 interaction D:
+/// `.lattice/context/channel-mixdown.md`) so a downmix that changes what the
+/// user hears is visible, not a hidden mixer-internal detail.
+fn log_channel_conversions(topology: &Topology) {
+    for g in &topology.groups {
+        let Some(out) = topology.outputs.iter().find(|o| o.id == g.output) else {
+            continue;
+        };
+        if g.input_format.layout != out.format.layout {
+            println!(
+                "group {:?}: {}ch {:?} -> {}ch {:?} channel matrix",
+                g.id, g.input_format.channels, g.input_format.layout, out.format.channels, out.format.layout
+            );
+        }
+    }
 }
 
 fn capture_loop(
@@ -581,13 +600,14 @@ mod tests {
     use super::*;
     use crate::ports::mock::MockSystem;
     use crate::ports::{Endpoint, EndpointId, EndpointKind};
-    use audio_core::{Format, Gain};
+    use audio_core::{ChannelLayout, Format, Gain};
     use std::thread::sleep;
 
     fn stereo(rate: u32) -> Format {
         Format {
             sample_rate: rate,
             channels: 2,
+            layout: ChannelLayout::STEREO,
         }
     }
 

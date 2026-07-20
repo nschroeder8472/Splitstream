@@ -21,6 +21,14 @@ fn config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("splitstream.toml"))
 }
 
+/// The bundled virtual driver product is still an open question (spec §15.2),
+/// so there's no real "Splitstream Bus" device on a dev machine yet — this
+/// lets a real device stand in for one without editing code, e.g. to smoke-test
+/// against actual hardware before a virtual driver is chosen and installed.
+fn bus_name_prefix() -> String {
+    std::env::var("SPLITSTREAM_BUS_PREFIX").unwrap_or_else(|_| "Splitstream Bus".to_string())
+}
+
 fn main() {
     let path = config_path();
 
@@ -29,7 +37,7 @@ fn main() {
         std::process::exit(1);
     });
 
-    let sys: Arc<dyn AudioSystem> = Arc::new(WasapiSystem::new("Splitstream Bus"));
+    let sys: Arc<dyn AudioSystem> = Arc::new(WasapiSystem::new(bus_name_prefix()));
     let handle = engine::start(&snapshot, sys).unwrap_or_else(|e| {
         eprintln!("failed to start engine: {e:?}");
         std::process::exit(1);

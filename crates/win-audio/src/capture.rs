@@ -14,6 +14,8 @@ use windows::Win32::System::Com::CLSCTX_ALL;
 use audio_core::Format;
 use engine::ports::{CapturePort, EndpointId, PortError};
 
+use crate::format::format_from_wfx;
+
 const BUFFER_DURATION_100NS: i64 = 200_000; // 20ms shared-mode buffer hint
 
 pub struct WasapiCapture {
@@ -48,10 +50,7 @@ pub fn open(id: &EndpointId) -> Result<WasapiCapture, PortError> {
         let wfx = client
             .GetMixFormat()
             .map_err(|e| PortError::Backend(e.to_string()))?;
-        let format = Format {
-            sample_rate: (*wfx).nSamplesPerSec,
-            channels: (*wfx).nChannels,
-        };
+        let format = format_from_wfx(wfx);
 
         client
             .Initialize(

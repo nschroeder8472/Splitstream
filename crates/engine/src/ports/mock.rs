@@ -132,6 +132,7 @@ mod tests {
         Format {
             sample_rate: rate,
             channels: 2,
+            layout: audio_core::ChannelLayout::STEREO,
         }
     }
 
