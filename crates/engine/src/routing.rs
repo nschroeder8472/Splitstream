@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -43,11 +43,40 @@ struct State {
     degraded: bool,
 }
 
+/// Grouped by `GroupId`, sorted by it for deterministic reads — a plain
+/// `Mutex` (not a lock-free structure) is fine here: read by the UI/tray on
+/// a control-thread poll, never from the RT audio path.
+type RoutesSnapshot = Arc<Mutex<Vec<(GroupId, Vec<SessionInfo>)>>>;
+
 pub struct RoutingHandle {
     commands: Sender<Command>,
     degraded: Arc<AtomicBool>,
+    routes: RoutesSnapshot,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+}
+
+/// Read-only, `Clone`-able view onto `RoutingHandle`'s state — for a
+/// consumer (app-shell.md's settings window) that needs to poll routes/
+/// degradation every frame but must never call `update_rules`/`update_topology`
+/// or `shutdown`. Split out because `RoutingHandle` itself can't be `Clone`
+/// (it owns the coordinator thread's `JoinHandle`, which isn't), so a
+/// read-only observer needs its own lightweight, independently-cloneable type
+/// rather than sharing the mutating handle.
+#[derive(Clone)]
+pub struct RoutingReader {
+    degraded: Arc<AtomicBool>,
+    routes: RoutesSnapshot,
+}
+
+impl RoutingReader {
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::Relaxed)
+    }
+
+    pub fn current_routes(&self) -> Vec<(GroupId, Vec<SessionInfo>)> {
+        self.routes.lock().unwrap().clone()
+    }
 }
 
 impl RoutingHandle {
@@ -73,6 +102,22 @@ impl RoutingHandle {
 
     pub fn is_degraded(&self) -> bool {
         self.degraded.load(Ordering::Relaxed)
+    }
+
+    /// Snapshot of currently-applied routes, grouped by `GroupId` — the
+    /// settings window's live routed-apps list (app-shell.md L1 §2). Reflects
+    /// the coordinator's last reconcile, not a live query.
+    pub fn current_routes(&self) -> Vec<(GroupId, Vec<SessionInfo>)> {
+        self.routes.lock().unwrap().clone()
+    }
+
+    /// A cloneable read-only handle for a consumer that only needs
+    /// `is_degraded`/`current_routes` — see [`RoutingReader`].
+    pub fn reader(&self) -> RoutingReader {
+        RoutingReader {
+            degraded: Arc::clone(&self.degraded),
+            routes: Arc::clone(&self.routes),
+        }
     }
 
     /// Flow F: endpoints stay hidden, no un-routing (Windows persists
@@ -114,6 +159,7 @@ pub fn start_routing(
 
     let session_events = session.take_events();
     let degraded = Arc::new(AtomicBool::new(state.degraded));
+    let routes = Arc::new(Mutex::new(compute_routes(&state)));
     let stop = Arc::new(AtomicBool::new(false));
     let (commands_tx, commands_rx) = mpsc::channel();
 
@@ -124,6 +170,7 @@ pub fn start_routing(
         commands: commands_rx,
         events,
         degraded: Arc::clone(&degraded),
+        routes: Arc::clone(&routes),
         stop: Arc::clone(&stop),
     };
     let thread = thread::spawn(move || coordinator_loop(state, ctx));
@@ -131,9 +178,32 @@ pub fn start_routing(
     Ok(RoutingHandle {
         commands: commands_tx,
         degraded,
+        routes,
         stop,
         thread: Some(thread),
     })
+}
+
+/// Groups `state.applied` by `GroupId` (reverse-looked-up through
+/// `state.buses`) with each pid's `SessionInfo`, sorted by `GroupId` for a
+/// deterministic read. A pid missing from `live_sessions` (should not happen
+/// — `applied` entries are only ever created alongside a `live_sessions`
+/// insert) or an endpoint no longer present in `buses` (stale entry from
+/// before a rebuild that hasn't reconciled yet) is skipped rather than panicking.
+fn compute_routes(state: &State) -> Vec<(GroupId, Vec<SessionInfo>)> {
+    let mut by_group: HashMap<GroupId, Vec<SessionInfo>> = HashMap::new();
+    for (pid, bus) in &state.applied {
+        let Some(group) = state.buses.iter().find(|(_, e)| *e == bus).map(|(g, _)| *g) else {
+            continue;
+        };
+        let Some(info) = state.live_sessions.get(pid) else {
+            continue;
+        };
+        by_group.entry(group).or_default().push(info.clone());
+    }
+    let mut routes: Vec<_> = by_group.into_iter().collect();
+    routes.sort_by_key(|(g, _)| g.0);
+    routes
 }
 
 /// Wiring/plumbing for the coordinator thread, grouped once the plain
@@ -153,6 +223,7 @@ struct CoordinatorCtx {
     commands: Receiver<Command>,
     events: Sender<EngineEvent>,
     degraded: Arc<AtomicBool>,
+    routes: RoutesSnapshot,
     stop: Arc<AtomicBool>,
 }
 
@@ -180,6 +251,7 @@ fn coordinator_loop(mut state: State, mut ctx: CoordinatorCtx) {
                 }
             }
             ctx.degraded.store(state.degraded, Ordering::Relaxed);
+            *ctx.routes.lock().unwrap() = compute_routes(&state);
         }
 
         while let Ok(evt) = ctx.session_events.try_recv() {
@@ -196,6 +268,7 @@ fn coordinator_loop(mut state: State, mut ctx: CoordinatorCtx) {
                 }
             }
             ctx.degraded.store(state.degraded, Ordering::Relaxed);
+            *ctx.routes.lock().unwrap() = compute_routes(&state);
         }
 
         thread::sleep(RECONCILE_TICK);
@@ -513,6 +586,71 @@ mod tests {
 
         assert!(!handle.is_degraded());
         assert_eq!(policy.routes().get(&100), Some(&bus("bus-game")));
+        handle.shutdown();
+    }
+
+    #[test]
+    fn current_routes_groups_applied_sessions_by_group_id() {
+        let policy = MockPolicyPort::new();
+        let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
+        let (tx, _rx) = mpsc::channel();
+
+        let handle = start_routing(
+            game_rules(),
+            game_buses(),
+            None,
+            Box::new(sessions),
+            Box::new(policy.clone()),
+            tx,
+        )
+        .unwrap();
+
+        let routes = handle.current_routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].0, GroupId(0));
+        assert_eq!(routes[0].1, vec![session(100, "game.exe")]);
+        handle.shutdown();
+    }
+
+    #[test]
+    fn current_routes_is_empty_when_nothing_is_applied() {
+        let policy = MockPolicyPort::new();
+        let sessions = MockSessionPort::new(vec![session(100, "other.exe")]);
+        let (tx, _rx) = mpsc::channel();
+
+        let handle = start_routing(
+            game_rules(),
+            game_buses(),
+            None,
+            Box::new(sessions),
+            Box::new(policy.clone()),
+            tx,
+        )
+        .unwrap();
+
+        assert!(handle.current_routes().is_empty());
+        handle.shutdown();
+    }
+
+    #[test]
+    fn reader_reflects_the_same_state_as_the_owning_handle() {
+        let policy = MockPolicyPort::new();
+        let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
+        let (tx, _rx) = mpsc::channel();
+
+        let handle = start_routing(
+            game_rules(),
+            game_buses(),
+            None,
+            Box::new(sessions),
+            Box::new(policy.clone()),
+            tx,
+        )
+        .unwrap();
+        let reader = handle.reader();
+
+        assert_eq!(reader.current_routes(), handle.current_routes());
+        assert_eq!(reader.is_degraded(), handle.is_degraded());
         handle.shutdown();
     }
 

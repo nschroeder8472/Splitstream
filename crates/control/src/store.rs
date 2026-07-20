@@ -1,0 +1,305 @@
+//! Single write path for shell-driven config edits: semantic edits
+//! ([`ConfigEdit`]) applied to a comment-preserving `toml_edit` document,
+//! validated, then written atomically (temp file + rename). Per app-shell.md's
+//! "machine edits to user-editable files" decision — never raw-text patching,
+//! never re-serialize via serde (that would destroy comments/ordering).
+//!
+//! Keeps its own in-memory `DocumentMut` across `apply()` calls rather than
+//! re-reading the file each time — app-shell.md documents the debounce/hand-edit
+//! race as last-writer-wins for v1, and this store is one of the writers in
+//! that race, so staying with its own last-known document is the accepted
+//! behavior, not a bug.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use toml_edit::{value, Array, ArrayOfTables, DocumentMut, Table};
+
+use audio_core::{Gain, GroupId};
+use engine::{ConfigSnapshot, GroupConfig};
+
+use crate::config::{parse, ConfigError};
+
+#[derive(Debug, Clone)]
+pub enum ConfigEdit {
+    SetGroupGain(String, Gain),
+    SetMaster(Gain),
+    SetMuted(bool),
+    SetFollowMaster(String, bool),
+    SetGroupOutput(String, String),
+    AddGroup(GroupConfig),
+    RemoveGroup(String),
+    SetRules(String, Vec<String>),
+}
+
+#[derive(Debug)]
+pub enum StoreError {
+    Io(String),
+    Validation(ConfigError),
+}
+
+/// `GroupId`s are positional (snapshot order), matching `engine::graph::resolve`'s
+/// own convention — same caveat as `group_rules`: valid as long as `snapshot`
+/// is the one the engine was last built/rebuilt from.
+pub fn group_id_for(snapshot: &ConfigSnapshot, name: &str) -> Option<GroupId> {
+    snapshot
+        .groups
+        .iter()
+        .position(|g| g.name == name)
+        .map(|i| GroupId(i as u16))
+}
+
+pub struct ConfigStore {
+    path: PathBuf,
+    doc: DocumentMut,
+    last_written: Option<ConfigSnapshot>,
+}
+
+impl ConfigStore {
+    /// Reads and validates the file at `path` (both TOML syntax and config
+    /// semantics) before accepting it as a base for edits.
+    pub fn open(path: &Path) -> Result<ConfigStore, StoreError> {
+        let text = fs::read_to_string(path).map_err(|e| StoreError::Io(e.to_string()))?;
+        let doc: DocumentMut = text
+            .parse()
+            .map_err(|e: toml_edit::TomlError| StoreError::Validation(ConfigError::Parse(e.to_string())))?;
+        parse(&text).map_err(StoreError::Validation)?;
+        Ok(ConfigStore {
+            path: path.to_path_buf(),
+            doc,
+            last_written: None,
+        })
+    }
+
+    /// Applies every edit to the in-memory document, validates the result
+    /// parses to a valid `ConfigSnapshot` (rejecting the whole batch and
+    /// leaving the document untouched on failure), then writes atomically.
+    pub fn apply(&mut self, edits: &[ConfigEdit]) -> Result<ConfigSnapshot, StoreError> {
+        let mut draft = self.doc.clone();
+        for edit in edits {
+            apply_edit(&mut draft, edit)?;
+        }
+
+        let text = draft.to_string();
+        let snapshot = parse(&text).map_err(StoreError::Validation)?;
+        write_atomic(&self.path, &text).map_err(StoreError::Io)?;
+
+        self.doc = draft;
+        self.last_written = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    /// True when `snapshot` is exactly what this store last wrote — lets a
+    /// watcher-delivered snapshot be recognized as this store's own echo
+    /// rather than an external edit.
+    pub fn is_echo(&self, snapshot: &ConfigSnapshot) -> bool {
+        self.last_written.as_ref() == Some(snapshot)
+    }
+}
+
+fn apply_edit(doc: &mut DocumentMut, edit: &ConfigEdit) -> Result<(), StoreError> {
+    match edit {
+        ConfigEdit::SetGroupGain(name, gain) => {
+            find_group_table(doc, name)?["gain"] = value(gain.value() as f64);
+        }
+        ConfigEdit::SetMaster(gain) => {
+            doc["master"] = value(gain.value() as f64);
+        }
+        ConfigEdit::SetMuted(muted) => {
+            doc["muted"] = value(*muted);
+        }
+        ConfigEdit::SetFollowMaster(name, follow) => {
+            find_group_table(doc, name)?["follow_master"] = value(*follow);
+        }
+        ConfigEdit::SetGroupOutput(name, device) => {
+            find_group_table(doc, name)?["output_device"] = value(device.as_str());
+        }
+        ConfigEdit::AddGroup(group) => {
+            groups_array(doc).push(group_table(group));
+        }
+        ConfigEdit::RemoveGroup(name) => {
+            let groups = groups_array(doc);
+            let index = groups
+                .iter()
+                .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
+                .ok_or_else(|| no_such_group(name))?;
+            groups.remove(index);
+        }
+        ConfigEdit::SetRules(name, rules) => {
+            find_group_table(doc, name)?["match_rules"] = value(string_array(rules));
+        }
+    }
+    Ok(())
+}
+
+fn groups_array(doc: &mut DocumentMut) -> &mut ArrayOfTables {
+    doc["group"]
+        .or_insert(toml_edit::Item::ArrayOfTables(ArrayOfTables::new()))
+        .as_array_of_tables_mut()
+        .expect("`group` key must hold an array of tables")
+}
+
+fn find_group_table<'a>(doc: &'a mut DocumentMut, name: &str) -> Result<&'a mut Table, StoreError> {
+    groups_array(doc)
+        .iter_mut()
+        .find(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+        .ok_or_else(|| no_such_group(name))
+}
+
+fn no_such_group(name: &str) -> StoreError {
+    StoreError::Validation(ConfigError::Invalid(format!("no group named {name:?}")))
+}
+
+fn group_table(g: &GroupConfig) -> Table {
+    let mut t = Table::new();
+    t["name"] = value(g.name.as_str());
+    t["bus_endpoint"] = value(g.bus_endpoint.as_str());
+    t["output_device"] = value(g.output_device.as_str());
+    t["gain"] = value(g.gain.value() as f64);
+    t["follow_master"] = value(g.follow_master);
+    t["match_rules"] = value(string_array(&g.match_rules));
+    t
+}
+
+fn string_array(items: &[String]) -> Array {
+    items.iter().map(String::as_str).collect()
+}
+
+/// Same-directory temp file + rename: atomic on the same filesystem, and
+/// avoids the watcher observing a half-written file (app-shell.md decision).
+fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
+    let tmp = path.with_extension("toml.tmp");
+    fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use audio_core::Gain;
+
+    fn write_file(dir: &std::path::Path, text: &str) -> PathBuf {
+        let path = dir.join("splitstream.toml");
+        fs::write(&path, text).unwrap();
+        path
+    }
+
+    const BASE: &str = r#"
+schema_version = 2
+master = 0.8 # master volume
+
+[[group]]
+name = "Game"
+bus_endpoint = "Bus 1"
+output_device = "Speakers"
+gain = 1.0
+follow_master = true
+"#;
+
+    #[test]
+    fn open_rejects_malformed_toml_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), "this is not [ valid toml");
+        assert!(matches!(
+            ConfigStore::open(&path),
+            Err(StoreError::Validation(ConfigError::Parse(_)))
+        ));
+    }
+
+    #[test]
+    fn open_rejects_semantically_invalid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), "schema_version = 2\nmaster = -1.0\n");
+        assert!(matches!(
+            ConfigStore::open(&path),
+            Err(StoreError::Validation(ConfigError::Invalid(_)))
+        ));
+    }
+
+    #[test]
+    fn apply_writes_gain_change_and_preserves_comments_and_formatting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let snapshot = store
+            .apply(&[ConfigEdit::SetGroupGain("Game".into(), Gain::new(0.5).unwrap())])
+            .unwrap();
+
+        assert_eq!(snapshot.groups[0].gain, Gain::new(0.5).unwrap());
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("# master volume"), "comment must survive an edit");
+        assert!(on_disk.contains("gain = 0.5"));
+    }
+
+    #[test]
+    fn apply_rejects_edit_for_an_unknown_group_and_leaves_the_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        let result = store.apply(&[ConfigEdit::SetGroupGain(
+            "Nonexistent".into(),
+            Gain::new(0.5).unwrap(),
+        )]);
+
+        assert!(matches!(result, Err(StoreError::Validation(_))));
+        assert_eq!(fs::read_to_string(&path).unwrap(), before, "rejected batch must not touch the file");
+    }
+
+    #[test]
+    fn apply_add_then_remove_group_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let added = GroupConfig {
+            name: "Chat".into(),
+            bus_endpoint: "Bus 2".into(),
+            output_device: "Headset".into(),
+            gain: Gain::UNITY,
+            follow_master: true,
+            match_rules: vec!["chat.exe".into()],
+        };
+        let snapshot = store.apply(&[ConfigEdit::AddGroup(added)]).unwrap();
+        assert_eq!(snapshot.groups.len(), 2);
+        assert_eq!(snapshot.groups[1].name, "Chat");
+        assert_eq!(snapshot.groups[1].match_rules, vec!["chat.exe".to_string()]);
+
+        let snapshot = store.apply(&[ConfigEdit::RemoveGroup("Game".into())]).unwrap();
+        assert_eq!(snapshot.groups.len(), 1);
+        assert_eq!(snapshot.groups[0].name, "Chat");
+    }
+
+    #[test]
+    fn apply_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        store.apply(&[ConfigEdit::SetMaster(Gain::new(0.5).unwrap())]).unwrap();
+
+        assert!(!path.with_extension("toml.tmp").exists());
+    }
+
+    #[test]
+    fn is_echo_recognizes_only_this_stores_own_last_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+        let original = parse(BASE).unwrap();
+        assert!(!store.is_echo(&original), "nothing written yet");
+
+        let written = store.apply(&[ConfigEdit::SetMuted(true)]).unwrap();
+        assert!(store.is_echo(&written));
+        assert!(!store.is_echo(&original));
+    }
+
+    #[test]
+    fn group_id_for_returns_positional_id_matching_snapshot_order() {
+        let snapshot = parse(BASE).unwrap();
+        assert_eq!(group_id_for(&snapshot, "Game"), Some(GroupId(0)));
+        assert_eq!(group_id_for(&snapshot, "Nonexistent"), None);
+    }
+}
