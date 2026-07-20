@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/audio-core",
+    "crates/engine",
+    "crates/win-audio",
+    "crates/control",
+    "crates/app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"

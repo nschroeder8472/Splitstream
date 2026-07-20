@@ -1,0 +1,15 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# Exposes engine::ports::mock to other crates' dev-dependencies (e.g. win-audio's
+# own tests, later app-shell integration tests). Always on under `cfg(test)`.
+test-support = []
+
+[dependencies]
+audio-core = { path = "../audio-core" }
+crossbeam-queue = "0.3"
+rtrb = "0.3"
+spin_sleep = "1"
