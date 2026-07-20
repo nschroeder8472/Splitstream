@@ -5,17 +5,21 @@
 //! layer) depends on `engine` for this type, not the other way around, so
 //! `engine` can be built and tested before `control` exists.
 
+use std::collections::HashSet;
+
 use audio_core::{Gain, GroupId, GroupSpec, OutputId, OutputSpec, Topology};
 
 use crate::ports::{Endpoint, EndpointId, EndpointKind};
 use crate::runtime::EngineError;
 
+#[derive(Clone)]
 pub struct ConfigSnapshot {
     pub schema_version: u32,
     pub master: Gain,
     pub groups: Vec<GroupConfig>,
 }
 
+#[derive(Clone)]
 pub struct GroupConfig {
     pub name: String,
     pub bus_endpoint: String,
@@ -36,9 +40,16 @@ pub struct GraphPlan {
 /// Resolves group/device names against the live endpoint list. Multiple
 /// groups naming the same `output_device` share one `OutputId` (spec:
 /// "shared outputs" — their audio sums cleanly at that one physical device).
+///
+/// `parked` names groups (drift-and-recovery: no fallback device available)
+/// to exclude from the resulting graph entirely rather than erroring — the
+/// group's `GroupId` stays reserved at its original index (`GroupId(i)`
+/// comes from `snapshot.groups`' position, not a running counter), so
+/// later groups keep stable ids across a rebuild that parks an earlier one.
 pub fn resolve(
     snapshot: &ConfigSnapshot,
     endpoints: &[Endpoint],
+    parked: &HashSet<String>,
 ) -> Result<GraphPlan, EngineError> {
     let find = |kind: EndpointKind, name: &str| {
         endpoints.iter().find(|e| e.kind == kind && e.name == name)
@@ -52,6 +63,9 @@ pub fn resolve(
 
     for (i, g) in snapshot.groups.iter().enumerate() {
         let group_id = GroupId(i as u16);
+        if parked.contains(&g.name) {
+            continue;
+        }
 
         let bus = find(EndpointKind::Bus, &g.bus_endpoint).ok_or_else(|| {
             EngineError::Resolve(format!(
@@ -140,6 +154,10 @@ mod tests {
         ]
     }
 
+    fn no_parked() -> HashSet<String> {
+        HashSet::new()
+    }
+
     fn group(name: &str, bus: &str, output: &str) -> GroupConfig {
         GroupConfig {
             name: name.into(),
@@ -158,7 +176,7 @@ mod tests {
             master: Gain::UNITY,
             groups: vec![group("Game", "Game", "Speakers")],
         };
-        let plan = resolve(&snapshot, &endpoints()).unwrap();
+        let plan = resolve(&snapshot, &endpoints(), &no_parked()).unwrap();
         assert_eq!(plan.topology.groups.len(), 1);
         assert_eq!(plan.topology.outputs.len(), 1);
         assert_eq!(plan.group_endpoints[0].1, EndpointId("bus-1".into()));
@@ -175,7 +193,7 @@ mod tests {
                 group("Music", "Game", "Speakers"),
             ],
         };
-        let plan = resolve(&snapshot, &endpoints()).unwrap();
+        let plan = resolve(&snapshot, &endpoints(), &no_parked()).unwrap();
         assert_eq!(
             plan.topology.outputs.len(),
             1,
@@ -195,7 +213,7 @@ mod tests {
             groups: vec![group("Game", "Nonexistent", "Speakers")],
         };
         assert!(matches!(
-            resolve(&snapshot, &endpoints()),
+            resolve(&snapshot, &endpoints(), &no_parked()),
             Err(EngineError::Resolve(_))
         ));
     }
@@ -208,8 +226,41 @@ mod tests {
             groups: vec![group("Game", "Game", "Nonexistent")],
         };
         assert!(matches!(
-            resolve(&snapshot, &endpoints()),
+            resolve(&snapshot, &endpoints(), &no_parked()),
             Err(EngineError::Resolve(_))
         ));
+    }
+
+    #[test]
+    fn parked_group_is_excluded_without_erroring() {
+        let snapshot = ConfigSnapshot {
+            schema_version: 2,
+            master: Gain::UNITY,
+            groups: vec![group("Game", "Game", "Nonexistent")],
+        };
+        let mut parked = HashSet::new();
+        parked.insert("Game".to_string());
+        let plan = resolve(&snapshot, &endpoints(), &parked).unwrap();
+        assert!(plan.topology.groups.is_empty());
+        assert!(plan.topology.outputs.is_empty());
+    }
+
+    #[test]
+    fn parking_an_earlier_group_keeps_later_groups_ids_stable() {
+        let snapshot = ConfigSnapshot {
+            schema_version: 2,
+            master: Gain::UNITY,
+            groups: vec![
+                group("Parked", "Game", "Speakers"),
+                group("Music", "Game", "Headphones"),
+            ],
+        };
+        let mut parked = HashSet::new();
+        parked.insert("Parked".to_string());
+        let plan = resolve(&snapshot, &endpoints(), &parked).unwrap();
+        assert_eq!(plan.topology.groups.len(), 1);
+        // "Music" is snapshot.groups[1] — its GroupId must stay GroupId(1)
+        // even though "Parked" (index 0) was skipped, not renumbered to 0.
+        assert_eq!(plan.topology.groups[0].id, GroupId(1));
     }
 }
