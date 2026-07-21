@@ -457,6 +457,7 @@ name = "audio-core"
 version = "0.1.0"
 dependencies = [
  "rubato",
+ "rustfft",
  "thiserror 2.0.19",
 ]
 

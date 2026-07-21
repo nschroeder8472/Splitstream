@@ -44,4 +44,4 @@ Blueprints in `.lattice/context/`, all `status: approved`. Implement in this ord
    5. Config/UI integration for DSP edits
    6. Exit: stages audibly correct, no clipping on shared outputs
 
-Deferred: P6 own driver (spec §13, separate signing track).
+Dropped: P6 own driver (spec §13). Won't ship — Microsoft driver-signing (EV cert + attestation, legal entity, recurring cert) is bureaucratic overkill for free open-source with no revenue. v1's bundled-driver path (VB-Audio / VB-CABLE, name-prefix bus classification, degraded-state reinstall prompt) is the permanent design, not a stopgap. Revisit only if native branded endpoints or capture-device exposure (spec open question #6, OBS/Discord) ever become must-haves.

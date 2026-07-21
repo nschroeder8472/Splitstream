@@ -17,7 +17,8 @@ use crossbeam_queue::ArrayQueue;
 use rtrb::RingBuffer;
 
 use audio_core::{
-    DomainError, DspChain, DspSpec, Format, GroupId, Mixer, MixerCommand, OutputId, Topology,
+    ChannelLayout, DomainError, DspChain, DspSpec, Format, GroupId, HrirSet, Mixer, MixerCommand,
+    OutputId, Render, Retired, Topology,
 };
 
 use crate::clock::{DriftConfig, DriftController, FillSample};
@@ -188,10 +189,10 @@ struct Persistent {
     /// to `endpoint`; `None` = parked (no fallback device available).
     /// Cleared whenever the app sets a new canonical snapshot.
     overrides: Mutex<HashMap<GroupId, Option<Endpoint>>>,
-    /// Retired `DspChain`s from `SwapChain` applies, drained and dropped by
-    /// the supervisor thread — dealloc never happens on the mixer's RT
-    /// thread (notes §7).
-    retired: ArrayQueue<Box<DspChain>>,
+    /// Retired chains/renders from `SwapChain`/`SwapRender` applies, drained
+    /// and dropped by the supervisor thread — dealloc never happens on the
+    /// mixer's RT thread (notes §7).
+    retired: ArrayQueue<Retired>,
 }
 
 struct RunningGraph {
@@ -213,10 +214,13 @@ struct RunningGraph {
     /// Drained by the recovery supervisor thread.
     fault_rx: Receiver<Fault>,
     /// Each group's source `Format` and the graph's `max_block_frames` — the
-    /// exact construction parameters `Mixer`'s per-group `DspChain`s were
-    /// built with, so `EngineHandle::apply_dsp_chains` can build a
-    /// replacement chain off-RT with matching buffer sizes (notes §7).
+    /// exact construction parameters `Mixer`'s per-group `DspChain`s/`Render`s
+    /// were built with, so `EngineHandle::apply_dsp_chains`/`apply_spatial`
+    /// can build a replacement off-RT with matching buffer sizes (notes §7).
     group_formats: Vec<(GroupId, Format)>,
+    /// Each output's `Format` — the `to` side `EngineHandle::apply_spatial`
+    /// needs to decide (and build) a group's replacement `Render`.
+    output_formats: Vec<(OutputId, Format)>,
     max_block_frames: usize,
     /// Telemetry gauges, written by the mixer thread each tick, read
     /// cross-thread by `EngineHandle::stats` — same pattern as `ring_fill`.
@@ -397,6 +401,48 @@ impl EngineHandle {
                 group,
                 chain: Box::new(chain),
             });
+        }
+        self.apply_params(commands)
+    }
+
+    /// Live spatial-audio toggle (spatial-audio.md): builds each group's new
+    /// `Render` off-RT (this call's thread, never the mixer thread — notes
+    /// §7) against the group's current input/output `Format`s, then funnels
+    /// the swaps through the same command path as `apply_params`/
+    /// `apply_dsp_chains`. `Render::build` owns the fallback rule (spatial
+    /// requested but the output isn't stereo -> plain matrix).
+    pub fn apply_spatial(&self, changes: &[(GroupId, bool)]) -> Result<(), EngineError> {
+        // Same accepted eventually-consistent race as `apply_dsp_chains`: the
+        // lock is dropped after this read, so a concurrent rebuild could
+        // make `max_block_frames`/formats stale by the time the command
+        // below applies. Individually-correct racing calls, not worth a
+        // stricter lock-holding scheme for how rarely this would matter.
+        let (max_block_frames, group_formats, group_outputs, output_formats) = {
+            let guard = self.running.lock().unwrap();
+            let Some(rg) = guard.as_ref() else {
+                return Err(EngineError::AlreadyStopped);
+            };
+            (
+                rg.max_block_frames,
+                rg.group_formats.clone(),
+                rg.group_outputs.clone(),
+                rg.output_formats.clone(),
+            )
+        };
+
+        let mut commands = Vec::with_capacity(changes.len());
+        for &(group, spatial) in changes {
+            let Some(&(_, from)) = group_formats.iter().find(|(g, _)| *g == group) else {
+                continue; // unknown group id — dropped silently, same convention as apply_dsp_chains
+            };
+            let Some(&(_, output_id)) = group_outputs.iter().find(|(g, _)| *g == group) else {
+                continue;
+            };
+            let Some(&(_, to)) = output_formats.iter().find(|(o, _)| *o == output_id) else {
+                continue;
+            };
+            let render = Render::build(spatial, from, to, max_block_frames);
+            commands.push(MixerCommand::SwapRender { group, render: Box::new(render) });
         }
         self.apply_params(commands)
     }
@@ -631,7 +677,7 @@ fn build_running_graph(
     let tick_period = compute_tick_period(&opened.captures, &opened.renders);
     let max_block_frames = compute_max_block_frames(&opened.plan, tick_period);
     let mixer = Mixer::new(&opened.plan.topology, max_block_frames)?;
-    log_channel_conversions(&opened.plan.topology);
+    log_channel_conversions(&opened.plan.topology, max_block_frames);
 
     let stop = Arc::new(AtomicBool::new(false));
     let xruns = Arc::new(AtomicU64::new(0));
@@ -678,6 +724,13 @@ fn build_running_graph(
         .groups
         .iter()
         .map(|g| (g.id, g.input_format))
+        .collect();
+    let output_formats: Vec<(OutputId, Format)> = opened
+        .plan
+        .topology
+        .outputs
+        .iter()
+        .map(|o| (o.id, o.format))
         .collect();
     let duck_depth_db = Arc::new(
         group_ids
@@ -733,6 +786,7 @@ fn build_running_graph(
         output_endpoints,
         fault_rx,
         group_formats,
+        output_formats,
         max_block_frames,
         duck_depth_db,
         limiter_engaged,
@@ -741,9 +795,10 @@ fn build_running_graph(
 
 /// Off-RT, called once at graph build (startup/rebuild) — never on the mixer
 /// thread. Surfaces silently-inserted channel conversions (L3 interaction D:
-/// `.lattice/context/channel-mixdown.md`) so a downmix that changes what the
-/// user hears is visible, not a hidden mixer-internal detail.
-fn log_channel_conversions(topology: &Topology) {
+/// `.lattice/context/channel-mixdown.md`) and spatial-audio render choices
+/// (spatial-audio.md's interaction F/E) so a downmix or binaural render that
+/// changes what the user hears is visible, not a hidden mixer-internal detail.
+fn log_channel_conversions(topology: &Topology, max_block_frames: usize) {
     for g in &topology.groups {
         let Some(out) = topology.outputs.iter().find(|o| o.id == g.output) else {
             continue;
@@ -753,6 +808,19 @@ fn log_channel_conversions(topology: &Topology) {
                 "group {:?}: {}ch {:?} -> {}ch {:?} channel matrix",
                 g.id, g.input_format.channels, g.input_format.layout, out.format.channels, out.format.layout
             );
+        }
+        if !g.spatial {
+            continue;
+        }
+        if out.format.layout == ChannelLayout::STEREO {
+            let taps = HrirSet::taps_for(out.format.sample_rate);
+            let partition = max_block_frames.max(1).next_power_of_two();
+            println!(
+                "group {:?}: {}ch {:?} -> binaural (partition {partition}, hrir {taps} taps @{})",
+                g.id, g.input_format.channels, g.input_format.layout, out.format.sample_rate
+            );
+        } else {
+            println!("group {:?}: spatial ignored (output not stereo)", g.id);
         }
     }
 }
@@ -1459,6 +1527,7 @@ mod tests {
                 match_rules: vec![],
                 dsp: Vec::new(),
                 duck: None,
+                spatial: false,
             }],
         }
     }
@@ -1559,6 +1628,43 @@ mod tests {
         // DspChain's Drop, which is more than this integration boundary needs).
         sleep(Duration::from_millis(30));
         handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn apply_spatial_toggles_the_running_groups_render() {
+        let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(mock_endpoints()));
+        let handle = start(&snapshot(), sys).unwrap();
+        handle.apply_spatial(&[(GroupId(0), true)]).unwrap();
+        // No panic / no error is the assertion here — the swap round-trips
+        // through the same command queue as apply_params/apply_dsp_chains,
+        // is applied by the mixer thread, and the retired original render
+        // is dropped off-RT by the supervisor. `snapshot()`'s one group
+        // routes to a stereo output, so this exercises the real Spatial
+        // path, not just the non-stereo fallback.
+        sleep(Duration::from_millis(30));
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn apply_spatial_on_unknown_group_is_a_silent_no_op() {
+        let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(mock_endpoints()));
+        let handle = start(&snapshot(), sys).unwrap();
+        assert!(handle.apply_spatial(&[(GroupId(99), true)]).is_ok());
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn apply_spatial_after_the_engine_has_stopped_is_an_error() {
+        let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(mock_endpoints()));
+        let handle = start(&snapshot(), sys).unwrap();
+        let mut broken = snapshot();
+        broken.groups[0].bus_endpoint = "does-not-exist".into();
+        assert!(handle.rebuild(&broken).is_err());
+
+        assert!(matches!(
+            handle.apply_spatial(&[(GroupId(0), true)]),
+            Err(EngineError::AlreadyStopped)
+        ));
     }
 
     #[test]

@@ -470,6 +470,9 @@ Real code must: register the thread with MMCSS before the loop; handle `AUDCLNT_
 - Design alignment: `§6.1 Format` — `layout` field restored as `ChannelLayout` value object (WASAPI-mask-compatible); implementation had dropped it. Design now matches spec's original domain model (channel-mixdown design).
 - Design override: `§6.1 key types` — `ChannelMatrix` added to audio-core's type list. Reason: N→M channel conversion is pure domain DSP (channel-mixdown design).
 - Design elaboration (cross-blueprint review): mixer thread is timer-paced with silence synthesis for idle loopback buses (§7.1); topology `Epoch` guards in-flight commands across rebuilds/chain swaps; `schema_version` policy — v2 covers `muted`/`[app]`/duck fields, unknown newer versions rejected (§11.3). Details in the five `.lattice/context/*.md` revision sections.
+- Design addition: `§2.1/§6.1 DSP scope` — HRTF virtual-surround rendering added beyond the spec's "EQ, ducking, limiter" set: `Render::Spatial(Spatializer)` as an alternative N→2 stage beside `ChannelMatrix` (fixed-virtual-speaker HRIR convolution, partitioned FFT, embedded public-domain set). Reason: fills the surround-on-headphones gap vs SteelSeries Sonar. See `.lattice/context/spatial-audio.md`.
+- Design override: channel-mixdown's recorded "no synthetic surround / no HRTF" boundary — superseded: HRTF virtualization now in scope as a per-group opt-in alternative render path; the plain matrix path and all its decisions (BS.775, LFE drop) stand untouched. Spatial path diverges deliberately on LFE: mixed into both ears at −6 dB (spatial-audio design).
+- Design addition: `§11.3 config schema` — per-group `spatial: bool` (default false) toggles virtualization; effective only when the group's output is stereo, silently falls back to matrix otherwise (spatial-audio design).
 
 ---
 

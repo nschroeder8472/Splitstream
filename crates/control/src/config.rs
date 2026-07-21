@@ -72,6 +72,8 @@ struct RawGroup {
     dsp: Vec<RawDspStage>,
     #[serde(default)]
     duck: Option<RawDuck>,
+    #[serde(default)]
+    spatial: bool,
 }
 
 /// TOML shape for `[[group.dsp]]` (spec §11.3). `bypassed` has no place on
@@ -237,6 +239,7 @@ pub(crate) fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
                 match_rules: g.match_rules,
                 dsp,
                 duck,
+                spatial: g.spatial,
             })
         })
         .collect::<Result<Vec<_>, ConfigError>>()?;
@@ -279,11 +282,21 @@ pub struct ConfigDelta {
     /// not a full rebuild. A pure param tweak (existing stage's band/ceiling
     /// value) or a bypass toggle stays in `params` instead (see `diff`).
     pub dsp_chains: Option<Vec<(GroupId, Vec<DspSpec>)>>,
+    /// Spatial-audio toggle changes — funnels through
+    /// `EngineHandle::apply_spatial`'s off-thread `Render` rebuild + swap
+    /// path (spatial-audio.md), not a full rebuild and not a plain
+    /// `MixerCommand` (unlike `params`, building a `Render` needs the
+    /// group's current topology, same reason `dsp_chains` isn't in `params`).
+    pub spatial: Option<Vec<(GroupId, bool)>>,
 }
 
 impl ConfigDelta {
     pub fn is_unchanged(&self) -> bool {
-        !self.structural && self.params.is_empty() && self.rules.is_none() && self.dsp_chains.is_none()
+        !self.structural
+            && self.params.is_empty()
+            && self.rules.is_none()
+            && self.dsp_chains.is_none()
+            && self.spatial.is_none()
     }
 }
 
@@ -320,6 +333,7 @@ pub fn diff(old: &ConfigSnapshot, new: &ConfigSnapshot) -> ConfigDelta {
     let mut params = Vec::new();
     let mut rules_changed = false;
     let mut dsp_chains: Vec<(GroupId, Vec<DspSpec>)> = Vec::new();
+    let mut spatial: Vec<(GroupId, bool)> = Vec::new();
     if old.master != new.master {
         params.push(MixerCommand::SetMaster(new.master));
     }
@@ -340,6 +354,9 @@ pub fn diff(old: &ConfigSnapshot, new: &ConfigSnapshot) -> ConfigDelta {
         }
         if o.match_rules != n.match_rules {
             rules_changed = true;
+        }
+        if o.spatial != n.spatial {
+            spatial.push((id, n.spatial));
         }
 
         // Stage count/type/order/param changed — an RT-safe chain swap, not
@@ -389,6 +406,7 @@ pub fn diff(old: &ConfigSnapshot, new: &ConfigSnapshot) -> ConfigDelta {
         params,
         rules: rules_changed.then(|| group_rules(new)),
         dsp_chains: (!dsp_chains.is_empty()).then_some(dsp_chains),
+        spatial: (!spatial.is_empty()).then_some(spatial),
     }
 }
 
@@ -482,6 +500,7 @@ mod tests {
             match_rules: vec![],
             dsp: Vec::new(),
             duck: None,
+            spatial: false,
         }
     }
 
@@ -981,6 +1000,61 @@ mod tests {
             &delta.params[0],
             MixerCommand::SetDuck { group: GroupId(1), duck: Some(d) } if d.trigger == GroupId(0)
         ));
+    }
+
+    #[test]
+    fn diff_reports_a_spatial_entry_for_a_spatial_only_change_not_structural() {
+        let a = ConfigSnapshot {
+            schema_version: 2,
+            master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
+            groups: vec![group("Game", "Bus", "Out", 1.0, true)],
+        };
+        let mut b = a.clone();
+        b.groups[0].spatial = true;
+
+        let delta = diff(&a, &b);
+        assert!(!delta.structural);
+        assert!(delta.dsp_chains.is_none());
+        assert!(delta.params.is_empty(), "spatial has no direct MixerCommand equivalent");
+        let spatial = delta.spatial.expect("expected a spatial delta");
+        assert_eq!(spatial, vec![(GroupId(0), true)]);
+    }
+
+    #[test]
+    fn diff_reports_unchanged_when_spatial_flag_is_the_same() {
+        let a = ConfigSnapshot {
+            schema_version: 2,
+            master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
+            groups: vec![group("Game", "Bus", "Out", 1.0, true)],
+        };
+        let b = a.clone();
+        assert!(diff(&a, &b).is_unchanged());
+    }
+
+    #[test]
+    fn parses_the_spatial_flag_defaulting_to_false() {
+        let toml = r#"
+            schema_version = 2
+            master = 1.0
+
+            [[group]]
+            name = "Game"
+            bus_endpoint = "Bus"
+            output_device = "Out"
+
+            [[group]]
+            name = "Music"
+            bus_endpoint = "Bus2"
+            output_device = "Out"
+            spatial = true
+        "#;
+        let snapshot = parse(toml).unwrap();
+        assert!(!snapshot.groups[0].spatial);
+        assert!(snapshot.groups[1].spatial);
     }
 
     #[test]
