@@ -21,8 +21,9 @@ pub struct WasapiSystem {
 impl WasapiSystem {
     /// `bus_name_prefix`: render endpoints whose friendly name starts with
     /// this are classified as `Bus`, everything else `Physical` — see the
-    /// classification note in `enumerator.rs` (bundled virtual driver choice
-    /// is still an open question, so this isn't hardcoded to one vendor).
+    /// classification note in `enumerator.rs`. Splitstream rides a bundled
+    /// third-party virtual driver (VB-Audio / VB-CABLE), so bus detection is
+    /// by configurable name prefix rather than a hardcoded vendor scheme.
     pub fn new(bus_name_prefix: impl Into<String>) -> WasapiSystem {
         WasapiSystem {
             enumerator: EndpointEnumerator::new(bus_name_prefix),

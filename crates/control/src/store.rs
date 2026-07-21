@@ -36,6 +36,10 @@ pub enum ConfigEdit {
     SetDspBypass(String, usize, bool),
     AddDspStage(String, DspSpec),
     RemoveDspStage(String, usize),
+    /// Live spatial-audio toggle (spatial-audio.md) — funnels through
+    /// `ShellAction::EditSpatial`/`EngineHandle::apply_spatial`, not the
+    /// plain `EditParams` fast path (see `ConfigDelta.spatial`'s doc).
+    SetSpatial(String, bool),
 }
 
 #[derive(Debug)]
@@ -172,6 +176,9 @@ fn apply_edit(doc: &mut DocumentMut, edit: &ConfigEdit) -> Result<(), StoreError
             }
             stages.remove(*stage_idx);
         }
+        ConfigEdit::SetSpatial(name, on) => {
+            find_group_table(doc, name)?["spatial"] = value(*on);
+        }
         ConfigEdit::SetDuck(name, duck) => {
             let group = find_group_table(doc, name)?;
             match duck {
@@ -292,6 +299,7 @@ fn group_table(g: &GroupConfig) -> Table {
     t["output_device"] = value(g.output_device.as_str());
     t["gain"] = value(g.gain.value() as f64);
     t["follow_master"] = value(g.follow_master);
+    t["spatial"] = value(g.spatial);
     t["match_rules"] = value(string_array(&g.match_rules));
     if !g.dsp.is_empty() {
         let mut arr = ArrayOfTables::new();
@@ -416,6 +424,7 @@ follow_master = true
             match_rules: vec!["chat.exe".into()],
             dsp: Vec::new(),
             duck: None,
+            spatial: false,
         };
         let snapshot = store.apply(&[ConfigEdit::AddGroup(added)]).unwrap();
         assert_eq!(snapshot.groups.len(), 2);
@@ -564,6 +573,24 @@ name = "Voice"
 bus_endpoint = "Bus 2"
 output_device = "Speakers"
 "#;
+
+    #[test]
+    fn set_spatial_then_unset_round_trips_and_preserves_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let snapshot = store
+            .apply(&[ConfigEdit::SetSpatial("Game".into(), true)])
+            .unwrap();
+        assert!(snapshot.groups[0].spatial);
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("# master volume"), "comment must survive an edit");
+        assert!(on_disk.contains("spatial = true"));
+
+        let snapshot = store.apply(&[ConfigEdit::SetSpatial("Game".into(), false)]).unwrap();
+        assert!(!snapshot.groups[0].spatial);
+    }
 
     #[test]
     fn set_duck_then_clear_duck_round_trips() {

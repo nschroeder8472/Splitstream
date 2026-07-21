@@ -6,9 +6,68 @@ use crate::channel::ChannelMatrix;
 use crate::dsp::{db_to_linear, DspChain, DspParam, DspStage, Limiter};
 use crate::resample::Src;
 use crate::sample::{
-    DomainError, DuckSpec, Format, Gain, GroupId, GroupSpec, OutputId, ResampleRatio, Topology,
+    ChannelLayout, DomainError, DuckSpec, Format, Gain, GroupId, GroupSpec, OutputId,
+    ResampleRatio, Topology,
 };
 use crate::smoothing::Smoothed;
+use crate::spatial::{HrirSet, Spatializer};
+
+/// Alternative N->2 render stage beside [`ChannelMatrix`], selected per-group
+/// (spatial-audio.md). `Spatial` is never an identity transform.
+pub enum Render {
+    Matrix(ChannelMatrix),
+    Spatial(Spatializer),
+}
+
+impl Render {
+    /// Shared by `build_group` (initial construction) and
+    /// `engine::EngineHandle::apply_spatial` (live toggle, off-thread
+    /// rebuild) — see spatial-audio.md's "Render::build" decision. Owns the
+    /// fallback rule: `spatial` only takes effect when `to` is stereo.
+    pub fn build(spatial: bool, from: Format, to: Format, max_block_frames: usize) -> Render {
+        if spatial && to.layout == ChannelLayout::STEREO {
+            let hrirs = HrirSet::embedded(to.sample_rate);
+            Render::Spatial(Spatializer::new(from.layout, &hrirs, max_block_frames))
+        } else {
+            Render::Matrix(ChannelMatrix::new(from.layout, to.layout))
+        }
+    }
+
+    /// Matrix-identity only; `Spatial` is always a real transform.
+    pub fn is_identity(&self) -> bool {
+        match self {
+            Render::Matrix(m) => m.is_identity(),
+            Render::Spatial(_) => false,
+        }
+    }
+
+    pub fn process(&mut self, input: &[f32], output: &mut [f32]) -> usize {
+        match self {
+            Render::Matrix(m) => m.process(input, output),
+            Render::Spatial(s) => s.process(input, output),
+        }
+    }
+}
+
+/// Manual impl: `Spatializer` holds `Arc<dyn rustfft::Fft<f32>>`, which has
+/// no `Debug` — same rationale as `DspChain`'s manual impl in `dsp.rs`.
+impl std::fmt::Debug for Render {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Render::Matrix(_) => f.write_str("Render::Matrix"),
+            Render::Spatial(_) => f.write_str("Render::Spatial"),
+        }
+    }
+}
+
+/// What a `SwapChain`/`SwapRender` apply hands back for the caller to drop
+/// off-RT (notes §7) — widened from a bare `Box<DspChain>` (dsp-pipeline.md)
+/// once `SwapRender` needed the same swap-and-retire path.
+#[derive(Debug)]
+pub enum Retired {
+    Chain(Box<DspChain>),
+    Render(Box<Render>),
+}
 
 #[derive(Debug)]
 pub enum MixerCommand {
@@ -48,6 +107,17 @@ pub enum MixerCommand {
     SwapChain {
         group: GroupId,
         chain: Box<DspChain>,
+    },
+    /// Live spatial-audio toggle (spatial-audio.md): the new `Render` is
+    /// built off-thread by the caller (`engine::EngineHandle::apply_spatial`)
+    /// against the group's current topology, moved in here, and the retired
+    /// `Render` is handed back for the caller to drop off-thread. No epoch
+    /// field: unlike `SwapChain`, this touches no stage indices a queued
+    /// command could go stale against, and the supervisor is the sole
+    /// producer, so a stale swap is simply last-write-wins, harmless.
+    SwapRender {
+        group: GroupId,
+        render: Box<Render>,
     },
 }
 
@@ -171,9 +241,12 @@ struct GroupState {
     // a fraction of a sample over a ~10ms ramp — inaudible.
     master: Smoothed,
     /// Converts source layout -> output layout, between the DSP chain and
-    /// SRC. Skipped entirely when `is_identity()` (same layout in and out).
-    matrix: ChannelMatrix,
-    /// Matrix output, pre-SRC. Capacity: `max_block_frames * output channels`.
+    /// SRC — either the plain channel matrix or a binaural spatializer.
+    /// Boxed at construction (off-RT) so a live `SwapRender` command is a
+    /// pointer move, never an RT allocation (notes §7). Skipped entirely
+    /// when `is_identity()` (same layout in and out, `Matrix` only).
+    render: Box<Render>,
+    /// Render output, pre-SRC. Capacity: `max_block_frames * output channels`.
     matrixed: Vec<f32>,
     src: Src,
     /// Gain-applied, then DSP-chain- and duck-processed samples, pre-matrix.
@@ -260,7 +333,12 @@ fn build_group(
     let out_channels = out_spec.format.channels as usize;
     let sample_rate = gspec.input_format.sample_rate;
 
-    let matrix = ChannelMatrix::new(gspec.input_format.layout, out_spec.format.layout);
+    let render = Box::new(Render::build(
+        gspec.spatial,
+        gspec.input_format,
+        out_spec.format,
+        max_block_frames,
+    ));
 
     // SRC runs post-matrix: both sides already share `out_channels` and
     // `out_spec.format.layout`, so only the sample rate differs between
@@ -285,7 +363,7 @@ fn build_group(
         follow_master: gspec.follow_master,
         gain: Smoothed::new(gspec.gain.value(), sample_rate, GAIN_TIME_CONSTANT_S),
         master: Smoothed::new(topology.master.value(), sample_rate, GAIN_TIME_CONSTANT_S),
-        matrix,
+        render,
         matrixed: vec![0.0; max_block_frames * out_channels],
         src,
         scratch: vec![0.0; max_block_frames * channels],
@@ -335,9 +413,9 @@ impl Mixer {
 
     /// Unknown ids are dropped silently: the command ring may still carry a
     /// stale-epoch command past the point its group/output was torn down.
-    /// Returns the retired chain on `SwapChain` — the caller drops it
-    /// off-RT (notes §7); every other variant returns `None`.
-    pub fn apply(&mut self, cmd: MixerCommand) -> Option<Box<DspChain>> {
+    /// Returns the retired chain/render on `SwapChain`/`SwapRender` — the
+    /// caller drops it off-RT (notes §7); every other variant returns `None`.
+    pub fn apply(&mut self, cmd: MixerCommand) -> Option<Retired> {
         match cmd {
             MixerCommand::SetGroupGain(id, gain) => {
                 if let Some(g) = self.groups.iter_mut().find(|g| g.id == id) {
@@ -392,7 +470,12 @@ impl Mixer {
                 .groups
                 .iter_mut()
                 .find(|g| g.id == group)
-                .map(|g| std::mem::replace(&mut g.dsp_chain, chain)),
+                .map(|g| Retired::Chain(std::mem::replace(&mut g.dsp_chain, chain))),
+            MixerCommand::SwapRender { group, render } => self
+                .groups
+                .iter_mut()
+                .find(|g| g.id == group)
+                .map(|g| Retired::Render(std::mem::replace(&mut g.render, render))),
         }
     }
 
@@ -469,12 +552,13 @@ impl Mixer {
             let n = self.groups[i].valid_len;
             let g = &mut self.groups[i];
 
-            // Matrix stage: skipped entirely (no copy) when source and
-            // output share a layout — the common case should pay nothing extra.
-            let (matrix_input, matrix_len): (&[f32], usize) = if g.matrix.is_identity() {
+            // Render stage: skipped entirely (no copy) when the matrix is
+            // identity — the common case should pay nothing extra. `Spatial`
+            // is never identity, so it always goes through `render.process`.
+            let (matrix_input, matrix_len): (&[f32], usize) = if g.render.is_identity() {
                 (&g.scratch[..n], n)
             } else {
-                let len = g.matrix.process(&g.scratch[..n], &mut g.matrixed);
+                let len = g.render.process(&g.scratch[..n], &mut g.matrixed);
                 (&g.matrixed[..len], len)
             };
 
@@ -584,6 +668,7 @@ mod tests {
                 input_format: stereo(48_000),
                 dsp: Vec::new(),
                 duck: None,
+                spatial: false,
             }],
             outputs: vec![OutputSpec {
                 id: OutputId(1),
@@ -690,6 +775,7 @@ mod tests {
                 input_format: stereo(48_000),
                 dsp: Vec::new(),
                 duck: None,
+                spatial: false,
             }],
             outputs: vec![],
         };
@@ -714,6 +800,7 @@ mod tests {
                 input_format: five_one(48_000),
                 dsp: Vec::new(),
                 duck: None,
+                spatial: false,
             }],
             outputs: vec![OutputSpec {
                 id: OutputId(1),
@@ -735,6 +822,7 @@ mod tests {
                 input_format: five_one(48_000),
                 dsp: Vec::new(),
                 duck: None,
+                spatial: false,
             }],
             outputs: vec![OutputSpec {
                 id: OutputId(1),
@@ -804,6 +892,7 @@ mod tests {
                 input_format: bad_format,
                 dsp: Vec::new(),
                 duck: None,
+                spatial: false,
             }],
             outputs: vec![OutputSpec {
                 id: OutputId(1),
@@ -834,6 +923,7 @@ mod tests {
                     attack_ms: 5.0,
                     release_ms: 200.0,
                 }),
+                spatial: false,
             }],
             outputs: vec![OutputSpec {
                 id: OutputId(1),
@@ -858,6 +948,7 @@ mod tests {
                     input_format: stereo(48_000),
                     dsp: Vec::new(),
                     duck: None,
+                    spatial: false,
                 },
                 GroupSpec {
                     id: GroupId(2), // target — e.g. music, ducks under GroupId(1)
@@ -873,6 +964,7 @@ mod tests {
                         attack_ms: 5.0,
                         release_ms: 200.0,
                     }),
+                    spatial: false,
                 },
             ],
             outputs: vec![OutputSpec {
@@ -999,6 +1091,7 @@ mod tests {
                 input_format: stereo(48_000),
                 dsp: vec![DspSpec::Limiter { ceiling_db: -6.0 }],
                 duck: None,
+                spatial: false,
             }],
             outputs: vec![OutputSpec {
                 id: OutputId(1),
@@ -1036,6 +1129,7 @@ mod tests {
                     input_format: stereo(48_000),
                     dsp: Vec::new(),
                     duck: None,
+                    spatial: false,
                 },
                 GroupSpec {
                     id: GroupId(2),
@@ -1045,6 +1139,7 @@ mod tests {
                     input_format: stereo(48_000),
                     dsp: Vec::new(),
                     duck: None,
+                    spatial: false,
                 },
             ],
             outputs: vec![OutputSpec {
@@ -1069,5 +1164,82 @@ mod tests {
         for &s in &settled {
             assert!(s <= 1.0 + 1e-2, "expected no clipping above full scale, got {s}");
         }
+    }
+
+    #[test]
+    fn render_build_selects_spatial_when_spatial_and_output_is_stereo() {
+        let render = Render::build(true, five_one(48_000), stereo(48_000), 256);
+        assert!(matches!(render, Render::Spatial(_)));
+        assert!(!render.is_identity(), "Spatial must never report identity");
+    }
+
+    #[test]
+    fn render_build_falls_back_to_matrix_when_output_is_not_stereo() {
+        // spatial=true but the output is 5.1, not stereo -- the design's
+        // documented fallback (mixer owns the rule, not a config error).
+        let render = Render::build(true, five_one(48_000), five_one(48_000), 256);
+        assert!(matches!(render, Render::Matrix(_)));
+        assert!(render.is_identity(), "same layout in/out -> the matrix path is identity");
+    }
+
+    #[test]
+    fn spatial_group_with_stereo_output_produces_binaural_audio_without_panicking() {
+        let topo = Topology {
+            master: Gain::UNITY,
+            groups: vec![GroupSpec {
+                id: GroupId(1),
+                gain: Gain::UNITY,
+                follow_master: false,
+                output: OutputId(1),
+                input_format: five_one(48_000),
+                dsp: Vec::new(),
+                duck: None,
+                spatial: true,
+            }],
+            outputs: vec![OutputSpec {
+                id: OutputId(1),
+                format: stereo(48_000),
+            }],
+        };
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        let frames = vec![0.5f32; 64 * 6];
+
+        let collected = run_ticks(&mut mixer, GroupId(1), OutputId(1), &frames, 80);
+
+        assert!(!collected.is_empty(), "spatialized output never produced any samples");
+        assert!(collected.iter().any(|&s| s.abs() > 1e-4), "spatialized output is silent");
+    }
+
+    #[test]
+    fn swap_render_replaces_the_running_render_and_returns_the_retired_one() {
+        let topo = single_group_topology(1.0, false, 1.0); // built non-spatial (Matrix, identity)
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+
+        let new_render = Box::new(Render::build(true, stereo(48_000), stereo(48_000), 256));
+        let retired = mixer.apply(MixerCommand::SwapRender {
+            group: GroupId(1),
+            render: new_render,
+        });
+        assert!(
+            matches!(retired, Some(Retired::Render(_))),
+            "swap should hand back the previously-installed render"
+        );
+
+        let frames = vec![0.5f32; 64 * 2];
+        let collected = run_ticks(&mut mixer, GroupId(1), OutputId(1), &frames, 80);
+        assert!(!collected.is_empty(), "post-swap spatial render produced no output");
+    }
+
+    #[test]
+    fn swap_render_on_unknown_group_is_a_no_op_returning_none() {
+        let topo = single_group_topology(1.0, false, 1.0);
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        let render = Box::new(Render::build(false, stereo(48_000), stereo(48_000), 256));
+        assert!(mixer
+            .apply(MixerCommand::SwapRender {
+                group: GroupId(99),
+                render,
+            })
+            .is_none());
     }
 }

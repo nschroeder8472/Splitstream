@@ -39,6 +39,13 @@ pub enum ShellAction {
     /// write has to happen before the engine call, the opposite order from
     /// `EditParams`) and not `EditStructure`'s full rebuild.
     EditDspChains(Vec<ConfigEdit>),
+    /// `SetSpatial` edits only — write to `ConfigStore` first (same order as
+    /// `EditDspChains`: the replacement `Render` needs the group's *post-edit*
+    /// output routing), then `EngineHandle::apply_spatial`'s off-RT
+    /// build-and-swap path (spatial-audio.md). Not `EditParams`' fast path:
+    /// building a `Render` needs the group's current topology, not just a
+    /// scalar value.
+    EditSpatial(Vec<ConfigEdit>),
     ToggleMute,
     ShowSettings,
     Quit,
@@ -224,11 +231,40 @@ impl Dispatcher {
         }
     }
 
+    /// `SetSpatial` edits: write to `ConfigStore` first (so the group's
+    /// `spatial` flag and current `output_device` are both post-edit), then
+    /// hand the resolved `(GroupId, bool)` pairs to
+    /// `EngineHandle::apply_spatial`, which builds the replacement `Render`
+    /// off-RT and swaps it in.
+    fn apply_spatial_edits(&mut self, edits: &[ConfigEdit]) {
+        match self.store.apply(edits) {
+            Ok(new_snapshot) => {
+                let changes: Vec<(audio_core::GroupId, bool)> = edits
+                    .iter()
+                    .filter_map(|e| match e {
+                        ConfigEdit::SetSpatial(name, on) => {
+                            control::group_id_for(&new_snapshot, name).map(|id| (id, *on))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !changes.is_empty() {
+                    if let Err(e) = self.handle.apply_spatial(&changes) {
+                        eprintln!("apply_spatial failed: {e:?}");
+                    }
+                }
+                self.set_current(new_snapshot);
+            }
+            Err(e) => eprintln!("spatial edit rejected: {e:?}"),
+        }
+    }
+
     fn handle_action(&mut self, action: ShellAction) -> Outcome {
         match action {
             ShellAction::EditParams(edits) => self.apply_params(&edits),
             ShellAction::EditStructure(edits) => self.apply_structural(&edits),
             ShellAction::EditDspChains(edits) => self.apply_dsp_chain_edits(&edits),
+            ShellAction::EditSpatial(edits) => self.apply_spatial_edits(&edits),
             ShellAction::ToggleMute => {
                 let muted = !self.current.muted;
                 self.apply_params(&[ConfigEdit::SetMuted(muted)]);
@@ -306,7 +342,8 @@ fn edits_to_mixer_commands(edits: &[ConfigEdit], current: &ConfigSnapshot) -> Ve
             | ConfigEdit::RemoveGroup(..)
             | ConfigEdit::RemoveDspStage(..)
             | ConfigEdit::AddDspStage(..)
-            | ConfigEdit::SetRules(..) => None,
+            | ConfigEdit::SetRules(..)
+            | ConfigEdit::SetSpatial(..) => None,
         })
         .collect()
 }
@@ -539,6 +576,7 @@ mod tests {
                 match_rules: vec![],
                 dsp: Vec::new(),
                 duck: None,
+                spatial: false,
             }],
             app: engine::AppConfig::default(),
         }
@@ -576,6 +614,17 @@ mod tests {
             ConfigEdit::SetRules("Game".into(), vec!["game.exe".into()]),
             ConfigEdit::RemoveGroup("Game".into()),
         ];
+
+        assert!(edits_to_mixer_commands(&edits, &snapshot).is_empty());
+    }
+
+    #[test]
+    fn spatial_edits_have_no_mixer_command_equivalent() {
+        // SetSpatial funnels through EngineHandle::apply_spatial (needs the
+        // group's current topology to build a Render), not a plain
+        // MixerCommand — same reason AddDspStage/RemoveDspStage aren't here.
+        let snapshot = snapshot_with_group("Game");
+        let edits = vec![ConfigEdit::SetSpatial("Game".into(), true)];
 
         assert!(edits_to_mixer_commands(&edits, &snapshot).is_empty());
     }

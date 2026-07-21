@@ -200,6 +200,10 @@ pub struct GroupSpec {
     /// at source layout).
     pub dsp: Vec<crate::dsp::DspSpec>,
     pub duck: Option<DuckSpec>,
+    /// Per-group virtual-surround/stereo-widen toggle (spatial-audio.md).
+    /// `Render::build` falls back to the plain channel matrix automatically
+    /// when this group's output isn't stereo.
+    pub spatial: bool,
 }
 
 #[derive(Debug, Clone)]

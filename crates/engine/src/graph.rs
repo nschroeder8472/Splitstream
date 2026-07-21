@@ -36,6 +36,9 @@ pub struct GroupConfig {
     pub match_rules: Vec<String>,
     pub dsp: Vec<DspStageConfig>,
     pub duck: Option<DuckSpecConfig>,
+    /// Per-group virtual-surround/stereo-widen toggle (spatial-audio.md) —
+    /// mirrors `audio_core::GroupSpec.spatial`.
+    pub spatial: bool,
 }
 
 /// Pairs a stage's construction spec with its persisted bypass state.
@@ -220,6 +223,7 @@ pub fn resolve(
             input_format: bus.format,
             dsp: g.dsp.iter().map(|s| s.spec.clone()).collect(),
             duck,
+            spatial: g.spatial,
         });
         group_endpoints.push((group_id, bus.id.clone()));
     }
@@ -285,6 +289,7 @@ mod tests {
             match_rules: vec![],
             dsp: Vec::new(),
             duck: None,
+            spatial: false,
         }
     }
 

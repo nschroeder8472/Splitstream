@@ -1,13 +1,12 @@
 //! `IMMDeviceEnumerator` → discover bus + physical endpoints (spec F1).
 //!
-//! Bus vs Physical classification: **the bundled virtual driver product is
-//! still an open question** (spec §15.2 / `.lattice/context/engine-core.md`
-//! Open Questions — VB-Audio matrix vs multiple VB-CABLE, licensing
-//! unresolved). Hardcoding either vendor's naming scheme here would be
-//! premature. Classification is by configurable name prefix instead — any
-//! active render endpoint whose friendly name starts with `bus_name_prefix`
-//! is a `Bus`, everything else is `Physical`. Revisit once the driver
-//! choice lands.
+//! Bus vs Physical classification: Splitstream sits on top of a bundled
+//! third-party signed virtual driver (VB-Audio matrix or multiple VB-CABLE
+//! instances — spec §9.5). Shipping our own driver (P6) is dropped, so this
+//! name-prefix scheme is the permanent design, not a stopgap: any active
+//! render endpoint whose friendly name starts with `bus_name_prefix` is a
+//! `Bus`, everything else is `Physical`. Configurable prefix keeps it vendor
+//! -agnostic across whichever bundled driver an install ships with.
 
 use windows::core::PWSTR;
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;

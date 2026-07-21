@@ -171,6 +171,11 @@ impl SettingsApp {
                 self.send(ShellAction::EditParams(vec![ConfigEdit::SetFollowMaster(name.clone(), follow)]));
             }
 
+            let mut spatial = group.spatial;
+            if ui.checkbox(&mut spatial, "Spatial audio").changed() {
+                self.send(ShellAction::EditSpatial(vec![ConfigEdit::SetSpatial(name.clone(), spatial)]));
+            }
+
             ui.horizontal(|ui| {
                 ui.label("Output:");
                 ui.text_edit_singleline(&mut output_draft);
@@ -370,6 +375,7 @@ impl SettingsApp {
                     match_rules: vec![],
                     dsp: Vec::new(),
                     duck: None,
+                    spatial: false,
                 };
                 self.send(ShellAction::EditStructure(vec![ConfigEdit::AddGroup(group)]));
                 self.new_group = NewGroupDraft::default();
