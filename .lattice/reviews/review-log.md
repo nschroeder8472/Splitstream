@@ -1,5 +1,47 @@
 # Review Log
 
+## 2026-07-22 — session-mute-on-capture, full implementation
+- **Scope**: 4 files (ports/mod.rs, ports/mock.rs, routing.rs, win-audio/sessions.rs) — application+infrastructure layers
+- **Atoms**: clean-code, architecture, secure-coding, test-quality (DDD skipped — no domain-folder files touched)
+- **Result**: 0 critical, 0 warning, 0 suggestion
+- **Key findings**: none survived — matches L4 contracts verbatim, mute strictly follows confirmed capture success, mute failure correctly isolated from `RoutingDegraded`
+- **Strengths**: all 4 L3 flows plus the negative (failed-capture-never-muted) case covered by tests; 94/94 engine tests + full workspace build clean
+
+## 2026-07-22 — mixer-ui-redesign, settings window column layout + drag-and-drop
+- **Scope**: 4 files (routing.rs, event_pump.rs, main.rs wiring, ui.rs full rewrite), engine+shell layers
+- **Atoms**: clean-code, architecture, test-quality
+- **Result**: 0 critical, 1 warning (resolved: confirmed intentional), 1 suggestion (fixed)
+- **Key findings**: Master's Mute checkbox moved behind gear icon by inferred symmetry, not mockup-dictated — user confirmed keep-as-is; one test's input data never actually exercised the glob-rule-survives-unassign path it claimed to test
+- **Strengths**: `resolve_drag_assign`'s full target×has_exact branch matrix independently tested; egui 0.35 dnd API verified against real vendored source, zero compile-fix churn across all 3 layers
+
+## 2026-07-22 — process-loopback-capture, full architecture pivot
+- **Scope**: 22 files (4 new, 2 deleted) across engine/win-audio/control/app, all layers
+- **Atoms**: clean-code, architecture, secure-coding, test-quality
+- **Result**: 0 critical, 1 warning, 1 suggestion
+- **Key findings**: spec `## Links` says §9.5 (virtual driver) is eliminated, but §2.2/§9.5 body/§13/§15 open-question text still describes BYOD as active; `Dispatcher::set_current` double-locks `ui` mutex unnecessarily
+- **Strengths**: async completion-callback given a bounded timeout, lock scope kept off the blocking WASAPI activation call, and a dead-capture-thread reap/retry path — all three real-hardware review findings from the prior session, already fixed before this review; `cargo check`/`cargo test --workspace` clean (87+ engine tests)
+
+## 2026-07-21 — simple-launch, installer/splitstream.iss
+- **Scope**: 1 file (new), build-artifact layer (no code)
+- **Atoms**: clean-code, architecture, secure-coding
+- **Result**: 0 critical, 0 warning, 0 suggestion
+- **Key findings**: none survived — verified `ArchitecturesInstallIn64BitMode=x64compatible`, `RunOnceId`, GUID escaping against live docs rather than memory
+- **Strengths**: `runasoriginaluser` correctly used on both `[Run]` and `[UninstallRun]` for the elevated-installer/de-elevated-app split
+
+## 2026-07-21 — simple-launch, onboarding UI + bus-classification plumbing
+- **Scope**: 8 files (ui.rs, engine::AudioSystem/AppConfig, win-audio enumerator/monitor/system/sessions/lib) across domain/application/shell layers
+- **Atoms**: clean-code, architecture, secure-coding, test-quality
+- **Result**: 0 critical, 1 warning, 0 suggestion — fixed
+- **Key findings**: onboarding's `output_device` fallback could collide with the picked `bus_endpoint` (OS default output already being the virtual cable), silently failing the first post-onboarding rebuild
+- **Strengths**: proactively reused the prior review's "never hold a shared lock across a blocking call" fix in the new `BusMatch` enumerator code, unprompted
+
+## 2026-07-21 — simple-launch, control + app infra layers (in-progress)
+- **Scope**: 7 files (2 new) across control/app, application+shell layers
+- **Atoms**: clean-code, architecture, secure-coding, test-quality
+- **Result**: 0 critical, 1 warning, 2 suggestion — all fixed
+- **Key findings**: `Dispatcher::set_current` held the per-frame UI mutex across a blocking WASAPI `enumerate()` call; `write_atomic` duplicated verbatim between `config.rs`/`store.rs`; seed template's `schema_version` was a second hardcoded literal
+- **Strengths**: reused one `sys.enumerate()` call across `needs_onboarding`+`available_devices` instead of duplicating it; fatal-vs-non-fatal startup error classification matches the blueprint's Flow 5 exactly
+
 ## 2026-07-19 — engine-core (P0–P1), full implementation
 - **Scope**: ~20 files across 5 crates, all layers (domain/application/infrastructure/shell)
 - **Atoms**: clean-code, architecture, domain-driven-design, secure-coding, test-quality
@@ -48,6 +90,13 @@
 - **Result**: 1 critical, 0 warning, 0 suggestion — fixed same session
 - **Key findings**: `store.rs`'s `dsp_array`/`bands`/`duck` TOML mutation helpers used `.expect()` assuming an array-of-tables/table on-disk shape; a hand-written but equally-valid inline shape (`bands = [{...}]`, `dsp = [{...}]`, `duck = {...}`) parses fine at `ConfigStore::open` but panicked the whole app on the first `SetEqBand`/`AddDspStage`/`SetDuck` edit against it. Confirmed by direct reproduction before fixing; converted to `StoreError::Validation` at all three sites.
 - **Strengths**: `diff()`'s three-way dsp_chains/bypass-only/duck branching correctly avoids an unnecessary chain rebuild for a pure bypass toggle; duck cycle detection and unknown-trigger validation both run at config-parse time (fail fast, before ever reaching the engine); 39/39 control tests and 85/85 engine tests passing throughout
+
+## 2026-07-21 — process-loopback-capture, full implementation
+- **Scope**: 24 files (2 new, 2 deleted) across engine/win-audio/control/app, application+infrastructure+shell layers
+- **Atoms**: clean-code, architecture, secure-coding, test-quality (DDD skipped — no domain-folder files touched)
+- **Result**: 1 critical/warning borderline, 1 warning, 1 suggestion — all 3 fixed same session
+- **Key findings**: `CaptureControl::apply_capture_sources` held the engine's shared running-graph lock across a blocking, unbounded-wait WASAPI COM activation call — the 3rd occurrence of this project's "blocking call under a shared lock" shape, invisible to mock-backed tests; restructured to open ports unlocked, added a timeout to the underlying async wait. A pid whose capture thread died mid-stream (not at open) was never reaped, permanently zombied instead of retried per the L3 "retried every time" design intent — fixed with an `is_finished()` reap pass, proven by a new regression test. `process_capture::open`'s ~120-line body split at its activation/initialize seam.
+- **Strengths**: real-hardware validation against a live pid caught two independent bugs (a `STATUS_HEAP_CORRUPTION` from a `PROPVARIANT`/`ManuallyDrop` interaction, and `GetMixFormat` returning `E_NOTIMPL` on this client type) before either shipped, both documented with the real error and fix reasoning in the context doc; 224 workspace tests green throughout, including a new mid-stream-death regression test that fails against the pre-fix code
 
 ## 2026-07-20 — spatial-audio, full implementation
 - **Scope**: 12 files (10 modified + spatial.rs/hrir_data.rs new) across audio-core/control/engine/app, domain+application+infrastructure+shell layers

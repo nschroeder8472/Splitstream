@@ -3,17 +3,10 @@ name = "win-audio"
 version.workspace = true
 edition.workspace = true
 
-[features]
-# Isolates the undocumented AudioPolicyConfig/IPolicyConfig surfaces (spec
-# §9.3–9.4, notes §13) behind a build-time gate — feature off or activation
-# failure both surface as PolicyError::Unavailable, one code path either way
-# (session-routing.md decision).
-policy-routing = []
-
 [dependencies]
 audio-core = { version = "0.1.0", path = "../audio-core" }
 engine = { version = "0.1.0", path = "../engine" }
-windows = { version = "0.62.2", features = ["Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_Storage_StructuredStorage", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Variant", "Win32_Devices_Properties", "Win32_Devices_FunctionDiscovery", "Win32_Foundation", "Win32_System_Threading", "Win32_Media_KernelStreaming", "Win32_Security", "Win32_System_WinRT"] }
+windows = { version = "0.62.2", features = ["Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_Storage_StructuredStorage", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Variant", "Win32_Devices_Properties", "Win32_Devices_FunctionDiscovery", "Win32_Foundation", "Win32_System_Threading", "Win32_Media_KernelStreaming", "Win32_Security"] }
 # Direct dep (not just transitive via `windows`): the `#[implement]` macro
 # (used in monitor.rs for IMMNotificationClient) expands to absolute
 # `::windows_core::...` paths, which only resolve if windows-core is a

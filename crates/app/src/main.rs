@@ -1,15 +1,22 @@
 //! Splitstream shell binary: single-instance guard, autostart, engine +
 //! session-routing startup, config hot-reload, tray + hotkeys + settings
 //! window. See `.lattice/context/app-shell.md` (P4).
+//!
+//! `windows_subsystem = "windows"` (release only — dev builds keep the
+//! console) voids `eprintln!`/stderr and any panic message once a
+//! double-clicked/logon launch has no console attached; `logging::init`
+//! (simple-launch.md) is the replacement diagnostic surface and must ship in
+//! the same change as this attribute (operational-learnings 2026-07-20).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod event_pump;
 mod hotkeys;
 mod lifecycle;
+mod logging;
+mod paths;
 mod tray;
 mod ui;
 
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -17,8 +24,8 @@ use std::thread;
 use std::time::Duration;
 
 use control::{group_rules, ConfigEdit, ConfigStore};
-use engine::ports::{AudioSystem, EndpointId, PolicyPort, SessionPort};
-use engine::{ConfigSnapshot, EngineEvent, EngineHandle, RoutingHandle};
+use engine::ports::{AudioSystem, SessionPort};
+use engine::{CaptureControl, ConfigSnapshot, EngineEvent, EngineHandle, RoutingHandle};
 use win_audio::WasapiSystem;
 
 use event_pump::{EventPump, UiState};
@@ -51,35 +58,12 @@ pub enum ShellAction {
     Quit,
 }
 
-/// No platform-config-directory convention has been decided yet — defaults
-/// to the current directory; override with a path argument.
-fn config_path() -> PathBuf {
-    std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("splitstream.toml"))
-}
-
-/// The bundled virtual driver product is still an open question (spec §15.2),
-/// so there's no real "Splitstream Bus" device on a dev machine yet — this
-/// lets a real device stand in for one without editing code.
-fn bus_name_prefix() -> String {
-    std::env::var("SPLITSTREAM_BUS_PREFIX").unwrap_or_else(|_| "Splitstream Bus".to_string())
-}
-
-/// Re-resolves group -> bus `EndpointId` from a fresh device enumeration.
-/// `EngineHandle` has no accessor for its internally-resolved graph, so
-/// routing (a separate subsystem, control-plane only) resolves its own copy
-/// the same way `engine::start`/`rebuild` does internally — cheap, non-RT.
-fn routing_buses(sys: &dyn AudioSystem, snapshot: &ConfigSnapshot) -> HashMap<audio_core::GroupId, EndpointId> {
-    let endpoints = sys.enumerate().unwrap_or_default();
-    match engine::graph::resolve(snapshot, &endpoints, &HashSet::new()) {
-        Ok(plan) => plan.group_endpoints.into_iter().collect(),
-        Err(e) => {
-            eprintln!("routing: bus resolution failed, routing table left empty: {e:?}");
-            HashMap::new()
-        }
-    }
+/// True when the config has no groups at all — the onboarding gate
+/// (process-loopback-capture pivot: a group only needs `output_device` to
+/// resolve, a normal resolve-time concern, not an onboarding one; there's no
+/// more virtual-bus classification step to gate on).
+fn needs_onboarding(snapshot: &ConfigSnapshot) -> bool {
+    snapshot.groups.is_empty()
 }
 
 /// Bundles everything a `ShellAction`/watcher-delivered snapshot needs to
@@ -87,12 +71,10 @@ fn routing_buses(sys: &dyn AudioSystem, snapshot: &ConfigSnapshot) -> HashMap<au
 /// too-many-arguments threshold (same idiom already used for
 /// `engine::runtime`'s thread-spawning contexts).
 struct Dispatcher {
-    sys: Arc<dyn AudioSystem>,
     handle: EngineHandle,
     routing: RoutingHandle,
     store: ConfigStore,
     ui: Arc<Mutex<UiState>>,
-    default_output: Option<EndpointId>,
     current: ConfigSnapshot,
     shared_ctx: Arc<Mutex<Option<eframe::egui::Context>>>,
 }
@@ -103,8 +85,26 @@ enum Outcome {
 }
 
 impl Dispatcher {
+    /// Reconciles `[app] autostart` on every snapshot change (simple-launch.md
+    /// L4) — not just at startup — so onboarding, a hand-edit of the config
+    /// file, and any future write path all keep the HKCU Run key in sync
+    /// with the one source of truth. Also clears `UiState.first_run` once at
+    /// least one group exists (only re-checked while still in first-run, to
+    /// avoid recomputing on every routine param edit once onboarding is done).
     fn set_current(&mut self, snapshot: ConfigSnapshot) {
-        self.ui.lock().unwrap().snapshot = snapshot.clone();
+        if snapshot.app.autostart != self.current.app.autostart {
+            if let Err(e) = lifecycle::set_autostart(snapshot.app.autostart) {
+                eprintln!("autostart registration failed (non-fatal): {e:?}");
+            }
+        }
+
+        let mut ui = self.ui.lock().unwrap();
+        ui.snapshot = snapshot.clone();
+        if ui.first_run {
+            ui.first_run = needs_onboarding(&snapshot);
+        }
+        drop(ui);
+
         self.current = snapshot;
     }
 
@@ -120,19 +120,20 @@ impl Dispatcher {
     /// echo-suppression decision — skip re-applying what the direct path
     /// below already applied).
     fn handle_watcher_snapshot(&mut self, new_snapshot: ConfigSnapshot) {
-        if self.store.is_echo(&new_snapshot) {
+        let is_echo = self.store.is_echo(&new_snapshot);
+        tracing::info!(is_echo, "main: watcher snapshot arrived");
+        if is_echo {
             self.set_current(new_snapshot);
             return;
         }
 
         let delta = control::diff(&self.current, &new_snapshot);
+        tracing::info!(structural = delta.structural, "main: watcher snapshot diff");
         if delta.structural {
             if let Err(e) = self.handle.rebuild(&new_snapshot) {
                 eprintln!("rebuild failed: {e:?}");
             }
-            let buses = routing_buses(self.sys.as_ref(), &new_snapshot);
-            self.routing
-                .update_topology(buses, group_rules(&new_snapshot), self.default_output.clone());
+            self.routing.update_rules(group_rules(&new_snapshot));
         } else {
             if !delta.params.is_empty() {
                 if let Err(e) = self.handle.apply_params(delta.params) {
@@ -149,14 +150,13 @@ impl Dispatcher {
     /// Flow C/H: structural edit — funnel-only, rebuild + routing update
     /// paired (app-shell.md's own flow definition).
     fn apply_structural(&mut self, edits: &[ConfigEdit]) {
+        tracing::info!("main: apply_structural (direct edit)");
         match self.store.apply(edits) {
             Ok(new_snapshot) => {
                 if let Err(e) = self.handle.rebuild(&new_snapshot) {
                     eprintln!("rebuild failed: {e:?}");
                 }
-                let buses = routing_buses(self.sys.as_ref(), &new_snapshot);
-                self.routing
-                    .update_topology(buses, group_rules(&new_snapshot), self.default_output.clone());
+                self.routing.update_rules(group_rules(&new_snapshot));
                 self.set_current(new_snapshot);
             }
             Err(e) => eprintln!("structural edit rejected: {e:?}"),
@@ -343,7 +343,8 @@ fn edits_to_mixer_commands(edits: &[ConfigEdit], current: &ConfigSnapshot) -> Ve
             | ConfigEdit::RemoveDspStage(..)
             | ConfigEdit::AddDspStage(..)
             | ConfigEdit::SetRules(..)
-            | ConfigEdit::SetSpatial(..) => None,
+            | ConfigEdit::SetSpatial(..)
+            | ConfigEdit::SetAutostart(..) => None,
         })
         .collect()
 }
@@ -357,8 +358,23 @@ struct Handoff {
 }
 
 fn main() {
+    // Checked first, before the instance guard / eframe / COM touch
+    // anything: the Inno uninstaller runs this as the end user
+    // (`runasoriginaluser`) purely to deregister the HKCU autostart entry,
+    // then exits (simple-launch.md Flow 6).
+    if std::env::args().any(|a| a == "--uninstall-cleanup") {
+        let _ = lifecycle::set_autostart(false);
+        std::process::exit(0);
+    }
+
+    // Held for the process lifetime — dropping it stops the log writer
+    // thread. Init'd on the main thread, before anything COM-touching, so
+    // even an instance-guard failure lands in the log/dialog surface instead
+    // of a console nobody sees under the GUI subsystem.
+    let _log_guard = logging::init(&paths::log_dir());
+
     let outcome = InstanceGuard::acquire(lifecycle::APP_ID).unwrap_or_else(|e| {
-        eprintln!("instance check failed: {e:?}");
+        logging::fatal_dialog("instance check failed", &format!("{e:?}"));
         std::process::exit(1);
     });
     let (_guard, surface_rx) = match outcome {
@@ -421,9 +437,9 @@ fn run_startup_and_dispatch(
     should_quit: Arc<AtomicBool>,
     shared_ctx: Arc<Mutex<Option<eframe::egui::Context>>>,
 ) {
-    let path = config_path();
-    let snapshot = control::load(&path).unwrap_or_else(|e| {
-        eprintln!("failed to load {}: {e:?}", path.display());
+    let path = paths::config_path();
+    let snapshot = control::ensure_config(&path).unwrap_or_else(|e| {
+        logging::fatal_dialog("failed to load config", &format!("{}: {e:?}", path.display()));
         std::process::exit(1);
     });
 
@@ -431,21 +447,21 @@ fn run_startup_and_dispatch(
         eprintln!("autostart registration failed (non-fatal): {e:?}");
     }
 
-    let sys: Arc<dyn AudioSystem> = Arc::new(WasapiSystem::new(bus_name_prefix()));
-    let default_output = sys.default_output().ok().map(|ep| ep.id);
+    let sys: Arc<dyn AudioSystem> = Arc::new(WasapiSystem::new());
+    let default_output_endpoint = sys.default_output().ok();
 
     let mut handle = engine::start(&snapshot, Arc::clone(&sys)).unwrap_or_else(|e| {
-        eprintln!("failed to start engine: {e:?}");
+        logging::fatal_dialog("failed to start engine", &format!("{e:?}"));
         std::process::exit(1);
     });
 
     let (watcher, config_rx) = control::ConfigWatcher::spawn(&path).unwrap_or_else(|e| {
-        eprintln!("failed to start config watcher: {e:?}");
+        logging::fatal_dialog("failed to start config watcher", &format!("{e:?}"));
         std::process::exit(1);
     });
 
     let store = ConfigStore::open(&path).unwrap_or_else(|e| {
-        eprintln!("failed to open config store: {e:?}");
+        logging::fatal_dialog("failed to open config store", &format!("{e:?}"));
         std::process::exit(1);
     });
 
@@ -465,20 +481,22 @@ fn run_startup_and_dispatch(
         });
     }
 
-    let sessions: Box<dyn SessionPort> = Box::new(win_audio::WasapiSessions::new(bus_name_prefix()));
-    let policy: Box<dyn PolicyPort> = Box::new(win_audio::PolicyRouter::new());
+    let sessions: Box<dyn SessionPort> = Box::new(win_audio::WasapiSessions::new());
+    let capture_control: CaptureControl = handle.capture_control();
     let routing = engine::start_routing(
         group_rules(&snapshot),
-        routing_buses(sys.as_ref(), &snapshot),
-        default_output.clone(),
+        std::process::id(),
         sessions,
-        policy,
+        capture_control,
         unified_tx,
     )
     .unwrap_or_else(|e| {
-        eprintln!("failed to start session routing: {e:?}");
+        logging::fatal_dialog("failed to start session routing", &format!("{e:?}"));
         std::process::exit(1);
     });
+
+    let endpoints = sys.enumerate().unwrap_or_default();
+    let first_run = needs_onboarding(&snapshot);
 
     let routing_reader = routing.reader();
     let ui_state = Arc::new(Mutex::new(UiState {
@@ -486,6 +504,10 @@ fn run_startup_and_dispatch(
         routes: routing.current_routes(),
         stats: handle.stats(),
         routing_degraded: routing.is_degraded(),
+        first_run,
+        available_devices: endpoints,
+        default_output_name: default_output_endpoint.map(|ep| ep.name),
+        all_sessions: routing.all_sessions(),
     }));
 
     let (actions_tx, actions_rx) = mpsc::channel::<ShellAction>();
@@ -521,12 +543,10 @@ fn run_startup_and_dispatch(
     }
 
     let mut dispatcher = Dispatcher {
-        sys,
         handle,
         routing,
         store,
         ui: ui_state,
-        default_output,
         current: snapshot,
         shared_ctx,
     };
@@ -548,10 +568,17 @@ fn run_startup_and_dispatch(
     tray_handle.shutdown();
     hotkey_handle.shutdown();
     dispatcher.routing.shutdown();
-    pump.shutdown();
+    // Must run before `pump.shutdown()`: the pump thread only exits once
+    // every sender to `unified_rx` drops, and one of those senders lives
+    // inside `EngineHandle`'s internal `Arc<Persistent>` — it doesn't drop
+    // until this call completes. Calling `pump.shutdown()` first deadlocks
+    // it forever (found live 2026-07-21: a quit that never actually exits
+    // leaves the single-instance mutex held, so every relaunch silently
+    // no-ops as "already running").
     if let Err(e) = dispatcher.handle.shutdown() {
         eprintln!("engine shutdown error: {e:?}");
     }
+    pump.shutdown();
     println!("Splitstream stopped.");
     std::process::exit(0);
 }
@@ -569,7 +596,6 @@ mod tests {
             muted: false,
             groups: vec![GroupConfig {
                 name: name.into(),
-                bus_endpoint: "Bus".into(),
                 output_device: "Out".into(),
                 gain: Gain::UNITY,
                 follow_master: true,
@@ -580,6 +606,24 @@ mod tests {
             }],
             app: engine::AppConfig::default(),
         }
+    }
+
+    #[test]
+    fn needs_onboarding_is_true_when_there_are_no_groups() {
+        let snapshot = ConfigSnapshot {
+            schema_version: 2,
+            master: Gain::UNITY,
+            muted: false,
+            groups: vec![],
+            app: engine::AppConfig::default(),
+        };
+        assert!(needs_onboarding(&snapshot));
+    }
+
+    #[test]
+    fn needs_onboarding_is_false_when_a_group_exists() {
+        let snapshot = snapshot_with_group("Game");
+        assert!(!needs_onboarding(&snapshot));
     }
 
     #[test]

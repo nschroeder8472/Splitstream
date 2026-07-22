@@ -1,11 +1,16 @@
-//! Per-app session routing (session-routing L3/L4). Control-plane only —
-//! never touches the audio path (mixer, rings, RT threads). A background
-//! thread (not RT) reconciles desired routing state against session
-//! enumeration/notifications and applies it through `PolicyPort`, with the
-//! same "one notice, skip further calls, retry only on config reload"
-//! degradation posture as the drift-and-recovery supervisor.
+//! Per-app session routing (process-loopback-capture L3/L4). Control-plane
+//! side: a background thread (not RT) matches live sessions against config
+//! rules and drives capture-source changes directly through `CaptureControl`
+//! — deliberately crosses the old P3-era "control-plane only, never touches
+//! the audio path" boundary (accepted judgment call, logged in the context
+//! doc: `engine::routing` and `engine::runtime` are peer modules in the same
+//! crate, and session-matching now directly determines what gets captured).
+//!
+//! No more `PolicyPort`/buses/`default_output` — the pivot from per-app
+//! WASAPI redirect to per-process loopback capture means there is nothing
+//! left to hide or redirect; a matched session's audio is captured directly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -14,33 +19,30 @@ use std::time::Duration;
 
 use audio_core::GroupId;
 
-use crate::ports::{EndpointId, PolicyError, PolicyPort, SessionEvent, SessionPort};
+use crate::ports::{SessionEvent, SessionPort};
 use crate::rules::{match_session, GroupRules, SessionInfo};
-use crate::runtime::{EngineError, EngineEvent};
+use crate::runtime::{CaptureControl, EngineError, EngineEvent};
 
 const RECONCILE_TICK: Duration = Duration::from_millis(100);
 
 enum Command {
     UpdateRules(Vec<GroupRules>),
-    UpdateTopology {
-        buses: HashMap<GroupId, EndpointId>,
-        rules: Vec<GroupRules>,
-        default_output: Option<EndpointId>,
-    },
 }
 
 struct State {
     rules: Vec<GroupRules>,
-    buses: HashMap<GroupId, EndpointId>,
-    default_output: Option<EndpointId>,
-    /// pid -> bus endpoint currently applied. Avoids rewriting Windows-persisted
-    /// per-app prefs on every reconcile (flow A) and is the source of truth for
-    /// flow D's "re-route changed / clear now-unmatched" comparison.
-    applied: HashMap<u32, EndpointId>,
+    /// Splitstream's own pid — enforced centrally here (not per-flow) so no
+    /// group's match rules, including a `*` catch-all, can ever resolve to
+    /// capturing Splitstream's own render output back into itself (L3
+    /// "Self-exclusion" safety rule).
+    self_pid: u32,
+    /// Group -> pid set actually confirmed applied last reconcile (desired
+    /// minus whatever failed to open that pass) — the source of truth for
+    /// `current_routes()`; `CaptureControl` owns the real running set.
+    applied: HashMap<GroupId, Vec<u32>>,
     /// pid -> last known session, tracked from `enumerate()` + `SessionEvent`
-    /// so flow D ("re-match all live sessions") doesn't need to re-enumerate.
+    /// so reconcile never needs to re-enumerate.
     live_sessions: HashMap<u32, SessionInfo>,
-    degraded: bool,
 }
 
 /// Grouped by `GroupId`, sorted by it for deterministic reads — a plain
@@ -48,25 +50,31 @@ struct State {
 /// a control-thread poll, never from the RT audio path.
 type RoutesSnapshot = Arc<Mutex<Vec<(GroupId, Vec<SessionInfo>)>>>;
 
+/// Every live session, matched or not, sorted by pid — same rationale as
+/// `RoutesSnapshot` (mixer-ui-redesign L4): the settings window's
+/// unassigned-pool source (Master's footer = this minus every pid in
+/// `RoutesSnapshot`).
+type AllSessionsSnapshot = Arc<Mutex<Vec<SessionInfo>>>;
+
 pub struct RoutingHandle {
     commands: Sender<Command>,
     degraded: Arc<AtomicBool>,
     routes: RoutesSnapshot,
+    all_sessions: AllSessionsSnapshot,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
 /// Read-only, `Clone`-able view onto `RoutingHandle`'s state — for a
 /// consumer (app-shell.md's settings window) that needs to poll routes/
-/// degradation every frame but must never call `update_rules`/`update_topology`
-/// or `shutdown`. Split out because `RoutingHandle` itself can't be `Clone`
-/// (it owns the coordinator thread's `JoinHandle`, which isn't), so a
-/// read-only observer needs its own lightweight, independently-cloneable type
-/// rather than sharing the mutating handle.
+/// degradation every frame but must never call `update_rules`/`shutdown`.
+/// Split out because `RoutingHandle` itself can't be `Clone` (it owns the
+/// coordinator thread's `JoinHandle`, which isn't).
 #[derive(Clone)]
 pub struct RoutingReader {
     degraded: Arc<AtomicBool>,
     routes: RoutesSnapshot,
+    all_sessions: AllSessionsSnapshot,
 }
 
 impl RoutingReader {
@@ -77,29 +85,27 @@ impl RoutingReader {
     pub fn current_routes(&self) -> Vec<(GroupId, Vec<SessionInfo>)> {
         self.routes.lock().unwrap().clone()
     }
+
+    /// Every live session, matched or not — the settings window's
+    /// unassigned-pool source (mixer-ui-redesign L4).
+    pub fn all_sessions(&self) -> Vec<SessionInfo> {
+        self.all_sessions.lock().unwrap().clone()
+    }
 }
 
 impl RoutingHandle {
+    /// Single reconcile entrypoint (merges the old P3-era `update_rules`/
+    /// `update_topology` split — neither ever needed a `buses`/
+    /// `default_output` param anymore, so one method covers both call sites:
+    /// a config edit and a structural rebuild both just re-match live
+    /// sessions against fresh rules).
     pub fn update_rules(&self, rules: Vec<GroupRules>) {
         let _ = self.commands.send(Command::UpdateRules(rules));
     }
 
-    /// Call after every structural rebuild (flow H): fresh bus map + rules;
-    /// coordinator reconciles as in flow A (idempotent — already-correct
-    /// persisted routes untouched).
-    pub fn update_topology(
-        &self,
-        buses: HashMap<GroupId, EndpointId>,
-        rules: Vec<GroupRules>,
-        default_output: Option<EndpointId>,
-    ) {
-        let _ = self.commands.send(Command::UpdateTopology {
-            buses,
-            rules,
-            default_output,
-        });
-    }
-
+    /// Soft, per-attempt signal (L3 flow E) — reflects only the most recent
+    /// reconcile pass's outcome, never a sticky "everything is broken" flag
+    /// that lingers once whatever failed stops being requested.
     pub fn is_degraded(&self) -> bool {
         self.degraded.load(Ordering::Relaxed)
     }
@@ -111,17 +117,28 @@ impl RoutingHandle {
         self.routes.lock().unwrap().clone()
     }
 
+    /// Every live session, matched or not — the settings window's
+    /// unassigned-pool source (mixer-ui-redesign L4). Reflects the
+    /// coordinator's last reconcile, not a live query.
+    pub fn all_sessions(&self) -> Vec<SessionInfo> {
+        self.all_sessions.lock().unwrap().clone()
+    }
+
     /// A cloneable read-only handle for a consumer that only needs
-    /// `is_degraded`/`current_routes` — see [`RoutingReader`].
+    /// `is_degraded`/`current_routes`/`all_sessions` — see [`RoutingReader`].
     pub fn reader(&self) -> RoutingReader {
         RoutingReader {
             degraded: Arc::clone(&self.degraded),
             routes: Arc::clone(&self.routes),
+            all_sessions: Arc::clone(&self.all_sessions),
         }
     }
 
-    /// Flow F: endpoints stay hidden, no un-routing (Windows persists
-    /// per-app prefs; uninstaller restores). Just stops the coordinator thread.
+    /// Stops the coordinator thread. Nothing Windows-side to restore
+    /// (process-loopback-capture pivot: no hidden devices, no persisted
+    /// redirect) — `CaptureControl`'s own shutdown path (via
+    /// `EngineHandle::shutdown`) tears down any still-running capture
+    /// threads.
     pub fn shutdown(mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
@@ -130,47 +147,45 @@ impl RoutingHandle {
     }
 }
 
-/// Flow A (run synchronously here, before the coordinator thread starts —
-/// same startup-is-synchronous convention as `engine::start` opening ports):
-/// hide bus endpoints + set the branded default, `enumerate()` (primes
-/// session notifications, §9.2), then route already-running matched sessions.
+/// Flow A: `enumerate()` (primes session notifications), then reconcile
+/// already-running matched sessions before the coordinator thread starts
+/// (same startup-is-synchronous convention as `engine::start` opening ports).
 pub fn start_routing(
     rules: Vec<GroupRules>,
-    buses: HashMap<GroupId, EndpointId>,
-    default_output: Option<EndpointId>,
+    self_pid: u32,
     mut session: Box<dyn SessionPort>,
-    mut policy: Box<dyn PolicyPort>,
+    capture: CaptureControl,
     events: Sender<EngineEvent>,
 ) -> Result<RoutingHandle, EngineError> {
     let mut state = State {
         rules,
-        buses,
-        default_output,
+        self_pid,
         applied: HashMap::new(),
         live_sessions: HashMap::new(),
-        degraded: false,
     };
 
     let initial_sessions = session.enumerate().map_err(EngineError::Port)?;
     for s in &initial_sessions {
         state.live_sessions.insert(s.pid, s.clone());
     }
-    full_reconcile(&mut state, &initial_sessions, policy.as_mut(), &events);
+    let initially_degraded = reconcile(&mut state, &capture, session.as_ref(), &events);
 
     let session_events = session.take_events();
-    let degraded = Arc::new(AtomicBool::new(state.degraded));
+    let degraded = Arc::new(AtomicBool::new(initially_degraded));
     let routes = Arc::new(Mutex::new(compute_routes(&state)));
+    let all_sessions = Arc::new(Mutex::new(compute_all_sessions(&state)));
     let stop = Arc::new(AtomicBool::new(false));
     let (commands_tx, commands_rx) = mpsc::channel();
 
     let ctx = CoordinatorCtx {
-        _session: session,
-        policy,
+        session,
+        capture,
         session_events,
         commands: commands_rx,
         events,
         degraded: Arc::clone(&degraded),
         routes: Arc::clone(&routes),
+        all_sessions: Arc::clone(&all_sessions),
         stop: Arc::clone(&stop),
     };
     let thread = thread::spawn(move || coordinator_loop(state, ctx));
@@ -179,175 +194,192 @@ pub fn start_routing(
         commands: commands_tx,
         degraded,
         routes,
+        all_sessions,
         stop,
         thread: Some(thread),
     })
 }
 
-/// Groups `state.applied` by `GroupId` (reverse-looked-up through
-/// `state.buses`) with each pid's `SessionInfo`, sorted by `GroupId` for a
-/// deterministic read. A pid missing from `live_sessions` (should not happen
-/// — `applied` entries are only ever created alongside a `live_sessions`
-/// insert) or an endpoint no longer present in `buses` (stale entry from
-/// before a rebuild that hasn't reconciled yet) is skipped rather than panicking.
-fn compute_routes(state: &State) -> Vec<(GroupId, Vec<SessionInfo>)> {
-    let mut by_group: HashMap<GroupId, Vec<SessionInfo>> = HashMap::new();
-    for (pid, bus) in &state.applied {
-        let Some(group) = state.buses.iter().find(|(_, e)| *e == bus).map(|(g, _)| *g) else {
-            continue;
-        };
-        let Some(info) = state.live_sessions.get(pid) else {
-            continue;
-        };
-        by_group.entry(group).or_default().push(info.clone());
+/// Every session currently matching a group, keyed by `GroupId` — every
+/// group named in `rules` gets an entry (possibly empty), so a group that
+/// used to have matches but no longer does still gets reconciled down to
+/// nothing rather than silently left with its last-applied set.
+/// Self-exclusion (L3 safety rule) is enforced here, centrally, once: `self_pid`
+/// is filtered out before matching, so no rule — including a `*` catch-all —
+/// can ever resolve to it.
+fn compute_desired(
+    rules: &[GroupRules],
+    live_sessions: &HashMap<u32, SessionInfo>,
+    self_pid: u32,
+) -> HashMap<GroupId, Vec<u32>> {
+    let mut desired: HashMap<GroupId, Vec<u32>> = HashMap::new();
+    for gr in rules {
+        desired.entry(gr.group).or_default();
     }
-    let mut routes: Vec<_> = by_group.into_iter().collect();
+    for (pid, info) in live_sessions {
+        if *pid == self_pid {
+            continue;
+        }
+        if let Some(group) = match_session(info, rules) {
+            desired.entry(group).or_default().push(*pid);
+        }
+    }
+    desired
+}
+
+/// Recomputes every group's desired pid set and applies it through
+/// `CaptureControl` — `apply_capture_sources` diffs internally, so calling
+/// this every tick regardless of whether anything actually changed is cheap
+/// (L3 flow E: also exactly what makes a persistently-failing pid retry
+/// "every time" rather than needing a separate retry mechanism). Returns
+/// whether *any* group had a pid fail to open this pass — the caller stores
+/// that as the new (non-sticky) degraded signal.
+///
+/// Also owns the session-mute-on-capture lifecycle (L3 flows A/B): diffs the
+/// full applied-pid set before/after this pass — a pid newly present gets
+/// muted, a pid newly absent gets unmuted. Mute only ever follows a
+/// *confirmed* capture success, since `state.applied` already excludes
+/// anything that failed to open this pass.
+fn reconcile(
+    state: &mut State,
+    capture: &CaptureControl,
+    session: &dyn SessionPort,
+    events: &Sender<EngineEvent>,
+) -> bool {
+    let before: HashSet<u32> = state.applied.values().flatten().copied().collect();
+    let desired = compute_desired(&state.rules, &state.live_sessions, state.self_pid);
+    let mut any_failure = false;
+
+    for (group, pids) in desired {
+        match capture.apply_capture_sources(group, pids.clone()) {
+            Ok(failed) => {
+                if !failed.is_empty() {
+                    any_failure = true;
+                    tracing::warn!(?group, ?failed, "routing: capture failed for pid(s)");
+                    let _ = events.send(EngineEvent::RoutingDegraded {
+                        reason: format!("group {group:?}: capture failed for pid(s) {failed:?}"),
+                    });
+                }
+                let applied: Vec<u32> = pids.into_iter().filter(|p| !failed.contains(p)).collect();
+                state.applied.insert(group, applied);
+            }
+            // Engine already stopped — nothing more this pass can do; leave
+            // `state.applied` as it was (stale but harmless, no consumer
+            // reads it once the engine is down).
+            Err(_) => any_failure = true,
+        }
+    }
+
+    let after: HashSet<u32> = state.applied.values().flatten().copied().collect();
+    for pid in after.difference(&before) {
+        if let Err(e) = session.set_muted(*pid, true) {
+            tracing::warn!(pid, ?e, "routing: failed to mute captured session");
+        }
+    }
+    for pid in before.difference(&after) {
+        if let Err(e) = session.set_muted(*pid, false) {
+            tracing::warn!(pid, ?e, "routing: failed to unmute released session");
+        }
+    }
+
+    any_failure
+}
+
+/// Every live session, matched or not, sorted by pid (mixer-ui-redesign L4)
+/// — the settings window's unassigned-pool source. Pure.
+fn compute_all_sessions(state: &State) -> Vec<SessionInfo> {
+    let mut sessions: Vec<SessionInfo> = state.live_sessions.values().cloned().collect();
+    sessions.sort_by_key(|s| s.pid);
+    sessions
+}
+
+/// Pairs each applied pid with its `SessionInfo`, sorted by `GroupId` for a
+/// deterministic read. A pid missing from `live_sessions` (shouldn't happen —
+/// `applied` is only ever derived from `live_sessions` in the same reconcile
+/// pass) is skipped rather than panicking.
+fn compute_routes(state: &State) -> Vec<(GroupId, Vec<SessionInfo>)> {
+    let mut routes: Vec<(GroupId, Vec<SessionInfo>)> = state
+        .applied
+        .iter()
+        .filter(|(_, pids)| !pids.is_empty())
+        .map(|(group, pids)| {
+            let sessions = pids
+                .iter()
+                .filter_map(|pid| state.live_sessions.get(pid).cloned())
+                .collect();
+            (*group, sessions)
+        })
+        .collect();
     routes.sort_by_key(|(g, _)| g.0);
     routes
 }
 
 /// Wiring/plumbing for the coordinator thread, grouped once the plain
 /// parameter list crossed the too-many-arguments threshold (operational
-/// learnings: extract at that point, not later — same idiom as
-/// `runtime::CaptureFaultCtx`/`RenderFaultCtx`).
+/// learnings: extract at that point, not later).
 struct CoordinatorCtx {
-    /// Never called again after `take_events` in `start_routing` — held alive
-    /// for the whole coordinator lifetime anyway, matching the "keep the
-    /// callback object alive" gotcha `win-audio`'s COM notification wrappers
-    /// already document (dropping it would silently unregister the real
-    /// WASAPI notification callback). Underscore-prefixed: never read after
-    /// construction, same idiom as `WasapiCapture::_client`.
-    _session: Box<dyn SessionPort>,
-    policy: Box<dyn PolicyPort>,
+    /// Held alive for the whole coordinator lifetime (dropping it would
+    /// silently unregister the real WASAPI session-notification callback,
+    /// same gotcha `win-audio`'s COM notification wrappers document) — and,
+    /// since session-mute-on-capture, actively called every reconcile pass
+    /// (mute/unmute diff) and once more after the loop exits (shutdown sweep).
+    session: Box<dyn SessionPort>,
+    capture: CaptureControl,
     session_events: Receiver<SessionEvent>,
     commands: Receiver<Command>,
     events: Sender<EngineEvent>,
     degraded: Arc<AtomicBool>,
     routes: RoutesSnapshot,
+    all_sessions: AllSessionsSnapshot,
     stop: Arc<AtomicBool>,
 }
 
-fn coordinator_loop(mut state: State, mut ctx: CoordinatorCtx) {
+fn coordinator_loop(mut state: State, ctx: CoordinatorCtx) {
     while !ctx.stop.load(Ordering::Relaxed) {
         while let Ok(cmd) = ctx.commands.try_recv() {
             match cmd {
                 Command::UpdateRules(rules) => {
                     state.rules = rules;
-                    state.degraded = false; // retry only on config reload
-                    let sessions: Vec<SessionInfo> = state.live_sessions.values().cloned().collect();
-                    reconcile(&mut state, &sessions, ctx.policy.as_mut(), &ctx.events);
-                }
-                Command::UpdateTopology {
-                    buses,
-                    rules,
-                    default_output,
-                } => {
-                    state.buses = buses;
-                    state.rules = rules;
-                    state.default_output = default_output;
-                    state.degraded = false;
-                    let sessions: Vec<SessionInfo> = state.live_sessions.values().cloned().collect();
-                    full_reconcile(&mut state, &sessions, ctx.policy.as_mut(), &ctx.events);
+                    tracing::info!(
+                        live_sessions = state.live_sessions.len(),
+                        "routing: rules updated"
+                    );
                 }
             }
-            ctx.degraded.store(state.degraded, Ordering::Relaxed);
-            *ctx.routes.lock().unwrap() = compute_routes(&state);
         }
 
         while let Ok(evt) = ctx.session_events.try_recv() {
             match evt {
                 SessionEvent::New(info) => {
-                    state.live_sessions.insert(info.pid, info.clone());
-                    reconcile(&mut state, std::slice::from_ref(&info), ctx.policy.as_mut(), &ctx.events);
+                    tracing::info!(pid = info.pid, path = %info.process_path.display(), "routing: new session");
+                    state.live_sessions.insert(info.pid, info);
                 }
-                // Flow C: drop from the map, no un-route — Windows persists the
-                // per-app pref, so the same group applies again on relaunch.
+                // Flow C: drop from the map — the next reconcile below naturally
+                // excludes this pid from every group's desired set, and
+                // `CaptureControl` stops its capture thread as a normal diff
+                // removal. Nothing Windows-side needs restoring (unlike the
+                // old policy-routing model).
                 SessionEvent::Ended(pid) => {
                     state.live_sessions.remove(&pid);
-                    state.applied.remove(&pid);
                 }
             }
-            ctx.degraded.store(state.degraded, Ordering::Relaxed);
-            *ctx.routes.lock().unwrap() = compute_routes(&state);
         }
+
+        let any_failure = reconcile(&mut state, &ctx.capture, ctx.session.as_ref(), &ctx.events);
+        ctx.degraded.store(any_failure, Ordering::Relaxed);
+        *ctx.routes.lock().unwrap() = compute_routes(&state);
+        *ctx.all_sessions.lock().unwrap() = compute_all_sessions(&state);
 
         thread::sleep(RECONCILE_TICK);
     }
-}
 
-/// Flow A/H: hide every bus endpoint, set the branded default, then reconcile
-/// routes for `sessions`.
-fn full_reconcile(
-    state: &mut State,
-    sessions: &[SessionInfo],
-    policy: &mut dyn PolicyPort,
-    events: &Sender<EngineEvent>,
-) {
-    let bus_ids: Vec<EndpointId> = state.buses.values().cloned().collect();
-    for bus in &bus_ids {
-        apply_policy(state, events, || policy.set_visibility(bus, false));
-    }
-    if let Some(default) = state.default_output.clone() {
-        apply_policy(state, events, || policy.set_default(&default));
-    }
-    reconcile(state, sessions, policy, events);
-}
-
-/// Routes newly-matched/changed sessions and clears now-unmatched ones back
-/// to default (flow D). Also correct for flow A/B/H: a session that was
-/// never `applied` and still doesn't match anything hits the `(None, None)`
-/// no-op arm, same as "unmatched apps stay normal."
-fn reconcile(
-    state: &mut State,
-    sessions: &[SessionInfo],
-    policy: &mut dyn PolicyPort,
-    events: &Sender<EngineEvent>,
-) {
-    for session in sessions {
-        let desired = match_session(session, &state.rules).and_then(|g| state.buses.get(&g).cloned());
-        let pid = session.pid;
-        match (desired, state.applied.get(&pid).cloned()) {
-            (Some(bus), Some(current)) if bus == current => {} // already correct
-            (Some(bus), _) => {
-                let target = bus.clone();
-                if apply_policy(state, events, || policy.route(pid, &target)) {
-                    state.applied.insert(pid, bus);
-                }
-            }
-            (None, Some(_)) => {
-                if apply_policy(state, events, || policy.clear_route(pid)) {
-                    state.applied.remove(&pid);
-                }
-            }
-            (None, None) => {}
-        }
-    }
-}
-
-/// Degradation posture (flow E): skip the call entirely once degraded;
-/// otherwise attempt it, and on the *first* failure set the flag and send
-/// exactly one `RoutingDegraded` notice (later calls skip before reaching
-/// this function's `Err` arm again, since `state.degraded` is already true).
-/// Returns whether the call actually ran and succeeded — callers use that to
-/// decide whether to update `state.applied`.
-fn apply_policy(
-    state: &mut State,
-    events: &Sender<EngineEvent>,
-    f: impl FnOnce() -> Result<(), PolicyError>,
-) -> bool {
-    if state.degraded {
-        return false;
-    }
-    match f() {
-        Ok(()) => true,
-        Err(e) => {
-            state.degraded = true;
-            let reason = match e {
-                PolicyError::Unavailable(msg) => format!("routing unavailable: {msg}"),
-                PolicyError::Failed(msg) => format!("routing failed: {msg}"),
-            };
-            let _ = events.send(EngineEvent::RoutingDegraded { reason });
-            false
+    // Clean-shutdown safety (L3 flow D): unmute every pid still captured when
+    // the coordinator stops, since a still-running app's session never fires
+    // `SessionEvent::Ended`. `RoutingHandle::shutdown()`'s thread-join blocks
+    // until this finishes — synchronous for free, no new API.
+    for pid in state.applied.values().flatten().copied().collect::<HashSet<u32>>() {
+        if let Err(e) = ctx.session.set_muted(pid, false) {
+            tracing::warn!(pid, ?e, "routing: failed to unmute session on shutdown");
         }
     }
 }
@@ -355,13 +387,10 @@ fn apply_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::mock::{MockPolicyPort, MockSessionPort};
+    use crate::ports::mock::{MockSessionPort, MockSystem};
     use crate::rules::MatchRule;
+    use crate::runtime;
     use std::time::Duration as StdDuration;
-
-    fn bus(id: &str) -> EndpointId {
-        EndpointId(id.to_string())
-    }
 
     fn session(pid: u32, exe: &str) -> SessionInfo {
         SessionInfo {
@@ -378,307 +407,299 @@ mod tests {
         }]
     }
 
-    fn game_buses() -> HashMap<GroupId, EndpointId> {
-        HashMap::from([(GroupId(0), bus("bus-game"))])
-    }
-
-    fn recv_degraded(events: &Receiver<EngineEvent>) -> String {
-        match events.recv_timeout(StdDuration::from_millis(500)) {
-            Ok(EngineEvent::RoutingDegraded { reason }) => reason,
-            other => panic!("expected RoutingDegraded, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn startup_hides_every_bus_and_sets_the_branded_default() {
-        let policy = MockPolicyPort::new();
-        let sessions = MockSessionPort::new(vec![]);
-        let (tx, _rx) = mpsc::channel();
-
-        let handle = start_routing(
-            vec![],
-            game_buses(),
-            Some(bus("out-1")),
-            Box::new(sessions),
-            Box::new(policy.clone()),
-            tx,
-        )
-        .unwrap();
-
-        assert_eq!(policy.is_visible(&bus("bus-game")), Some(false));
-        assert_eq!(policy.default_endpoint(), Some(bus("out-1")));
-        handle.shutdown();
+    fn test_capture() -> (CaptureControl, runtime::EngineHandle) {
+        let sys: Arc<dyn crate::ports::AudioSystem> = Arc::new(MockSystem::new(vec![]));
+        let snapshot = crate::graph::ConfigSnapshot {
+            schema_version: 2,
+            master: audio_core::Gain::UNITY,
+            muted: false,
+            app: crate::graph::AppConfig::default(),
+            groups: vec![],
+        };
+        let handle = runtime::start(&snapshot, sys).unwrap();
+        let capture = handle.capture_control();
+        (capture, handle)
     }
 
     #[test]
     fn startup_routes_an_already_running_matched_session() {
-        let policy = MockPolicyPort::new();
+        let (capture, engine) = test_capture();
         let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
         let (tx, _rx) = mpsc::channel();
 
-        let handle = start_routing(
-            game_rules(),
-            game_buses(),
-            None,
-            Box::new(sessions),
-            Box::new(policy.clone()),
-            tx,
-        )
-        .unwrap();
+        let handle = start_routing(game_rules(), 0, Box::new(sessions), capture, tx).unwrap();
 
-        assert_eq!(policy.routes().get(&100), Some(&bus("bus-game")));
+        assert_eq!(
+            handle.current_routes(),
+            vec![(GroupId(0), vec![session(100, "game.exe")])]
+        );
         handle.shutdown();
+        engine.shutdown().unwrap();
     }
 
     #[test]
     fn startup_leaves_an_unmatched_session_untouched() {
-        let policy = MockPolicyPort::new();
+        let (capture, engine) = test_capture();
         let sessions = MockSessionPort::new(vec![session(100, "other.exe")]);
         let (tx, _rx) = mpsc::channel();
 
-        let handle = start_routing(
-            game_rules(),
-            game_buses(),
-            None,
-            Box::new(sessions),
-            Box::new(policy.clone()),
-            tx,
-        )
-        .unwrap();
+        let handle = start_routing(game_rules(), 0, Box::new(sessions), capture, tx).unwrap();
 
-        assert!(!policy.routes().contains_key(&100));
+        assert!(handle.current_routes().is_empty());
         handle.shutdown();
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn all_sessions_includes_both_matched_and_unmatched_sessions_sorted_by_pid() {
+        let (capture, engine) = test_capture();
+        let sessions = MockSessionPort::new(vec![session(200, "other.exe"), session(100, "game.exe")]);
+        let (tx, _rx) = mpsc::channel();
+
+        let handle = start_routing(game_rules(), 0, Box::new(sessions), capture, tx).unwrap();
+
+        assert_eq!(
+            handle.all_sessions(),
+            vec![session(100, "game.exe"), session(200, "other.exe")]
+        );
+        handle.shutdown();
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn reader_all_sessions_matches_the_owning_handle() {
+        let (capture, engine) = test_capture();
+        let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
+        let (tx, _rx) = mpsc::channel();
+
+        let handle = start_routing(game_rules(), 0, Box::new(sessions), capture, tx).unwrap();
+        let reader = handle.reader();
+
+        assert_eq!(reader.all_sessions(), handle.all_sessions());
+        handle.shutdown();
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn self_pid_is_never_matched_even_by_a_catch_all_rule() {
+        let (capture, engine) = test_capture();
+        let catch_all = vec![GroupRules {
+            group: GroupId(0),
+            rules: vec![MatchRule::Glob(crate::rules::GlobPattern::new("*"))],
+        }];
+        let sessions = MockSessionPort::new(vec![session(999, "splitstream.exe"), session(100, "game.exe")]);
+        let (tx, _rx) = mpsc::channel();
+
+        let handle = start_routing(catch_all, 999, Box::new(sessions), capture, tx).unwrap();
+
+        let routes = handle.current_routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].1, vec![session(100, "game.exe")]);
+        handle.shutdown();
+        engine.shutdown().unwrap();
     }
 
     #[test]
     fn new_session_event_routes_a_matching_session() {
-        let policy = MockPolicyPort::new();
+        let (capture, engine) = test_capture();
         let sessions = MockSessionPort::new(vec![]);
         let (tx, _rx) = mpsc::channel();
 
-        let handle = start_routing(
-            game_rules(),
-            game_buses(),
-            None,
-            Box::new(sessions.clone()),
-            Box::new(policy.clone()),
-            tx,
-        )
-        .unwrap();
-
+        let handle = start_routing(game_rules(), 0, Box::new(sessions.clone()), capture, tx).unwrap();
         sessions.emit_event(SessionEvent::New(session(200, "game.exe")));
 
         let deadline = std::time::Instant::now() + StdDuration::from_secs(2);
-        while !policy.routes().contains_key(&200) && std::time::Instant::now() < deadline {
-            thread::sleep(StdDuration::from_millis(10));
+        let mut routes = handle.current_routes();
+        while routes.is_empty() && std::time::Instant::now() < deadline {
+            thread::sleep(StdDuration::from_millis(20));
+            routes = handle.current_routes();
         }
-        assert_eq!(policy.routes().get(&200), Some(&bus("bus-game")));
+        assert_eq!(routes, vec![(GroupId(0), vec![session(200, "game.exe")])]);
         handle.shutdown();
+        engine.shutdown().unwrap();
     }
 
     #[test]
-    fn session_ended_drops_the_applied_entry_without_clearing_the_route() {
-        let policy = MockPolicyPort::new();
+    fn session_ended_drops_it_from_routes() {
+        let (capture, engine) = test_capture();
         let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
         let (tx, _rx) = mpsc::channel();
 
-        let handle = start_routing(
-            game_rules(),
-            game_buses(),
-            None,
-            Box::new(sessions.clone()),
-            Box::new(policy.clone()),
-            tx,
-        )
-        .unwrap();
-        assert_eq!(policy.routes().get(&100), Some(&bus("bus-game")));
+        let handle = start_routing(game_rules(), 0, Box::new(sessions.clone()), capture, tx).unwrap();
+        assert!(!handle.current_routes().is_empty());
 
         sessions.emit_event(SessionEvent::Ended(100));
-        thread::sleep(StdDuration::from_millis(250));
-
-        // No un-route call — the last-applied route stays recorded on the
-        // mock (Windows itself would keep the persisted pref in place too).
-        assert_eq!(policy.routes().get(&100), Some(&bus("bus-game")));
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(2);
+        let mut routes = handle.current_routes();
+        while !routes.is_empty() && std::time::Instant::now() < deadline {
+            thread::sleep(StdDuration::from_millis(20));
+            routes = handle.current_routes();
+        }
+        assert!(routes.is_empty());
         handle.shutdown();
+        engine.shutdown().unwrap();
     }
 
     #[test]
     fn live_rule_change_reroutes_a_now_matching_session_and_clears_a_now_unmatched_one() {
-        let policy = MockPolicyPort::new();
+        let (capture, engine) = test_capture();
         let sessions = MockSessionPort::new(vec![session(100, "game.exe"), session(200, "music.exe")]);
         let (tx, _rx) = mpsc::channel();
 
-        // Startup: only "game.exe" matches, "music.exe" stays unmatched.
-        let handle = start_routing(
-            game_rules(),
-            game_buses(),
-            None,
-            Box::new(sessions),
-            Box::new(policy.clone()),
-            tx,
-        )
-        .unwrap();
-        assert_eq!(policy.routes().get(&100), Some(&bus("bus-game")));
-        assert!(!policy.routes().contains_key(&200));
+        let handle = start_routing(game_rules(), 0, Box::new(sessions), capture, tx).unwrap();
+        assert_eq!(
+            handle.current_routes(),
+            vec![(GroupId(0), vec![session(100, "game.exe")])]
+        );
 
-        // Rule change: "game.exe" no longer matches anything, "music.exe" now does.
         let new_rules = vec![GroupRules {
             group: GroupId(0),
             rules: vec![MatchRule::ExactName("music.exe".into())],
         }];
         handle.update_rules(new_rules);
-        thread::sleep(StdDuration::from_millis(250));
 
-        assert!(!policy.routes().contains_key(&100), "game.exe should have been cleared");
-        assert_eq!(policy.routes().get(&200), Some(&bus("bus-game")));
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(2);
+        let mut routes = handle.current_routes();
+        while routes.first().is_some_and(|(_, s)| s.iter().any(|i| i.pid == 100))
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(StdDuration::from_millis(20));
+            routes = handle.current_routes();
+        }
+        assert_eq!(routes, vec![(GroupId(0), vec![session(200, "music.exe")])]);
         handle.shutdown();
+        engine.shutdown().unwrap();
     }
 
     #[test]
-    fn first_policy_failure_degrades_and_sends_exactly_one_notice() {
-        let policy = MockPolicyPort::new();
-        policy.fail_with_unavailable();
-        let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
-        let (tx, rx) = mpsc::channel();
+    fn a_pid_that_fails_to_open_is_reported_degraded_without_blocking_others() {
+        let sys_inner = Arc::new(MockSystem::new(vec![]));
+        sys_inner.fail_process_capture(100);
+        let sys: Arc<dyn crate::ports::AudioSystem> = sys_inner;
+        let snapshot = crate::graph::ConfigSnapshot {
+            schema_version: 2,
+            master: audio_core::Gain::UNITY,
+            muted: false,
+            app: crate::graph::AppConfig::default(),
+            groups: vec![],
+        };
+        let engine = runtime::start(&snapshot, sys).unwrap();
+        let capture = engine.capture_control();
 
-        let handle = start_routing(
-            game_rules(),
-            game_buses(),
-            None,
-            Box::new(sessions),
-            Box::new(policy.clone()),
-            tx,
-        )
-        .unwrap();
-
-        let reason = recv_degraded(&rx);
-        assert!(reason.contains("unavailable"), "reason was: {reason}");
-        assert!(handle.is_degraded());
-        // Nothing got routed — the very first policy call (hiding the bus) failed.
-        assert!(!policy.routes().contains_key(&100));
-        // Exactly one notice: nothing else queued within a short window.
-        assert!(rx.recv_timeout(StdDuration::from_millis(200)).is_err());
-        handle.shutdown();
-    }
-
-    #[test]
-    fn config_reload_via_update_rules_clears_degraded_and_retries() {
-        let policy = MockPolicyPort::new();
-        policy.fail_with_unavailable();
-        let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
-        let (tx, rx) = mpsc::channel();
-
-        let handle = start_routing(
-            game_rules(),
-            game_buses(),
-            None,
-            Box::new(sessions),
-            Box::new(policy.clone()),
-            tx,
-        )
-        .unwrap();
-        recv_degraded(&rx);
-        assert!(handle.is_degraded());
-
-        policy.stop_failing();
-        handle.update_rules(game_rules());
-        thread::sleep(StdDuration::from_millis(250));
-
-        assert!(!handle.is_degraded());
-        assert_eq!(policy.routes().get(&100), Some(&bus("bus-game")));
-        handle.shutdown();
-    }
-
-    #[test]
-    fn current_routes_groups_applied_sessions_by_group_id() {
-        let policy = MockPolicyPort::new();
-        let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
+        let rules = vec![GroupRules {
+            group: GroupId(0),
+            rules: vec![
+                MatchRule::ExactName("game.exe".into()),
+                MatchRule::ExactName("music.exe".into()),
+            ],
+        }];
+        let sessions = MockSessionPort::new(vec![session(100, "game.exe"), session(200, "music.exe")]);
         let (tx, _rx) = mpsc::channel();
 
-        let handle = start_routing(
-            game_rules(),
-            game_buses(),
-            None,
-            Box::new(sessions),
-            Box::new(policy.clone()),
-            tx,
-        )
-        .unwrap();
+        let handle = start_routing(rules, 0, Box::new(sessions), capture, tx).unwrap();
 
+        assert!(handle.is_degraded(), "pid 100's activation was made to fail");
         let routes = handle.current_routes();
         assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].0, GroupId(0));
-        assert_eq!(routes[0].1, vec![session(100, "game.exe")]);
+        assert_eq!(routes[0].1, vec![session(200, "music.exe")], "pid 200 still applied");
         handle.shutdown();
+        engine.shutdown().unwrap();
     }
 
     #[test]
-    fn current_routes_is_empty_when_nothing_is_applied() {
-        let policy = MockPolicyPort::new();
-        let sessions = MockSessionPort::new(vec![session(100, "other.exe")]);
-        let (tx, _rx) = mpsc::channel();
-
-        let handle = start_routing(
-            game_rules(),
-            game_buses(),
-            None,
-            Box::new(sessions),
-            Box::new(policy.clone()),
-            tx,
-        )
-        .unwrap();
-
-        assert!(handle.current_routes().is_empty());
-        handle.shutdown();
-    }
-
-    #[test]
-    fn reader_reflects_the_same_state_as_the_owning_handle() {
-        let policy = MockPolicyPort::new();
+    fn a_newly_captured_pid_gets_muted() {
+        let (capture, engine) = test_capture();
         let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
         let (tx, _rx) = mpsc::channel();
 
-        let handle = start_routing(
-            game_rules(),
-            game_buses(),
-            None,
-            Box::new(sessions),
-            Box::new(policy.clone()),
-            tx,
-        )
-        .unwrap();
-        let reader = handle.reader();
+        let handle = start_routing(game_rules(), 0, Box::new(sessions.clone()), capture, tx).unwrap();
 
-        assert_eq!(reader.current_routes(), handle.current_routes());
-        assert_eq!(reader.is_degraded(), handle.is_degraded());
+        assert!(sessions.muted_pids().contains(&100));
         handle.shutdown();
+        engine.shutdown().unwrap();
     }
 
     #[test]
-    fn structural_rebuild_via_update_topology_hides_the_new_bus_and_reroutes() {
-        let policy = MockPolicyPort::new();
+    fn a_released_pid_gets_unmuted() {
+        let (capture, engine) = test_capture();
         let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
         let (tx, _rx) = mpsc::channel();
 
-        let handle = start_routing(
-            game_rules(),
-            game_buses(),
-            None,
-            Box::new(sessions),
-            Box::new(policy.clone()),
-            tx,
-        )
-        .unwrap();
-        assert_eq!(policy.routes().get(&100), Some(&bus("bus-game")));
+        let handle = start_routing(game_rules(), 0, Box::new(sessions.clone()), capture, tx).unwrap();
+        assert!(sessions.muted_pids().contains(&100));
 
-        // Rebuild gave the group's bus a fresh EndpointId.
-        let new_buses = HashMap::from([(GroupId(0), bus("bus-game-2"))]);
-        handle.update_topology(new_buses, game_rules(), Some(bus("out-2")));
-        thread::sleep(StdDuration::from_millis(250));
-
-        assert_eq!(policy.is_visible(&bus("bus-game-2")), Some(false));
-        assert_eq!(policy.default_endpoint(), Some(bus("out-2")));
-        assert_eq!(policy.routes().get(&100), Some(&bus("bus-game-2")));
+        sessions.emit_event(SessionEvent::Ended(100));
+        let deadline = std::time::Instant::now() + StdDuration::from_secs(2);
+        while sessions.muted_pids().contains(&100) && std::time::Instant::now() < deadline {
+            thread::sleep(StdDuration::from_millis(20));
+        }
+        assert!(!sessions.muted_pids().contains(&100));
         handle.shutdown();
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shutdown_unmutes_every_still_captured_pid() {
+        let (capture, engine) = test_capture();
+        let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
+        let (tx, _rx) = mpsc::channel();
+
+        let handle = start_routing(game_rules(), 0, Box::new(sessions.clone()), capture, tx).unwrap();
+        assert!(sessions.muted_pids().contains(&100));
+
+        handle.shutdown();
+        assert!(
+            sessions.muted_pids().is_empty(),
+            "clean shutdown must unmute every session still captured when the coordinator stops"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_pid_that_fails_to_capture_is_never_muted() {
+        let sys_inner = Arc::new(MockSystem::new(vec![]));
+        sys_inner.fail_process_capture(100);
+        let sys: Arc<dyn crate::ports::AudioSystem> = sys_inner;
+        let snapshot = crate::graph::ConfigSnapshot {
+            schema_version: 2,
+            master: audio_core::Gain::UNITY,
+            muted: false,
+            app: crate::graph::AppConfig::default(),
+            groups: vec![],
+        };
+        let engine = runtime::start(&snapshot, sys).unwrap();
+        let capture = engine.capture_control();
+
+        let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
+        let (tx, _rx) = mpsc::channel();
+
+        let handle = start_routing(game_rules(), 0, Box::new(sessions.clone()), capture, tx).unwrap();
+
+        assert!(handle.is_degraded());
+        assert!(
+            !sessions.muted_pids().contains(&100),
+            "a pid that failed to open must never be muted"
+        );
+        handle.shutdown();
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_mute_failure_is_isolated_and_does_not_mark_routing_degraded() {
+        let (capture, engine) = test_capture();
+        let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
+        sessions.fail_mute(100);
+        let (tx, _rx) = mpsc::channel();
+
+        let handle = start_routing(game_rules(), 0, Box::new(sessions.clone()), capture, tx).unwrap();
+
+        assert!(!handle.is_degraded(), "a mute failure is cosmetic, not a routing degradation");
+        assert_eq!(
+            handle.current_routes(),
+            vec![(GroupId(0), vec![session(100, "game.exe")])],
+            "capture itself must succeed even though mute failed"
+        );
+        handle.shutdown();
+        engine.shutdown().unwrap();
     }
 }

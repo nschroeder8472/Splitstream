@@ -19,16 +19,17 @@ pub struct WasapiSystem {
 }
 
 impl WasapiSystem {
-    /// `bus_name_prefix`: render endpoints whose friendly name starts with
-    /// this are classified as `Bus`, everything else `Physical` — see the
-    /// classification note in `enumerator.rs`. Splitstream rides a bundled
-    /// third-party virtual driver (VB-Audio / VB-CABLE), so bus detection is
-    /// by configurable name prefix rather than a hardcoded vendor scheme.
-    pub fn new(bus_name_prefix: impl Into<String>) -> WasapiSystem {
+    pub fn new() -> WasapiSystem {
         WasapiSystem {
-            enumerator: EndpointEnumerator::new(bus_name_prefix),
+            enumerator: EndpointEnumerator::new(),
             monitor: Mutex::new(None),
         }
+    }
+}
+
+impl Default for WasapiSystem {
+    fn default() -> WasapiSystem {
+        WasapiSystem::new()
     }
 }
 
@@ -37,8 +38,8 @@ impl AudioSystem for WasapiSystem {
         self.enumerator.enumerate()
     }
 
-    fn open_capture(&self, id: &EndpointId) -> Result<Box<dyn CapturePort>, PortError> {
-        Ok(Box::new(crate::capture::open(id)?))
+    fn open_process_capture(&self, pid: u32, include_tree: bool) -> Result<Box<dyn CapturePort>, PortError> {
+        Ok(Box::new(crate::process_capture::open(pid, include_tree)?))
     }
 
     fn open_render(&self, id: &EndpointId) -> Result<Box<dyn RenderPort>, PortError> {
@@ -54,7 +55,7 @@ impl AudioSystem for WasapiSystem {
     }
 
     fn subscribe_device_events(&self) -> Result<Receiver<DeviceEvent>, PortError> {
-        let (monitor, rx) = crate::monitor::subscribe(self.enumerator.bus_name_prefix())?;
+        let (monitor, rx) = crate::monitor::subscribe()?;
         *self.monitor.lock().unwrap() = Some(monitor);
         Ok(rx)
     }
@@ -63,28 +64,31 @@ impl AudioSystem for WasapiSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine::ports::EndpointKind;
     use std::time::Duration;
 
-    /// Opens real WASAPI capture + render against whatever physical device
-    /// this machine has, reads/writes a few cycles, drops cleanly. Render
-    /// only ever writes silence — no audible output. Not part of the normal
-    /// suite (no audio hardware guarantee in CI). Run explicitly:
-    /// `cargo test -p win-audio -- --ignored open_and_pump_a_real_device`.
+    /// Opens real WASAPI process-loopback capture + physical render against
+    /// whatever process/device this machine has, reads/writes a few cycles,
+    /// drops cleanly. Render only ever writes silence — no audible output.
+    /// Not part of the normal suite (no audio hardware or a known playing
+    /// pid guarantee in CI). Run explicitly with a real playing process's
+    /// pid: `SPLITSTREAM_TEST_PID=1234 cargo test -p win-audio -- --ignored
+    /// open_and_pump_a_real_device`.
     #[test]
     #[ignore]
     fn open_and_pump_a_real_device() {
-        let sys = WasapiSystem::new("Splitstream Bus");
-        let endpoints = sys.enumerate().expect("enumerate");
-        let physical = endpoints
-            .iter()
-            .find(|e| e.kind == EndpointKind::Physical)
-            .expect("expected at least one physical render endpoint");
+        let Ok(pid) = std::env::var("SPLITSTREAM_TEST_PID").and_then(|s| {
+            s.parse::<u32>().map_err(|_| std::env::VarError::NotPresent)
+        }) else {
+            println!("SPLITSTREAM_TEST_PID not set — skipping");
+            return;
+        };
+        let sys = WasapiSystem::new();
+        let physical = sys.default_output().expect("default_output");
 
         let mut render = sys.open_render(&physical.id).expect("open_render");
         let mut capture = sys
-            .open_capture(&physical.id)
-            .expect("open_capture (loopback)");
+            .open_process_capture(pid, false)
+            .expect("open_process_capture");
 
         let channels = render.format().channels as usize;
         let silence = vec![0.0f32; render.period_frames() * channels];
@@ -97,7 +101,7 @@ mod tests {
 
         let mut buf = vec![0.0f32; 4096];
         let n = capture.read(&mut buf).expect("read");
-        println!("loopback captured {n} samples in one read()");
+        println!("process loopback captured {n} samples in one read()");
 
         let _guard = sys.promote_rt_thread();
     }
@@ -109,9 +113,8 @@ mod tests {
     #[test]
     #[ignore]
     fn default_output_returns_a_real_physical_endpoint() {
-        let sys = WasapiSystem::new("Splitstream Bus");
+        let sys = WasapiSystem::new();
         let default = sys.default_output().expect("default_output");
-        assert_eq!(default.kind, EndpointKind::Physical);
         println!("default output: {default:?}");
     }
 
@@ -124,7 +127,7 @@ mod tests {
     #[test]
     #[ignore]
     fn subscribe_and_print_real_device_events() {
-        let sys = WasapiSystem::new("Splitstream Bus");
+        let sys = WasapiSystem::new();
         let rx = sys.subscribe_device_events().expect("subscribe_device_events");
         println!("listening for device events for 10s — plug/unplug a device now");
         while let Ok(evt) = rx.recv_timeout(Duration::from_secs(10)) {

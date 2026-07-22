@@ -19,15 +19,32 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use audio_core::GroupId;
+use engine::ports::Endpoint;
 use engine::{ConfigSnapshot, EngineEvent, EngineStats, SessionInfo};
 
 /// Shared read model for the settings window and tray — the app-shell.md L4
-/// `UiState` contract. `app`-internal; nothing in `engine`/`control` reads it.
+/// `UiState` contract, extended by simple-launch.md L4 for first-run
+/// onboarding and mixer-ui-redesign L4 for drag-assign. `app`-internal;
+/// nothing in `engine`/`control` reads it.
 pub struct UiState {
     pub snapshot: ConfigSnapshot,
     pub routes: Vec<(GroupId, Vec<SessionInfo>)>,
     pub stats: EngineStats,
     pub routing_degraded: bool,
+    /// True until at least one group exists — `main::needs_onboarding`'s
+    /// result, kept live by `Dispatcher::set_current`.
+    pub first_run: bool,
+    /// Snapshot of `AudioSystem::enumerate()` taken at startup, for the
+    /// onboarding panel's output-device picker.
+    pub available_devices: Vec<Endpoint>,
+    /// `AudioSystem::default_output()`'s friendly name at startup, if any —
+    /// the onboarding panel's prefilled `output_device` pick.
+    pub default_output_name: Option<String>,
+    /// Every live session, matched or not — the settings window's
+    /// draggable-chip source (mixer-ui-redesign L4). Populated the same
+    /// per-frame way `routes`/`routing_degraded` already are (polled from
+    /// `RoutingReader` inside `ui.rs`'s `fn ui()`, not via `EventPump`).
+    pub all_sessions: Vec<SessionInfo>,
 }
 
 pub struct PumpHandle {
@@ -80,6 +97,10 @@ mod tests {
                 duck_depth_db: vec![],
             },
             routing_degraded: false,
+            first_run: false,
+            available_devices: vec![],
+            default_output_name: None,
+            all_sessions: vec![],
         }))
     }
 

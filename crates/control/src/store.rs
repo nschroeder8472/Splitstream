@@ -40,6 +40,12 @@ pub enum ConfigEdit {
     /// `ShellAction::EditSpatial`/`EngineHandle::apply_spatial`, not the
     /// plain `EditParams` fast path (see `ConfigDelta.spatial`'s doc).
     SetSpatial(String, bool),
+    /// `[app] autostart` (simple-launch.md L4) — rides the plain
+    /// `EditParams`/`ConfigStore::apply` path like any other scalar; no
+    /// mixer command exists for it (`edits_to_mixer_commands` returns
+    /// `None`), the dispatcher reconciles `lifecycle::set_autostart` when
+    /// `app.autostart` differs from the prior snapshot instead.
+    SetAutostart(bool),
 }
 
 #[derive(Debug)]
@@ -92,7 +98,7 @@ impl ConfigStore {
 
         let text = draft.to_string();
         let snapshot = parse(&text).map_err(StoreError::Validation)?;
-        write_atomic(&self.path, &text).map_err(StoreError::Io)?;
+        crate::atomic_write::write_atomic(&self.path, &text).map_err(StoreError::Io)?;
 
         self.doc = draft;
         self.last_written = Some(snapshot.clone());
@@ -179,6 +185,13 @@ fn apply_edit(doc: &mut DocumentMut, edit: &ConfigEdit) -> Result<(), StoreError
         ConfigEdit::SetSpatial(name, on) => {
             find_group_table(doc, name)?["spatial"] = value(*on);
         }
+        ConfigEdit::SetAutostart(on) => {
+            let app = doc["app"]
+                .or_insert(Item::Table(Table::new()))
+                .as_table_mut()
+                .ok_or_else(malformed_app_shape)?;
+            app["autostart"] = value(*on);
+        }
         ConfigEdit::SetDuck(name, duck) => {
             let group = find_group_table(doc, name)?;
             match duck {
@@ -239,6 +252,12 @@ fn malformed_shape(group: &str, key: &str, expected: &str) -> StoreError {
     )))
 }
 
+fn malformed_app_shape() -> StoreError {
+    StoreError::Validation(ConfigError::Invalid(
+        "`app` must be written as a `[app]` table, not an inline table, to support live edits".into(),
+    ))
+}
+
 fn dsp_stage_table(spec: &DspSpec) -> Table {
     let mut t = Table::new();
     match spec {
@@ -295,7 +314,6 @@ fn no_such_group(name: &str) -> StoreError {
 fn group_table(g: &GroupConfig) -> Table {
     let mut t = Table::new();
     t["name"] = value(g.name.as_str());
-    t["bus_endpoint"] = value(g.bus_endpoint.as_str());
     t["output_device"] = value(g.output_device.as_str());
     t["gain"] = value(g.gain.value() as f64);
     t["follow_master"] = value(g.follow_master);
@@ -326,14 +344,6 @@ fn string_array(items: &[String]) -> Array {
     items.iter().map(String::as_str).collect()
 }
 
-/// Same-directory temp file + rename: atomic on the same filesystem, and
-/// avoids the watcher observing a half-written file (app-shell.md decision).
-fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
-    let tmp = path.with_extension("toml.tmp");
-    fs::write(&tmp, text).map_err(|e| e.to_string())?;
-    fs::rename(&tmp, path).map_err(|e| e.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,7 +361,6 @@ master = 0.8 # master volume
 
 [[group]]
 name = "Game"
-bus_endpoint = "Bus 1"
 output_device = "Speakers"
 gain = 1.0
 follow_master = true
@@ -417,7 +426,6 @@ follow_master = true
 
         let added = GroupConfig {
             name: "Chat".into(),
-            bus_endpoint: "Bus 2".into(),
             output_device: "Headset".into(),
             gain: Gain::UNITY,
             follow_master: true,
@@ -565,12 +573,10 @@ master = 0.8
 
 [[group]]
 name = "Game"
-bus_endpoint = "Bus 1"
 output_device = "Speakers"
 
 [[group]]
 name = "Voice"
-bus_endpoint = "Bus 2"
 output_device = "Speakers"
 "#;
 
@@ -590,6 +596,33 @@ output_device = "Speakers"
 
         let snapshot = store.apply(&[ConfigEdit::SetSpatial("Game".into(), false)]).unwrap();
         assert!(!snapshot.groups[0].spatial);
+    }
+
+    #[test]
+    fn set_autostart_round_trips_against_an_existing_app_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(
+            dir.path(),
+            "schema_version = 2\nmaster = 1.0\n\n[app]\nautostart = false\n",
+        );
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let snapshot = store.apply(&[ConfigEdit::SetAutostart(true)]).unwrap();
+        assert!(snapshot.app.autostart);
+
+        let snapshot = store.apply(&[ConfigEdit::SetAutostart(false)]).unwrap();
+        assert!(!snapshot.app.autostart);
+    }
+
+    #[test]
+    fn set_autostart_creates_the_app_table_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let snapshot = store.apply(&[ConfigEdit::SetAutostart(true)]).unwrap();
+
+        assert!(snapshot.app.autostart);
     }
 
     #[test]
@@ -632,7 +665,6 @@ master = 1.0
 
 [[group]]
 name = "Game"
-bus_endpoint = "Bus"
 output_device = "Out"
 
 [[group.dsp]]
@@ -664,7 +696,6 @@ master = 1.0
 
 [[group]]
 name = "Game"
-bus_endpoint = "Bus"
 output_device = "Out"
 dsp = [{ type = "limiter", ceiling_db = -1.0 }]
 "#,

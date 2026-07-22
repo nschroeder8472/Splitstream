@@ -60,7 +60,6 @@ struct RawHotkeys {
 #[derive(Deserialize)]
 struct RawGroup {
     name: String,
-    bus_endpoint: String,
     output_device: String,
     #[serde(default = "default_gain")]
     gain: f32,
@@ -202,6 +201,39 @@ pub fn load(path: &Path) -> Result<ConfigSnapshot, ConfigError> {
     parse(&text)
 }
 
+/// Machine-neutral seed (simple-launch.md L4): no `[[group]]` — baking a
+/// device name into the shipped template would be wrong on every machine but
+/// the one it was written on. Onboarding (app-shell) adds the first group
+/// once the user picks an output device (process-loopback-capture pivot:
+/// no virtual bus to pick anymore — just an output). Body built from
+/// `SUPPORTED_SCHEMA_VERSION` rather than a second hardcoded literal, so a
+/// future schema bump can't leave the seed silently stale.
+fn default_config_template() -> String {
+    format!(
+        "# Splitstream configuration.\n\
+         # No audio group is configured yet — first-run onboarding adds one once you\n\
+         # pick an output device to route apps through.\n\
+         schema_version = {SUPPORTED_SCHEMA_VERSION}\n\
+         master = 1.0\n\
+         muted = false\n\
+         \n\
+         [app]\n\
+         autostart = true\n"
+    )
+}
+
+/// Create-if-missing then load (simple-launch.md L4). Never touches an
+/// existing file — only writes the seed when `path` doesn't exist yet.
+pub fn ensure_config(path: &Path) -> Result<ConfigSnapshot, ConfigError> {
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| ConfigError::Io(e.to_string()))?;
+        }
+        crate::atomic_write::write_atomic(path, &default_config_template()).map_err(ConfigError::Io)?;
+    }
+    load(path)
+}
+
 pub(crate) fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
     let raw: RawConfig = toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
 
@@ -232,7 +264,6 @@ pub(crate) fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
             });
             Ok(GroupConfig {
                 name: g.name,
-                bus_endpoint: g.bus_endpoint,
                 output_device: g.output_device,
                 gain,
                 follow_master: g.follow_master,
@@ -339,7 +370,7 @@ pub fn diff(old: &ConfigSnapshot, new: &ConfigSnapshot) -> ConfigDelta {
     }
 
     for (i, (o, n)) in old.groups.iter().zip(new.groups.iter()).enumerate() {
-        if o.bus_endpoint != n.bus_endpoint || o.output_device != n.output_device {
+        if o.output_device != n.output_device {
             return ConfigDelta {
                 structural: true,
                 ..ConfigDelta::default()
@@ -490,10 +521,9 @@ fn debounce_loop(
 mod tests {
     use super::*;
 
-    fn group(name: &str, bus: &str, output: &str, gain: f32, follow_master: bool) -> GroupConfig {
+    fn group(name: &str, output: &str, gain: f32, follow_master: bool) -> GroupConfig {
         GroupConfig {
             name: name.into(),
-            bus_endpoint: bus.into(),
             output_device: output.into(),
             gain: Gain::new(gain).unwrap(),
             follow_master,
@@ -512,7 +542,6 @@ mod tests {
 
             [[group]]
             name = "Game"
-            bus_endpoint = "Splitstream Game"
             output_device = "Speakers"
             gain = 1.0
             follow_master = true
@@ -607,7 +636,6 @@ mod tests {
 
     fn group_with_rules(
         name: &str,
-        bus: &str,
         output: &str,
         gain: f32,
         follow_master: bool,
@@ -615,7 +643,7 @@ mod tests {
     ) -> GroupConfig {
         GroupConfig {
             match_rules: rules.iter().map(|r| r.to_string()).collect(),
-            ..group(name, bus, output, gain, follow_master)
+            ..group(name, output, gain, follow_master)
         }
     }
 
@@ -626,14 +654,14 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
-            groups: vec![group("Game", "Bus", "Out", 1.0, true)],
+            groups: vec![group("Game", "Out", 1.0, true)],
         };
         let b = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
-            groups: vec![group("Game", "Bus", "Out", 1.0, true)],
+            groups: vec![group("Game", "Out", 1.0, true)],
         };
         assert!(diff(&a, &b).is_unchanged());
     }
@@ -645,14 +673,14 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
-            groups: vec![group("Game", "Bus", "Out", 1.0, true)],
+            groups: vec![group("Game", "Out", 1.0, true)],
         };
         let b = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
-            groups: vec![group("Game", "Bus", "Out", 0.5, true)],
+            groups: vec![group("Game", "Out", 0.5, true)],
         };
         let delta = diff(&a, &b);
         assert!(!delta.structural);
@@ -668,14 +696,14 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
-            groups: vec![group("Game", "Bus", "Out", 1.0, true)],
+            groups: vec![group("Game", "Out", 1.0, true)],
         };
         let b = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
-            groups: vec![group("Music", "Bus", "Out", 1.0, true)],
+            groups: vec![group("Music", "Out", 1.0, true)],
         };
         let delta = diff(&a, &b);
         assert!(delta.structural);
@@ -690,14 +718,14 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
-            groups: vec![group("Game", "Bus", "Speakers", 1.0, true)],
+            groups: vec![group("Game", "Speakers", 1.0, true)],
         };
         let b = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
-            groups: vec![group("Game", "Bus", "Headphones", 1.0, true)],
+            groups: vec![group("Game", "Headphones", 1.0, true)],
         };
         assert!(diff(&a, &b).structural);
     }
@@ -709,14 +737,14 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
-            groups: vec![group_with_rules("Game", "Bus", "Out", 1.0, true, &[])],
+            groups: vec![group_with_rules("Game", "Out", 1.0, true, &[])],
         };
         let b = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
-            groups: vec![group_with_rules("Game", "Bus", "Out", 1.0, true, &["game.exe"])],
+            groups: vec![group_with_rules("Game", "Out", 1.0, true, &["game.exe"])],
         };
         let delta = diff(&a, &b);
         assert!(!delta.structural);
@@ -737,14 +765,14 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
-            groups: vec![group_with_rules("Game", "Bus", "Out", 1.0, true, &[])],
+            groups: vec![group_with_rules("Game", "Out", 1.0, true, &[])],
         };
         let b = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
-            groups: vec![group_with_rules("Game", "Bus", "Out", 0.5, true, &["game.exe"])],
+            groups: vec![group_with_rules("Game", "Out", 0.5, true, &["game.exe"])],
         };
         let delta = diff(&a, &b);
         assert!(!delta.structural);
@@ -761,8 +789,8 @@ mod tests {
             muted: false,
             app: engine::AppConfig::default(),
             groups: vec![
-                group_with_rules("Game", "Bus", "Out", 1.0, true, &["game.exe"]),
-                group_with_rules("Music", "Bus", "Out", 1.0, true, &["music*.exe"]),
+                group_with_rules("Game", "Out", 1.0, true, &["game.exe"]),
+                group_with_rules("Music", "Out", 1.0, true, &["music*.exe"]),
             ],
         };
         let rules = group_rules(&snapshot);
@@ -784,7 +812,6 @@ mod tests {
 
             [[group]]
             name = "Music"
-            bus_endpoint = "Bus"
             output_device = "Out"
 
             [[group.dsp]]
@@ -813,7 +840,6 @@ mod tests {
 
             [[group]]
             name = "Music"
-            bus_endpoint = "Bus"
             output_device = "Out"
 
             [[group.dsp]]
@@ -831,12 +857,10 @@ mod tests {
 
             [[group]]
             name = "Voice"
-            bus_endpoint = "Bus1"
             output_device = "Out"
 
             [[group]]
             name = "Music"
-            bus_endpoint = "Bus2"
             output_device = "Out"
 
             [group.duck]
@@ -860,7 +884,6 @@ mod tests {
 
             [[group]]
             name = "Music"
-            bus_endpoint = "Bus"
             output_device = "Out"
 
             [group.duck]
@@ -881,7 +904,6 @@ mod tests {
 
             [[group]]
             name = "A"
-            bus_endpoint = "Bus1"
             output_device = "Out"
             [group.duck]
             trigger = "B"
@@ -892,7 +914,6 @@ mod tests {
 
             [[group]]
             name = "B"
-            bus_endpoint = "Bus2"
             output_device = "Out"
             [group.duck]
             trigger = "A"
@@ -904,10 +925,10 @@ mod tests {
         assert!(matches!(parse(toml), Err(ConfigError::Invalid(_))));
     }
 
-    fn group_with_dsp(name: &str, bus: &str, output: &str, dsp: Vec<DspStageConfig>) -> GroupConfig {
+    fn group_with_dsp(name: &str, output: &str, dsp: Vec<DspStageConfig>) -> GroupConfig {
         GroupConfig {
             dsp,
-            ..group(name, bus, output, 1.0, true)
+            ..group(name, output, 1.0, true)
         }
     }
 
@@ -918,7 +939,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
-            groups: vec![group_with_dsp("Game", "Bus", "Out", vec![])],
+            groups: vec![group_with_dsp("Game", "Out", vec![])],
         };
         let b = ConfigSnapshot {
             schema_version: 2,
@@ -927,7 +948,6 @@ mod tests {
             app: engine::AppConfig::default(),
             groups: vec![group_with_dsp(
                 "Game",
-                "Bus",
                 "Out",
                 vec![DspStageConfig {
                     spec: DspSpec::Limiter { ceiling_db: -1.0 },
@@ -954,14 +974,14 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
-            groups: vec![group_with_dsp("Game", "Bus", "Out", vec![stage(false)])],
+            groups: vec![group_with_dsp("Game", "Out", vec![stage(false)])],
         };
         let b = ConfigSnapshot {
             schema_version: 2,
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
-            groups: vec![group_with_dsp("Game", "Bus", "Out", vec![stage(true)])],
+            groups: vec![group_with_dsp("Game", "Out", vec![stage(true)])],
         };
         let delta = diff(&a, &b);
         assert!(delta.dsp_chains.is_none(), "same spec shape must not trigger a chain rebuild");
@@ -980,8 +1000,8 @@ mod tests {
             muted: false,
             app: engine::AppConfig::default(),
             groups: vec![
-                group("Voice", "Bus1", "Out", 1.0, true),
-                group("Music", "Bus2", "Out", 1.0, true),
+                group("Voice", "Out", 1.0, true),
+                group("Music", "Out", 1.0, true),
             ],
         };
         let mut b = a.clone();
@@ -1009,7 +1029,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
-            groups: vec![group("Game", "Bus", "Out", 1.0, true)],
+            groups: vec![group("Game", "Out", 1.0, true)],
         };
         let mut b = a.clone();
         b.groups[0].spatial = true;
@@ -1029,7 +1049,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
-            groups: vec![group("Game", "Bus", "Out", 1.0, true)],
+            groups: vec![group("Game", "Out", 1.0, true)],
         };
         let b = a.clone();
         assert!(diff(&a, &b).is_unchanged());
@@ -1043,18 +1063,49 @@ mod tests {
 
             [[group]]
             name = "Game"
-            bus_endpoint = "Bus"
             output_device = "Out"
 
             [[group]]
             name = "Music"
-            bus_endpoint = "Bus2"
             output_device = "Out"
             spatial = true
         "#;
         let snapshot = parse(toml).unwrap();
         assert!(!snapshot.groups[0].spatial);
         assert!(snapshot.groups[1].spatial);
+    }
+
+    #[test]
+    fn ensure_config_writes_the_default_template_when_the_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("splitstream.toml");
+
+        let snapshot = ensure_config(&path).unwrap();
+
+        assert!(path.exists());
+        assert!(snapshot.groups.is_empty());
+        assert!(snapshot.app.autostart);
+    }
+
+    #[test]
+    fn ensure_config_creates_missing_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("splitstream.toml");
+
+        ensure_config(&path).unwrap();
+
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn ensure_config_leaves_an_existing_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("splitstream.toml");
+        fs::write(&path, "schema_version = 2\nmaster = 0.42\n").unwrap();
+
+        let snapshot = ensure_config(&path).unwrap();
+
+        assert_eq!(snapshot.master, Gain::new(0.42).unwrap());
     }
 
     #[test]

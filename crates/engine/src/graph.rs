@@ -7,9 +7,9 @@
 
 use std::collections::HashSet;
 
-use audio_core::{DspSpec, DuckSpec, Gain, GroupId, GroupSpec, OutputId, OutputSpec, Topology};
+use audio_core::{DspSpec, DuckSpec, Format, Gain, GroupId, GroupSpec, OutputId, OutputSpec, Topology};
 
-use crate::ports::{Endpoint, EndpointId, EndpointKind};
+use crate::ports::{Endpoint, EndpointId};
 use crate::runtime::EngineError;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -27,7 +27,6 @@ pub struct ConfigSnapshot {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupConfig {
     pub name: String,
-    pub bus_endpoint: String,
     pub output_device: String,
     pub gain: Gain,
     pub follow_master: bool,
@@ -124,16 +123,29 @@ impl HotkeyChord {
 }
 
 /// Config with names resolved to endpoint ids, ready for `runtime` to open
-/// ports and build the `Mixer` from.
+/// ports and build the `Mixer` from. No more `group_endpoints`
+/// (process-loopback-capture pivot): a group no longer has any capture
+/// endpoint to resolve — its capture *sources* are pids, matched live by
+/// `engine::routing` and wired in dynamically via
+/// `EngineHandle::capture_control`, never resolved here.
 pub struct GraphPlan {
     pub topology: Topology,
-    pub group_endpoints: Vec<(GroupId, EndpointId)>,
     pub output_endpoints: Vec<(OutputId, EndpointId)>,
 }
 
 /// Resolves group/device names against the live endpoint list. Multiple
 /// groups naming the same `output_device` share one `OutputId` (spec:
 /// "shared outputs" — their audio sums cleanly at that one physical device).
+///
+/// `capture_format` is every group's `input_format` (process-loopback-capture
+/// L4) — there is no per-group bus to derive a per-group format from
+/// anymore, so the caller passes one fixed format for every group. Confirmed
+/// on real hardware: a process-loopback-activated `IAudioClient` doesn't
+/// implement `GetMixFormat` at all, so the real `win-audio` implementation
+/// *dictates* a fixed format to every process capture stream at `Initialize`
+/// time rather than negotiating one — every stream reports the same value
+/// regardless of the system's actual default device (see
+/// `engine::runtime::PROCESS_CAPTURE_FORMAT`'s doc for the full story).
 ///
 /// `parked` names groups (drift-and-recovery: no fallback device available)
 /// to exclude from the resulting graph entirely rather than erroring — the
@@ -144,13 +156,9 @@ pub fn resolve(
     snapshot: &ConfigSnapshot,
     endpoints: &[Endpoint],
     parked: &HashSet<String>,
+    capture_format: Format,
 ) -> Result<GraphPlan, EngineError> {
-    let find = |kind: EndpointKind, name: &str| {
-        endpoints.iter().find(|e| e.kind == kind && e.name == name)
-    };
-
     let mut groups = Vec::with_capacity(snapshot.groups.len());
-    let mut group_endpoints = Vec::with_capacity(snapshot.groups.len());
     let mut outputs: Vec<OutputSpec> = Vec::new();
     let mut output_endpoints: Vec<(OutputId, EndpointId)> = Vec::new();
     let mut output_by_device: Vec<(&str, OutputId)> = Vec::new();
@@ -161,25 +169,21 @@ pub fn resolve(
             continue;
         }
 
-        let bus = find(EndpointKind::Bus, &g.bus_endpoint).ok_or_else(|| {
-            EngineError::Resolve(format!(
-                "group '{}': bus endpoint '{}' not found",
-                g.name, g.bus_endpoint
-            ))
-        })?;
-
         let output_id = match output_by_device
             .iter()
             .find(|(name, _)| *name == g.output_device)
         {
             Some((_, id)) => *id,
             None => {
-                let physical = find(EndpointKind::Physical, &g.output_device).ok_or_else(|| {
-                    EngineError::Resolve(format!(
-                        "group '{}': output device '{}' not found",
-                        g.name, g.output_device
-                    ))
-                })?;
+                let physical = endpoints
+                    .iter()
+                    .find(|e| e.name == g.output_device)
+                    .ok_or_else(|| {
+                        EngineError::Resolve(format!(
+                            "group '{}': output device '{}' not found",
+                            g.name, g.output_device
+                        ))
+                    })?;
                 let id = OutputId(outputs.len() as u16);
                 outputs.push(OutputSpec {
                     id,
@@ -220,12 +224,11 @@ pub fn resolve(
             gain: g.gain,
             follow_master: g.follow_master,
             output: output_id,
-            input_format: bus.format,
+            input_format: capture_format,
             dsp: g.dsp.iter().map(|s| s.spec.clone()).collect(),
             duck,
             spatial: g.spatial,
         });
-        group_endpoints.push((group_id, bus.id.clone()));
     }
 
     Ok(GraphPlan {
@@ -234,7 +237,6 @@ pub fn resolve(
             groups,
             outputs,
         },
-        group_endpoints,
         output_endpoints,
     })
 }
@@ -242,7 +244,7 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use audio_core::{ChannelLayout, Format};
+    use audio_core::ChannelLayout;
 
     fn stereo(rate: u32) -> Format {
         Format {
@@ -255,21 +257,13 @@ mod tests {
     fn endpoints() -> Vec<Endpoint> {
         vec![
             Endpoint {
-                id: EndpointId("bus-1".into()),
-                name: "Game".into(),
-                kind: EndpointKind::Bus,
-                format: stereo(48_000),
-            },
-            Endpoint {
                 id: EndpointId("out-1".into()),
                 name: "Speakers".into(),
-                kind: EndpointKind::Physical,
                 format: stereo(48_000),
             },
             Endpoint {
                 id: EndpointId("out-2".into()),
                 name: "Headphones".into(),
-                kind: EndpointKind::Physical,
                 format: stereo(48_000),
             },
         ]
@@ -279,10 +273,13 @@ mod tests {
         HashSet::new()
     }
 
-    fn group(name: &str, bus: &str, output: &str) -> GroupConfig {
+    fn resolve_test(snapshot: &ConfigSnapshot, endpoints: &[Endpoint], parked: &HashSet<String>) -> Result<GraphPlan, EngineError> {
+        resolve(snapshot, endpoints, parked, stereo(48_000))
+    }
+
+    fn group(name: &str, output: &str) -> GroupConfig {
         GroupConfig {
             name: name.into(),
-            bus_endpoint: bus.into(),
             output_device: output.into(),
             gain: Gain::UNITY,
             follow_master: true,
@@ -323,19 +320,31 @@ mod tests {
     }
 
     #[test]
-    fn resolves_group_to_bus_and_output_ids() {
+    fn resolves_group_to_its_output_id() {
         let snapshot = ConfigSnapshot {
             schema_version: 2,
             muted: false,
             app: AppConfig::default(),
             master: Gain::UNITY,
-            groups: vec![group("Game", "Game", "Speakers")],
+            groups: vec![group("Game", "Speakers")],
         };
-        let plan = resolve(&snapshot, &endpoints(), &no_parked()).unwrap();
+        let plan = resolve_test(&snapshot, &endpoints(), &no_parked()).unwrap();
         assert_eq!(plan.topology.groups.len(), 1);
         assert_eq!(plan.topology.outputs.len(), 1);
-        assert_eq!(plan.group_endpoints[0].1, EndpointId("bus-1".into()));
         assert_eq!(plan.output_endpoints[0].1, EndpointId("out-1".into()));
+    }
+
+    #[test]
+    fn resolved_groups_share_the_passed_in_capture_format() {
+        let snapshot = ConfigSnapshot {
+            schema_version: 2,
+            muted: false,
+            app: AppConfig::default(),
+            master: Gain::UNITY,
+            groups: vec![group("Game", "Speakers")],
+        };
+        let plan = resolve(&snapshot, &endpoints(), &no_parked(), stereo(44_100)).unwrap();
+        assert_eq!(plan.topology.groups[0].input_format, stereo(44_100));
     }
 
     #[test]
@@ -346,11 +355,11 @@ mod tests {
             app: AppConfig::default(),
             master: Gain::UNITY,
             groups: vec![
-                group("Game", "Game", "Speakers"),
-                group("Music", "Game", "Speakers"),
+                group("Game", "Speakers"),
+                group("Music", "Speakers"),
             ],
         };
-        let plan = resolve(&snapshot, &endpoints(), &no_parked()).unwrap();
+        let plan = resolve_test(&snapshot, &endpoints(), &no_parked()).unwrap();
         assert_eq!(
             plan.topology.outputs.len(),
             1,
@@ -363,31 +372,16 @@ mod tests {
     }
 
     #[test]
-    fn missing_bus_endpoint_is_a_resolve_error() {
-        let snapshot = ConfigSnapshot {
-            schema_version: 2,
-            muted: false,
-            app: AppConfig::default(),
-            master: Gain::UNITY,
-            groups: vec![group("Game", "Nonexistent", "Speakers")],
-        };
-        assert!(matches!(
-            resolve(&snapshot, &endpoints(), &no_parked()),
-            Err(EngineError::Resolve(_))
-        ));
-    }
-
-    #[test]
     fn missing_output_device_is_a_resolve_error() {
         let snapshot = ConfigSnapshot {
             schema_version: 2,
             muted: false,
             app: AppConfig::default(),
             master: Gain::UNITY,
-            groups: vec![group("Game", "Game", "Nonexistent")],
+            groups: vec![group("Game", "Nonexistent")],
         };
         assert!(matches!(
-            resolve(&snapshot, &endpoints(), &no_parked()),
+            resolve_test(&snapshot, &endpoints(), &no_parked()),
             Err(EngineError::Resolve(_))
         ));
     }
@@ -399,11 +393,11 @@ mod tests {
             muted: false,
             app: AppConfig::default(),
             master: Gain::UNITY,
-            groups: vec![group("Game", "Game", "Nonexistent")],
+            groups: vec![group("Game", "Nonexistent")],
         };
         let mut parked = HashSet::new();
         parked.insert("Game".to_string());
-        let plan = resolve(&snapshot, &endpoints(), &parked).unwrap();
+        let plan = resolve_test(&snapshot, &endpoints(), &parked).unwrap();
         assert!(plan.topology.groups.is_empty());
         assert!(plan.topology.outputs.is_empty());
     }
@@ -416,13 +410,13 @@ mod tests {
             app: AppConfig::default(),
             master: Gain::UNITY,
             groups: vec![
-                group("Parked", "Game", "Speakers"),
-                group("Music", "Game", "Headphones"),
+                group("Parked", "Speakers"),
+                group("Music", "Headphones"),
             ],
         };
         let mut parked = HashSet::new();
         parked.insert("Parked".to_string());
-        let plan = resolve(&snapshot, &endpoints(), &parked).unwrap();
+        let plan = resolve_test(&snapshot, &endpoints(), &parked).unwrap();
         assert_eq!(plan.topology.groups.len(), 1);
         // "Music" is snapshot.groups[1] — its GroupId must stay GroupId(1)
         // even though "Parked" (index 0) was skipped, not renumbered to 0.
@@ -437,7 +431,7 @@ mod tests {
             app: AppConfig::default(),
             master: Gain::UNITY,
             groups: vec![
-                group("Voice", "Game", "Speakers"),
+                group("Voice", "Speakers"),
                 GroupConfig {
                     duck: Some(DuckSpecConfig {
                         trigger: "Voice".into(),
@@ -446,11 +440,11 @@ mod tests {
                         attack_ms: 5.0,
                         release_ms: 200.0,
                     }),
-                    ..group("Music", "Game", "Speakers")
+                    ..group("Music", "Speakers")
                 },
             ],
         };
-        let plan = resolve(&snapshot, &endpoints(), &no_parked()).unwrap();
+        let plan = resolve_test(&snapshot, &endpoints(), &no_parked()).unwrap();
         let music = &plan.topology.groups[1];
         assert_eq!(music.duck.unwrap().trigger, GroupId(0), "Voice is snapshot.groups[0]");
     }
@@ -470,11 +464,11 @@ mod tests {
                     attack_ms: 5.0,
                     release_ms: 200.0,
                 }),
-                ..group("Music", "Game", "Speakers")
+                ..group("Music", "Speakers")
             }],
         };
         assert!(matches!(
-            resolve(&snapshot, &endpoints(), &no_parked()),
+            resolve_test(&snapshot, &endpoints(), &no_parked()),
             Err(EngineError::Resolve(_))
         ));
     }

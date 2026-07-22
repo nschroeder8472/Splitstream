@@ -13,3 +13,4 @@ audio-core = { path = "../audio-core" }
 crossbeam-queue = "0.3"
 rtrb = "0.3"
 spin_sleep = "1"
+tracing = "0.1.44"
