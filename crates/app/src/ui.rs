@@ -38,21 +38,72 @@ use crate::ShellAction;
 /// `SessionInfo` back up from `all_sessions` by pid.
 struct DragSession(u32);
 
-/// Master/group column width — narrow, side-by-side fader strips per the
-/// mockup (`RoughAppUI.png`).
-const COLUMN_WIDTH: f32 = 140.0;
+/// Column width clamps (responsive-ui-refinement L4) — narrow enough to fit
+/// several side-by-side per the mockup (`RoughAppUI.png`), wide enough to
+/// stay readable. Below `MIN_COLUMN_WIDTH * column count`, the row scrolls
+/// horizontally instead of shrinking further (L3 flow F).
+const MIN_COLUMN_WIDTH: f32 = 100.0;
+const MAX_COLUMN_WIDTH: f32 = 220.0;
+
+/// Vertical fader length clamps (responsive-ui-refinement L4).
+const MIN_FADER_HEIGHT: f32 = 120.0;
+const MAX_FADER_HEIGHT: f32 = 400.0;
+
+/// Rough vertical space a column's chrome (name row, mute button or output
+/// dropdown, "Routed Apps" label + drop zone) takes up around the fader —
+/// subtracted from the row's available height before clamping fader length.
+/// Tuned by eye, not exact; egui sizes the surrounding widgets by their own
+/// content regardless, this only informs how much length the fader claims.
+const COLUMN_CHROME_HEIGHT: f32 = 160.0;
+
+/// Fixed on-screen size for the custom-painted speaker icon — the icon
+/// itself doesn't need to scale with the responsive column/fader sizing,
+/// only its position (always directly under Master's fader) does. Square,
+/// so the volume-arc math below doesn't need separate x/y scale factors.
+const SPEAKER_ICON_SIZE: egui::Vec2 = egui::vec2(28.0, 28.0);
+
+/// Column width given the available row width and how many columns (master
+/// plus groups, not counting the floating "+") share it — clamped so
+/// columns never get unreadably narrow or absurdly wide. Pure
+/// (responsive-ui-refinement L4).
+fn column_width(available_width: f32, column_count: usize) -> f32 {
+    let count = column_count.max(1) as f32;
+    (available_width / count).clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH)
+}
+
+/// Vertical fader length given the column's available height — clamped so
+/// the fader never vanishes on a short window or stretches absurdly tall.
+/// Pure (responsive-ui-refinement L4).
+fn fader_height(available_height: f32) -> f32 {
+    available_height.clamp(MIN_FADER_HEIGHT, MAX_FADER_HEIGHT)
+}
 
 /// Read-only data `group_column` needs besides `self`/`ui`/the group itself —
 /// bundled once the plain parameter list crossed clippy's
 /// `too_many_arguments` threshold (operational learnings: extract at that
 /// point, not later — same idiom as `engine::runtime`'s `CaptureFaultCtx`/
-/// `RenderFaultCtx`). All borrows, so trivially `Copy`.
+/// `RenderFaultCtx`). All borrows/`Copy` values, so trivially `Copy`.
 #[derive(Clone, Copy)]
 struct GroupColumnCtx<'a> {
     routes: &'a [(GroupId, Vec<SessionInfo>)],
     all_sessions: &'a [SessionInfo],
     all_groups: &'a [GroupConfig],
     devices: &'a [Endpoint],
+    /// Responsive sizing (responsive-ui-refinement L4) — computed once per
+    /// frame in `ui()` from `ui.available_size()`, shared by every column.
+    width: f32,
+    fader_height: f32,
+}
+
+/// Which page `SettingsApp` is currently showing (responsive-ui-refinement
+/// L4) — replaces the old `advanced_open: HashMap<String, bool>` /
+/// `master_advanced_open: bool`. Exactly one page is ever visible, so an
+/// enum has no representable invalid state a bool map could (two groups'
+/// pages "open" at once).
+#[derive(Clone)]
+enum Screen {
+    Mixer,
+    GroupSettings(String),
 }
 
 #[derive(Default)]
@@ -97,12 +148,10 @@ pub struct SettingsApp {
     drafts: HashMap<String, GroupDraft>,
     new_group: NewGroupDraft,
     onboarding: OnboardingDraft,
-    /// Per-group gear-icon panel visibility — independent per group
-    /// (mixer-ui-redesign L4).
-    advanced_open: HashMap<String, bool>,
-    /// Master column's own gear-icon panel visibility — separate from
-    /// `advanced_open` (which is keyed by group name; Master isn't a group).
-    master_advanced_open: bool,
+    /// Which page is showing — mixer or one group's full-screen settings
+    /// (responsive-ui-refinement L4). Replaces the old
+    /// `advanced_open`/`master_advanced_open` bool fields entirely.
+    screen: Screen,
     /// Floating "+" toggles the "Create New Audio Source" panel — hidden by
     /// default, matching the mockup's floating button rather than today's
     /// always-inline row.
@@ -118,8 +167,7 @@ impl SettingsApp {
             drafts: HashMap::new(),
             new_group: NewGroupDraft::default(),
             onboarding: OnboardingDraft::default(),
-            advanced_open: HashMap::new(),
-            master_advanced_open: false,
+            screen: Screen::Mixer,
             show_new_group_panel: false,
         }
     }
@@ -166,40 +214,71 @@ impl eframe::App for SettingsApp {
             return;
         }
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            if degraded {
-                ui.colored_label(
-                    egui::Color32::from_rgb(220, 80, 40),
-                    "Routing degraded — some app auto-routing may not work.",
-                );
-                ui.separator();
-            }
+        // Safety net (L3 flow D): if the currently-open group settings page
+        // named a group that no longer exists (its own "Remove group" click
+        // already handles the expected case by resetting screen directly —
+        // this also covers an external config edit removing it out from
+        // under an open page), fall back to the mixer rather than looking up
+        // a missing group below.
+        let screen_is_stale = matches!(&self.screen, Screen::GroupSettings(name) if !snapshot.groups.iter().any(|g| &g.name == name));
+        if screen_is_stale {
+            self.screen = Screen::Mixer;
+        }
 
-            ui.heading("Splitstream");
-
-            let group_ctx = GroupColumnCtx {
-                routes: &routes,
-                all_sessions: &all_sessions,
-                all_groups: &snapshot.groups,
-                devices: &available_devices,
-            };
-            ui.horizontal(|ui| {
-                self.master_column(ui, &snapshot, &routes, &all_sessions);
-                for (i, group) in snapshot.groups.iter().enumerate() {
-                    self.group_column(ui, group, GroupId(i as u16), &group_ctx);
+        egui::CentralPanel::default().show(ui, |ui| match self.screen.clone() {
+            Screen::Mixer => {
+                if degraded {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(220, 80, 40),
+                        "Routing degraded — some app auto-routing may not work.",
+                    );
+                    ui.separator();
                 }
-                if ui.button("+").on_hover_text("Create New Audio Source").clicked() {
-                    self.show_new_group_panel = !self.show_new_group_panel;
+
+                ui.heading("Splitstream");
+
+                // Responsive sizing (responsive-ui-refinement L4/L3 flow A) —
+                // recomputed fresh every frame from the space actually
+                // available, no cached layout state.
+                let available = ui.available_size();
+                let column_count = 1 + snapshot.groups.len();
+                let width = column_width(available.x, column_count);
+                let height = fader_height(available.y - COLUMN_CHROME_HEIGHT);
+
+                let group_ctx = GroupColumnCtx {
+                    routes: &routes,
+                    all_sessions: &all_sessions,
+                    all_groups: &snapshot.groups,
+                    devices: &available_devices,
+                    width,
+                    fader_height: height,
+                };
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        self.master_column(ui, &snapshot, &routes, &all_sessions, width, height);
+                        for (i, group) in snapshot.groups.iter().enumerate() {
+                            self.group_column(ui, group, GroupId(i as u16), &group_ctx);
+                        }
+                        if ui.button("+").on_hover_text("Create New Audio Source").clicked() {
+                            self.show_new_group_panel = !self.show_new_group_panel;
+                        }
+                    });
+                });
+
+                if self.show_new_group_panel {
+                    ui.separator();
+                    self.add_group_controls(ui, &available_devices);
                 }
-            });
 
-            if self.show_new_group_panel {
                 ui.separator();
-                self.add_group_controls(ui, &available_devices);
+                ui.label(format!("xruns: {xruns}   group faults: {faults}"));
             }
-
-            ui.separator();
-            ui.label(format!("xruns: {xruns}   group faults: {faults}"));
+            Screen::GroupSettings(name) => {
+                // `screen_is_stale` above already guarantees this exists.
+                if let Some(group) = snapshot.groups.iter().find(|g| g.name == name) {
+                    self.group_settings_page(ui, group, &snapshot.groups);
+                }
+            }
         });
     }
 }
@@ -256,40 +335,37 @@ impl SettingsApp {
         }
     }
 
-    /// Master column (`RoughAppUI.png`): name + gear (Mute lives behind it,
-    /// mirroring how each group's advanced settings live behind its own
-    /// gear), vertical fader, "Routed Apps" footer = the *unassigned*-session
-    /// pool (mixer-ui-redesign L2 decision — Master's footer, not a separate
-    /// strip). Dropping a chip here unassigns it (drag-assign target `None`).
+    /// Master column (`RoughAppUI.png`): name (no gear — nothing left to
+    /// hide behind one once mute moves here, responsive-ui-refinement
+    /// decision), vertical fader sized to `fader_height`, speaker-icon mute
+    /// button directly under the fader, "Routed Apps" footer = the
+    /// *unassigned*-session pool (mixer-ui-redesign L2 decision — Master's
+    /// footer, not a separate strip). Dropping a chip here unassigns it
+    /// (drag-assign target `None`).
     fn master_column(
         &mut self,
         ui: &mut egui::Ui,
         snapshot: &engine::ConfigSnapshot,
         routes: &[(GroupId, Vec<SessionInfo>)],
         all_sessions: &[SessionInfo],
+        width: f32,
+        height: f32,
     ) {
         ui.group(|ui| {
-            ui.set_width(COLUMN_WIDTH);
+            ui.set_width(width);
             ui.vertical_centered(|ui| {
-                ui.horizontal(|ui| {
-                    ui.strong("Master Volume");
-                    if ui.small_button("⚙").clicked() {
-                        self.master_advanced_open = !self.master_advanced_open;
-                    }
-                });
-
-                if self.master_advanced_open {
-                    let mut muted = snapshot.muted;
-                    if ui.checkbox(&mut muted, "Mute").changed() {
-                        self.send(ShellAction::EditParams(vec![ConfigEdit::SetMuted(muted)]));
-                    }
-                }
+                ui.strong("Master Volume");
 
                 let mut master = snapshot.master.value();
+                ui.spacing_mut().slider_width = height;
                 if ui.add(egui::Slider::new(&mut master, 0.0..=1.0).vertical()).changed() {
                     if let Ok(gain) = Gain::new(master) {
                         self.send(ShellAction::EditParams(vec![ConfigEdit::SetMaster(gain)]));
                     }
+                }
+
+                if speaker_mute_button(ui, snapshot.muted) {
+                    self.send(ShellAction::EditParams(vec![ConfigEdit::SetMuted(!snapshot.muted)]));
                 }
 
                 ui.label("Routed Apps");
@@ -301,24 +377,24 @@ impl SettingsApp {
         });
     }
 
-    /// One group's column: name + gear (opens the advanced panel below),
-    /// dropdown-sourced output device, vertical fader, "Routed Apps" footer
-    /// as a drop zone (mixer-ui-redesign L2/L3).
+    /// One group's column: name + gear (navigates to that group's full
+    /// settings page — responsive-ui-refinement L3 flow B, no longer an
+    /// inline expand), dropdown-sourced output device, vertical fader sized
+    /// to `ctx.fader_height`, "Routed Apps" footer as a drop zone
+    /// (mixer-ui-redesign L2/L3).
     fn group_column(&mut self, ui: &mut egui::Ui, group: &GroupConfig, id: GroupId, ctx: &GroupColumnCtx) {
-        let GroupColumnCtx { routes, all_sessions, all_groups, devices } = *ctx;
+        let GroupColumnCtx { routes, all_sessions, all_groups, devices, width, fader_height } = *ctx;
         let name = group.name.clone();
 
         ui.group(|ui| {
-            ui.set_width(COLUMN_WIDTH);
+            ui.set_width(width);
             ui.vertical_centered(|ui| {
-                let mut open = *self.advanced_open.get(&name).unwrap_or(&false);
                 ui.horizontal(|ui| {
                     ui.strong(&group.name);
                     if ui.small_button("⚙").clicked() {
-                        open = !open;
+                        self.screen = Screen::GroupSettings(name.clone());
                     }
                 });
-                self.advanced_open.insert(name.clone(), open);
 
                 let mut output_choice = group.output_device.clone();
                 if output_device_combo(ui, &format!("output-{name}"), &mut output_choice, devices) {
@@ -329,6 +405,7 @@ impl SettingsApp {
                 }
 
                 let mut gain = group.gain.value();
+                ui.spacing_mut().slider_width = fader_height;
                 if ui.add(egui::Slider::new(&mut gain, 0.0..=1.0).vertical()).changed() {
                     if let Ok(g) = Gain::new(gain) {
                         self.send(ShellAction::EditParams(vec![ConfigEdit::SetGroupGain(name.clone(), g)]));
@@ -342,12 +419,6 @@ impl SettingsApp {
                 }
             });
         });
-
-        if *self.advanced_open.get(&name).unwrap_or(&false) {
-            ui.group(|ui| {
-                self.group_advanced_panel(ui, group, all_groups);
-            });
-        }
     }
 
     /// Resolves a dropped chip's pid to its process file name and sends the
@@ -364,11 +435,22 @@ impl SettingsApp {
         }
     }
 
-    /// Gear-icon panel (mixer-ui-redesign L2): follow-master, spatial,
-    /// DSP chain, duck sidechain, match-rules text fallback, remove-group —
-    /// everything the always-visible column doesn't show.
-    fn group_advanced_panel(&mut self, ui: &mut egui::Ui, group: &GroupConfig, all_groups: &[GroupConfig]) {
+    /// Group settings page (responsive-ui-refinement L4, revised from
+    /// mixer-ui-redesign's inline `group_advanced_panel`): follow-master,
+    /// spatial, DSP chain, duck sidechain, match-rules text fallback,
+    /// remove-group — same content, now a full-width page reached via the
+    /// column's gear icon (L3 flow B) instead of an inline expand. Back
+    /// button returns to the mixer (L3 flow C).
+    fn group_settings_page(&mut self, ui: &mut egui::Ui, group: &GroupConfig, all_groups: &[GroupConfig]) {
         let name = group.name.clone();
+
+        ui.horizontal(|ui| {
+            if ui.button("⬅ Back").clicked() {
+                self.screen = Screen::Mixer;
+            }
+            ui.heading(format!("{name} Settings"));
+        });
+        ui.separator();
 
         let mut follow = group.follow_master;
         if ui.checkbox(&mut follow, "Follow master").changed() {
@@ -399,6 +481,9 @@ impl SettingsApp {
 
         if ui.button("Remove group").clicked() {
             self.send(ShellAction::EditStructure(vec![ConfigEdit::RemoveGroup(name.clone())]));
+            // L3 flow D — navigate back immediately in the same click rather
+            // than waiting for next frame's stale-screen fallback to catch it.
+            self.screen = Screen::Mixer;
         }
     }
 
@@ -568,6 +653,50 @@ impl SettingsApp {
     }
 }
 
+/// Custom-painted speaker icon + click sense (responsive-ui-refinement L4)
+/// — cone + volume arcs when `muted` is false, cone + diagonal slash when
+/// true. A custom paint avoids the tofu-box risk an emoji-range glyph
+/// (🔊/🔇) would carry in egui's default font, unlike the already-proven ⚙
+/// (operational learnings). Single-purpose: only Master's mute calls this
+/// today, not a generic icon-button abstraction. Returns whether clicked
+/// this frame — holds no mute state of its own, caller flips its own bool.
+fn speaker_mute_button(ui: &mut egui::Ui, muted: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(SPEAKER_ICON_SIZE, egui::Sense::click());
+    let color = if response.hovered() { ui.visuals().strong_text_color() } else { ui.visuals().text_color() };
+    let stroke = egui::Stroke::new(2.0, color);
+
+    // 24x24 design grid scaled to the allocated (square) rect.
+    let scale = rect.width() / 24.0;
+    let point = |x: f32, y: f32| rect.min + egui::vec2(x, y) * scale;
+
+    // Speaker cone: rectangular body + trapezoid horn, drawn as two separate
+    // convex shapes — `Shape::convex_polygon`'s fill is only correct for
+    // convex input (epaint's own doc), and the combined 6-point outline has
+    // a reflex vertex at the body/horn seam (x=6), so one polygon call would
+    // fill incorrectly there.
+    let body = vec![point(0.0, 9.0), point(6.0, 9.0), point(6.0, 15.0), point(0.0, 15.0)];
+    let horn = vec![point(6.0, 9.0), point(13.0, 2.0), point(13.0, 22.0), point(6.0, 15.0)];
+    ui.painter().add(egui::Shape::convex_polygon(body, color, egui::Stroke::NONE));
+    ui.painter().add(egui::Shape::convex_polygon(horn, color, egui::Stroke::NONE));
+
+    if muted {
+        ui.painter().line_segment([point(15.0, 5.0), point(22.0, 19.0)], stroke);
+    } else {
+        let horn_tip = point(13.0, 12.0);
+        for radius in [4.0_f32, 7.0] {
+            let arc: Vec<egui::Pos2> = (0..=6)
+                .map(|i| {
+                    let angle = -0.6 + (i as f32 / 6.0) * 1.2; // ~ -34deg..+34deg
+                    horn_tip + egui::vec2(angle.cos(), angle.sin()) * radius * scale
+                })
+                .collect();
+            ui.painter().add(egui::Shape::line(arc, stroke));
+        }
+    }
+
+    response.on_hover_text(if muted { "Unmute" } else { "Mute" }).clicked()
+}
+
 /// Reusable device picker — replaces `text_edit_singleline` at every call
 /// site (onboarding, existing-group output, new-group output). Returns true
 /// on selection change; `id_source` must be unique among all comboboxes
@@ -646,7 +775,7 @@ fn routed_sessions(routes: &[(GroupId, Vec<SessionInfo>)], group: GroupId) -> Ve
         .find(|(g, _)| *g == group)
         .map(|(_, sessions)| sessions.clone())
         .unwrap_or_default();
-    sessions.sort_by(|a, b| chip_label(a).cmp(&chip_label(b)));
+    sessions.sort_by_key(chip_label);
     sessions
 }
 
@@ -789,6 +918,41 @@ mod tests {
     #[test]
     fn split_rules_of_blank_text_is_empty() {
         assert!(split_rules("   ").is_empty());
+    }
+
+    #[test]
+    fn column_width_divides_available_space_evenly_within_the_clamp_range() {
+        assert_eq!(column_width(600.0, 3), 200.0);
+    }
+
+    #[test]
+    fn column_width_never_shrinks_below_the_minimum() {
+        assert_eq!(column_width(90.0, 3), MIN_COLUMN_WIDTH);
+    }
+
+    #[test]
+    fn column_width_never_grows_above_the_maximum() {
+        assert_eq!(column_width(1000.0, 1), MAX_COLUMN_WIDTH);
+    }
+
+    #[test]
+    fn column_width_treats_zero_columns_as_one() {
+        assert_eq!(column_width(150.0, 0), column_width(150.0, 1));
+    }
+
+    #[test]
+    fn fader_height_passes_through_within_the_clamp_range() {
+        assert_eq!(fader_height(250.0), 250.0);
+    }
+
+    #[test]
+    fn fader_height_never_shrinks_below_the_minimum() {
+        assert_eq!(fader_height(10.0), MIN_FADER_HEIGHT);
+    }
+
+    #[test]
+    fn fader_height_never_grows_above_the_maximum() {
+        assert_eq!(fader_height(10_000.0), MAX_FADER_HEIGHT);
     }
 
     #[test]

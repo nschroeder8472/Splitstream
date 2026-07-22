@@ -1,5 +1,12 @@
 # Review Log
 
+## 2026-07-22 — responsive-ui-refinement, full implementation
+- **Scope**: 3 files (ui.rs main delta, lifecycle.rs/logging.rs minor fixes), single shell layer
+- **Atoms**: clean-code, test-quality (architecture/DDD/secure-coding skipped — single-file/layer, no domain, no trust boundary)
+- **Result**: 1 critical/warning borderline, 0 warning, 1 suggestion — both fixed same session
+- **Key findings**: `speaker_mute_button`'s cone was one 6-point `convex_polygon` call, but the combined body+horn outline has a reflex vertex at the seam (verified via cross-product sign flip: `-42,+140,+140,-42,+36,+36`) — epaint's fill is convex-only, so the concave shape rendered incorrectly; split into two convex calls (rect body + horn quad). `Screen`'s unused `PartialEq` derive dropped (only `matches!` used, never `==`).
+- **Strengths**: every L4 contract implemented with zero deviation from approved design; 8 new unit tests hit both clamp bounds plus pass-through/zero-column edge cases; `Shape`/`Painter` constructor signatures verified against vendored egui 0.35 source rather than memory; `cargo clippy -p app --tests -- -D warnings` and 39/39 tests clean throughout
+
 ## 2026-07-22 — session-mute-on-capture, full implementation
 - **Scope**: 4 files (ports/mod.rs, ports/mock.rs, routing.rs, win-audio/sessions.rs) — application+infrastructure layers
 - **Atoms**: clean-code, architecture, secure-coding, test-quality (DDD skipped — no domain-folder files touched)
