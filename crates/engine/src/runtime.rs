@@ -52,15 +52,15 @@ impl From<&PortError> for FaultKind {
     }
 }
 
+/// Capture-side faults no longer feed this channel (process-loopback-capture
+/// pivot): a per-pid capture failure is isolated by construction — other
+/// pids in the same group, and every other group, are unaffected — so there
+/// is no "the group faulted" event for the recovery supervisor to react to
+/// (L3 flow E: per-attempt, never a sticky/global degradation). Only
+/// physical output devices (drift-and-recovery's actual scope) still report
+/// through here.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum FaultSource {
-    /// Bus/capture-side faults are already fully surfaced via
-    /// `EngineStats::group_faults` (the `group_faulted` atomics) — this
-    /// variant exists for symmetry with `Output` and reserves the identity
-    /// for a future capture-side recovery path; drift-and-recovery's scope
-    /// is physical output devices only, so nothing consumes it yet.
-    #[allow(dead_code)]
-    Group(GroupId),
     Output(OutputId),
 }
 
@@ -166,11 +166,49 @@ struct RingGauge {
     applied_ratio_bits: AtomicU64,
 }
 
-/// Per-group consumer plus its channel count and the index into the output
-/// arrays (`RunningGraph::output_ids`, `ring_fill`, ...) it feeds — precomputed
-/// once at build time so the mixer thread never has to look it up per tick.
-type GroupConsumers = Vec<(GroupId, rtrb::Consumer<f32>, usize, usize)>;
+/// One group's mixer-thread-local input state: zero or more per-pid capture
+/// rings summed together each tick (process-loopback-capture pivot —
+/// replaces the old one-consumer-per-group shape; a group with zero pids
+/// behaves exactly like the old "starved" case, silence). `channels`/
+/// `output_index` are precomputed once at build time so the mixer thread
+/// never has to look them up per tick.
+struct GroupSlot {
+    group_id: GroupId,
+    pids: Vec<(u32, rtrb::Consumer<f32>)>,
+    channels: usize,
+    output_index: usize,
+}
+
+type GroupConsumers = Vec<GroupSlot>;
 type OutputProducers = Vec<(OutputId, rtrb::Producer<f32>, usize)>;
+
+/// A live per-pid capture thread, tracked so `CaptureControl` can stop and
+/// join exactly one pid without disturbing any other pid or group (L3 flow
+/// B/C — diffed, isolated add/remove).
+struct PidCapture {
+    stop: Arc<AtomicBool>,
+    thread: JoinHandle<()>,
+}
+
+/// Wire format from `CaptureControl::apply_capture_sources` (any thread —
+/// typically `engine::routing`'s coordinator thread) into the mixer thread's
+/// own local `GroupSlot` list. Carries the `rtrb::Consumer` itself (not
+/// `Copy`/`Clone`) — same "move a pre-built off-RT value through a channel"
+/// idiom as `MixerCommand::SwapChain`'s boxed `DspChain`, just via a
+/// dedicated channel instead of the `MixerCommand` queue, since this mutates
+/// `mixer_loop`'s own local capture bookkeeping, not anything `Mixer` itself
+/// (`audio_core`) knows about.
+enum CaptureMsg {
+    Add {
+        group: GroupId,
+        pid: u32,
+        consumer: rtrb::Consumer<f32>,
+    },
+    Remove {
+        group: GroupId,
+        pid: u32,
+    },
+}
 
 struct Persistent {
     commands: ArrayQueue<Envelope>,
@@ -197,13 +235,24 @@ struct Persistent {
 
 struct RunningGraph {
     stop: Arc<AtomicBool>,
-    capture_threads: Vec<JoinHandle<()>>,
+    /// Live per-pid capture threads, keyed by group then pid —
+    /// `CaptureControl::apply_capture_sources` adds/removes entries directly
+    /// (through the same `Arc<Mutex<Option<RunningGraph>>>` every other
+    /// structural accessor locks), independent of `apply_rebuild`'s full
+    /// stop/respawn (a rebuild only touches render/output-side ports; capture
+    /// sources are re-established by the routing coordinator's next
+    /// reconcile against the fresh topology).
+    capture_pids: HashMap<GroupId, HashMap<u32, PidCapture>>,
+    /// Sender half the mixer thread currently reading from — `CaptureControl`
+    /// reads this out of the locked `RunningGraph` to hand the mixer thread a
+    /// newly-opened pid's consumer (or tell it to drop one), since the
+    /// mixer's own `GroupSlot` list is local to its thread, not shared state.
+    capture_tx: Sender<CaptureMsg>,
     mixer_thread: Option<JoinHandle<()>>,
     render_threads: Vec<JoinHandle<()>>,
     xruns: Arc<AtomicU64>,
     ring_fill: Arc<Vec<RingGauge>>,
     output_ids: Vec<OutputId>,
-    group_faulted: Arc<Vec<AtomicBool>>,
     group_ids: Vec<GroupId>,
     /// Which output each group currently routes through — the supervisor
     /// uses this to map a faulted `OutputId` back to affected groups.
@@ -346,13 +395,12 @@ impl EngineHandle {
                         )
                     })
                     .collect(),
-                group_faults: rg
-                    .group_ids
-                    .iter()
-                    .zip(rg.group_faulted.iter())
-                    .filter(|(_, faulted)| faulted.load(Ordering::Relaxed))
-                    .map(|(id, _)| *id)
-                    .collect(),
+                // Always empty (process-loopback-capture pivot): a per-pid
+                // capture failure is isolated to that one pid, never "the
+                // whole group" — there is no group-level fault concept left
+                // to report. Field kept for API stability (app-shell reads
+                // only its `.len()`).
+                group_faults: Vec::new(),
                 limiter_engaged: rg
                     .output_ids
                     .iter()
@@ -451,6 +499,18 @@ impl EngineHandle {
         Epoch(self.persistent.epoch.load(Ordering::Relaxed))
     }
 
+    /// Cloneable handle for driving per-pid capture-source changes from any
+    /// thread — `engine::routing`'s coordinator thread needs this
+    /// independently from whatever thread owns this `EngineHandle`
+    /// (process-loopback-capture L4). Same established idiom as
+    /// `RoutingHandle::reader()`.
+    pub fn capture_control(&self) -> CaptureControl {
+        CaptureControl {
+            running: Arc::clone(&self.running),
+            sys: Arc::clone(&self.sys),
+        }
+    }
+
     /// Single-consume handoff (drift-and-recovery revision): the app-side
     /// event pump takes the receiver once and fans out to its own consumers
     /// (tray, UI). `Receiver` is single-consumer, so a second call can't
@@ -482,14 +542,169 @@ impl EngineHandle {
 
 fn stop_running_graph(mut rg: RunningGraph) {
     rg.stop.store(true, Ordering::Relaxed);
-    for t in rg.capture_threads.drain(..) {
-        let _ = t.join();
+    // Per-pid capture threads use their own stop flags (not `rg.stop`) so
+    // `CaptureControl` can stop one independently mid-run — a full teardown
+    // stops every one of them here.
+    for (_, pids) in rg.capture_pids.drain() {
+        for (_, pc) in pids {
+            pc.stop.store(true, Ordering::Relaxed);
+            let _ = pc.thread.join();
+        }
     }
     if let Some(t) = rg.mixer_thread.take() {
         let _ = t.join();
     }
     for t in rg.render_threads.drain(..) {
         let _ = t.join();
+    }
+}
+
+/// Drives per-pid capture-source changes into a live `RunningGraph`
+/// (process-loopback-capture L4) — a cloneable handle so `engine::routing`'s
+/// coordinator thread can call this concurrently with whatever thread owns
+/// the `EngineHandle` itself, same pattern as `RoutingHandle`/`RoutingReader`.
+#[derive(Clone)]
+pub struct CaptureControl {
+    running: Arc<Mutex<Option<RunningGraph>>>,
+    sys: Arc<dyn AudioSystem>,
+}
+
+impl CaptureControl {
+    /// Diffs `pids` against the currently-running set for `group`: newly-
+    /// present pids get a capture thread opened and wired into the mixer's
+    /// `GroupSlot`; no-longer-present pids have theirs stopped and removed;
+    /// pids present in both sets are left completely untouched — no full
+    /// teardown/rebuild of the group (process-loopback-capture L3 flow B/C,
+    /// binding behavior, not an implementation detail). A pid that fails to
+    /// open (permission denied, protected process, ...) is skipped and
+    /// returned in the result — this call's *other* pids still apply (L3
+    /// flow E: per-attempt, isolated, never a global degraded posture).
+    /// Returns the pids that failed to open this call (empty = every pid
+    /// applied); `engine::routing` uses this to surface a per-attempt
+    /// `EngineEvent::RoutingDegraded` notice, not a sticky flag — deviates
+    /// from the blueprint's literal `Result<(), EngineError>` signature
+    /// (logged in the context doc) since the degradation signal has to come
+    /// from somewhere and `routing.rs`, not `runtime.rs`, owns it.
+    ///
+    /// Three passes, only the middle one unlocked (review finding,
+    /// 2026-07-21): `self.sys.open_process_capture` is a blocking WASAPI/COM
+    /// activation call — doing it while holding `self.running`'s lock would
+    /// stall every other engine control call (`stats`/`apply_params`/
+    /// `rebuild`, all sharing the same lock) for however long activation
+    /// takes, on every thread that calls them. Stop/remove is bounded
+    /// (~poll_interval, same tolerance already accepted for the mixer/render
+    /// thread joins in `stop_running_graph`) so it stays under the lock.
+    /// Racing this against a concurrent rebuild/`apply_capture_sources` call
+    /// is an accepted eventually-consistent race, same tolerance already
+    /// documented for `apply_dsp_chains`/`apply_spatial`.
+    pub fn apply_capture_sources(&self, group: GroupId, pids: Vec<u32>) -> Result<Vec<u32>, EngineError> {
+        let desired: HashSet<u32> = pids.into_iter().collect();
+
+        let to_open: Vec<u32> = {
+            let mut guard = self.running.lock().unwrap();
+            let Some(rg) = guard.as_mut() else {
+                return Err(EngineError::AlreadyStopped);
+            };
+
+            // Reap any pid whose thread already exited on its own — a
+            // runtime read failure, not an open failure (review finding,
+            // 2026-07-21): without this, a dead thread's pid stays "current"
+            // forever and is never retried, even though matched sessions are
+            // meant to be retried independently every reconcile (L3 flow E).
+            if let Some(group_map) = rg.capture_pids.get_mut(&group) {
+                let dead: Vec<u32> = group_map
+                    .iter()
+                    .filter(|(_, pc)| pc.thread.is_finished())
+                    .map(|(pid, _)| *pid)
+                    .collect();
+                for pid in dead {
+                    if let Some(pc) = group_map.remove(&pid) {
+                        let _ = pc.thread.join();
+                    }
+                    let _ = rg.capture_tx.send(CaptureMsg::Remove { group, pid });
+                }
+            }
+
+            let current: HashSet<u32> = rg
+                .capture_pids
+                .get(&group)
+                .map(|m| m.keys().copied().collect())
+                .unwrap_or_default();
+
+            for pid in current.difference(&desired).copied().collect::<Vec<_>>() {
+                if let Some(pc) = rg.capture_pids.get_mut(&group).and_then(|m| m.remove(&pid)) {
+                    pc.stop.store(true, Ordering::Relaxed);
+                    let _ = pc.thread.join();
+                }
+                let _ = rg.capture_tx.send(CaptureMsg::Remove { group, pid });
+            }
+
+            desired.difference(&current).copied().collect()
+        };
+
+        // Unlocked: open every new pid. Best-effort per pid (L3 flow E) — a
+        // failure here excludes just this pid, the others still apply.
+        let mut failed = Vec::new();
+        let mut opened = Vec::new();
+        for pid in to_open {
+            let Ok(port) = self.sys.open_process_capture(pid, false) else {
+                failed.push(pid);
+                continue;
+            };
+            let format = port.format();
+            let device_period_s = port.poll_interval().as_secs_f64() * 2.0; // polled at ~period/2
+            let capacity = ring_capacity_samples(device_period_s, format.sample_rate, format.channels);
+            let (producer, consumer) = RingBuffer::<f32>::new(capacity);
+            opened.push((pid, port, producer, consumer));
+        }
+
+        {
+            let mut guard = self.running.lock().unwrap();
+            let Some(rg) = guard.as_mut() else {
+                return Err(EngineError::AlreadyStopped);
+            };
+            for (pid, port, producer, consumer) in opened {
+                let stop = Arc::new(AtomicBool::new(false));
+                let thread = {
+                    let stop = Arc::clone(&stop);
+                    let sys = Arc::clone(&self.sys);
+                    thread::spawn(move || pid_capture_loop(port, producer, &stop, sys.as_ref()))
+                };
+                rg.capture_pids.entry(group).or_default().insert(pid, PidCapture { stop, thread });
+                let _ = rg.capture_tx.send(CaptureMsg::Add { group, pid, consumer });
+            }
+        }
+
+        Ok(failed)
+    }
+}
+
+/// One pid's capture loop — same shape as the old per-bus `capture_loop`,
+/// minus fault reporting: a per-pid read failure just ends this one thread
+/// (process-loopback-capture L3 flow E treats it as this pid quietly
+/// dropping out, not a "fault" the recovery supervisor needs to react to).
+fn pid_capture_loop(
+    mut port: Box<dyn CapturePort>,
+    mut producer: rtrb::Producer<f32>,
+    stop: &AtomicBool,
+    sys: &dyn AudioSystem,
+) {
+    let _rt = sys.promote_rt_thread();
+    let poll_interval = port.poll_interval();
+    let channels = port.format().channels.max(1) as usize;
+    let mut buf = vec![0.0f32; channels * 256];
+    let sleeper = spin_sleep::SpinSleeper::default();
+
+    while !stop.load(Ordering::Relaxed) {
+        match port.read(&mut buf) {
+            Ok(n) => {
+                for &sample in &buf[..n] {
+                    let _ = producer.push(sample); // ring full: drop, best-effort (notes §1)
+                }
+            }
+            Err(_) => return, // this pid's stream is done — other pids/groups keep running
+        }
+        sleeper.sleep(poll_interval);
     }
 }
 
@@ -566,72 +781,64 @@ fn apply_rebuild(
     Ok(())
 }
 
-/// Resolved config + every port opened, but nothing spawned yet.
+/// Resolved config + every port opened, but nothing spawned yet. No more
+/// `captures` (process-loopback-capture pivot): capture sources are pids,
+/// matched live by `engine::routing` and wired in dynamically via
+/// `CaptureControl` — a graph build never opens any capture port itself.
 struct OpenedGraph {
     plan: GraphPlan,
-    captures: Vec<(GroupId, Box<dyn CapturePort>)>,
     renders: Vec<(OutputId, Box<dyn RenderPort>)>,
 }
 
-/// Opens every port synchronously, before anything is spawned: fail fast,
-/// nothing to unwind if a configured device doesn't open.
+/// Every process capture stream's fixed format (`graph::resolve`'s
+/// `capture_format` param — every group's `input_format`, see that fn's
+/// doc). **Not** queried from the system: confirmed on real hardware
+/// (2026-07-21) that a process-loopback-activated `IAudioClient` doesn't
+/// implement `GetMixFormat` at all (`E_NOTIMPL`) — the real `win-audio`
+/// implementation *dictates* this exact format to every process capture
+/// stream at `Initialize` time (`process_capture.rs`'s `fixed_capture_wfx`),
+/// rather than negotiating one, so every stream reports the same value
+/// regardless of the system's actual default device. `MockSystem` mirrors
+/// the same constant independently for the same reason.
+const PROCESS_CAPTURE_FORMAT: Format = Format {
+    sample_rate: 48_000,
+    channels: 2,
+    layout: ChannelLayout::STEREO,
+};
+
+/// Opens every render port synchronously, before anything is spawned: fail
+/// fast, nothing to unwind if a configured device doesn't open.
 fn open_graph(
     snapshot: &ConfigSnapshot,
     sys: &Arc<dyn AudioSystem>,
     parked: &HashSet<String>,
 ) -> Result<OpenedGraph, EngineError> {
     let endpoints = sys.enumerate()?;
-    let plan = graph::resolve(snapshot, &endpoints, parked)?;
+    let plan = graph::resolve(snapshot, &endpoints, parked, PROCESS_CAPTURE_FORMAT)?;
 
-    let mut captures = Vec::with_capacity(plan.group_endpoints.len());
-    for (group_id, endpoint_id) in &plan.group_endpoints {
-        captures.push((*group_id, sys.open_capture(endpoint_id)?));
-    }
     let mut renders = Vec::with_capacity(plan.output_endpoints.len());
     for (output_id, endpoint_id) in &plan.output_endpoints {
         renders.push((*output_id, sys.open_render(endpoint_id)?));
     }
 
-    Ok(OpenedGraph {
-        plan,
-        captures,
-        renders,
-    })
+    Ok(OpenedGraph { plan, renders })
 }
 
-fn spawn_capture_threads(
-    captures: Vec<(GroupId, Box<dyn CapturePort>)>,
-    group_output_index: &HashMap<GroupId, usize>,
-    stop: &Arc<AtomicBool>,
-    group_faulted: &Arc<Vec<AtomicBool>>,
-    faults: &Sender<Fault>,
-    sys: &Arc<dyn AudioSystem>,
-) -> (Vec<JoinHandle<()>>, GroupConsumers) {
-    let mut threads = Vec::with_capacity(captures.len());
-    let mut consumers = Vec::with_capacity(captures.len());
-    for (index, (group_id, port)) in captures.into_iter().enumerate() {
-        let format = port.format();
-        let device_period_s = port.poll_interval().as_secs_f64() * 2.0; // polled at ~period/2
-        let capacity = ring_capacity_samples(device_period_s, format.sample_rate, format.channels);
-        let (producer, consumer) = RingBuffer::<f32>::new(capacity);
-        let output_index = group_output_index[&group_id];
-        consumers.push((group_id, consumer, format.channels as usize, output_index));
-
-        let stop = Arc::clone(stop);
-        let faulted = Arc::clone(group_faulted);
-        let faults = faults.clone();
-        let sys = Arc::clone(sys);
-        threads.push(thread::spawn(move || {
-            let ctx = CaptureFaultCtx {
-                faulted: &faulted,
-                group_index: index,
-                group_id,
-                faults: &faults,
-            };
-            capture_loop(port, producer, &stop, &ctx, sys.as_ref());
-        }));
-    }
-    (threads, consumers)
+/// One empty `GroupSlot` per group in `plan` — no pids captured yet at
+/// build/rebuild time; `CaptureControl::apply_capture_sources` populates
+/// them once `engine::routing` matches live sessions against the fresh
+/// topology.
+fn build_group_slots(plan: &GraphPlan, group_output_index: &HashMap<GroupId, usize>) -> GroupConsumers {
+    plan.topology
+        .groups
+        .iter()
+        .map(|g| GroupSlot {
+            group_id: g.id,
+            pids: Vec::new(),
+            channels: g.input_format.channels as usize,
+            output_index: group_output_index[&g.id],
+        })
+        .collect()
 }
 
 fn spawn_render_threads(
@@ -674,7 +881,7 @@ fn build_running_graph(
 ) -> Result<RunningGraph, EngineError> {
     let opened = open_graph(snapshot, sys, parked)?;
 
-    let tick_period = compute_tick_period(&opened.captures, &opened.renders);
+    let tick_period = compute_tick_period(&opened.renders);
     let max_block_frames = compute_max_block_frames(&opened.plan, tick_period);
     let mixer = Mixer::new(&opened.plan.topology, max_block_frames)?;
     log_channel_conversions(&opened.plan.topology, max_block_frames);
@@ -683,11 +890,6 @@ fn build_running_graph(
     let xruns = Arc::new(AtomicU64::new(0));
     let group_ids: Vec<GroupId> = opened.plan.topology.groups.iter().map(|g| g.id).collect();
     let output_ids: Vec<OutputId> = opened.plan.topology.outputs.iter().map(|o| o.id).collect();
-    let group_faulted = Arc::new(
-        (0..group_ids.len())
-            .map(|_| AtomicBool::new(false))
-            .collect::<Vec<_>>(),
-    );
     let ring_fill = Arc::new(
         output_ids
             .iter()
@@ -746,17 +948,11 @@ fn build_running_graph(
     );
 
     let (fault_tx, fault_rx) = mpsc::channel();
-    let (capture_threads, group_consumers) = spawn_capture_threads(
-        opened.captures,
-        &group_output_index,
-        &stop,
-        &group_faulted,
-        &fault_tx,
-        sys,
-    );
+    let group_consumers = build_group_slots(&opened.plan, &group_output_index);
     let (render_threads, output_producers) =
         spawn_render_threads(opened.renders, &stop, &xruns, &fault_tx, sys);
 
+    let (capture_tx, capture_rx) = mpsc::channel();
     let mixer_args = MixerThreadArgs {
         max_block_frames,
         persistent: Arc::clone(persistent),
@@ -767,6 +963,7 @@ fn build_running_graph(
         sys: Arc::clone(sys),
         duck_depth_db: Arc::clone(&duck_depth_db),
         limiter_engaged: Arc::clone(&limiter_engaged),
+        capture_rx,
     };
     let mixer_thread = thread::spawn(move || {
         mixer_loop(mixer, group_consumers, output_producers, mixer_args);
@@ -774,13 +971,13 @@ fn build_running_graph(
 
     Ok(RunningGraph {
         stop,
-        capture_threads,
+        capture_pids: HashMap::new(),
+        capture_tx,
         mixer_thread: Some(mixer_thread),
         render_threads,
         xruns,
         ring_fill,
         output_ids,
-        group_faulted,
         group_ids,
         group_outputs,
         output_endpoints,
@@ -825,58 +1022,10 @@ fn log_channel_conversions(topology: &Topology, max_block_frames: usize) {
     }
 }
 
-/// Groups the identity + fault-reporting parameters `capture_loop` needs
-/// besides its port/producer/stop — pulled into a context struct once the
-/// plain parameter list crossed clippy's `too_many_arguments` threshold
-/// (operational learnings: extract at that point, not later).
-struct CaptureFaultCtx<'a> {
-    faulted: &'a [AtomicBool],
-    group_index: usize,
-    group_id: GroupId,
-    faults: &'a Sender<Fault>,
-}
-
-fn capture_loop(
-    mut port: Box<dyn CapturePort>,
-    mut producer: rtrb::Producer<f32>,
-    stop: &AtomicBool,
-    ctx: &CaptureFaultCtx,
-    sys: &dyn AudioSystem,
-) {
-    let _rt = sys.promote_rt_thread();
-    let poll_interval = port.poll_interval();
-    let channels = port.format().channels.max(1) as usize;
-    let mut buf = vec![0.0f32; channels * 256];
-    let sleeper = spin_sleep::SpinSleeper::default();
-
-    while !stop.load(Ordering::Relaxed) {
-        match port.read(&mut buf) {
-            Ok(n) => {
-                for &sample in &buf[..n] {
-                    let _ = producer.push(sample); // ring full: drop, best-effort (notes §1)
-                }
-            }
-            // Mark faulted (stats surface) and exit; other groups/outputs keep
-            // running on their own thread+ring. The recovery supervisor
-            // consumes `faults` to rebuild/re-route (drift-and-recovery).
-            Err(e) => {
-                ctx.faulted[ctx.group_index].store(true, Ordering::Relaxed);
-                let _ = ctx.faults.send(Fault {
-                    source: FaultSource::Group(ctx.group_id),
-                    kind: FaultKind::from(&e),
-                });
-                return;
-            }
-        }
-        sleeper.sleep(poll_interval);
-    }
-}
-
 /// Groups the identity + fault-reporting parameters `render_loop` needs
-/// besides its port/consumer/stop — same rationale as `CaptureFaultCtx`
-/// (operational learnings: extract at that point, not later; a param-count
-/// refactor applied to one of two mirrored functions should be applied to
-/// both).
+/// besides its port/consumer/stop (operational learnings: extract at that
+/// point, not later; a param-count refactor applied to one of two mirrored
+/// functions should be applied to both).
 struct RenderFaultCtx<'a> {
     xruns: &'a AtomicU64,
     output_id: OutputId,
@@ -940,6 +1089,9 @@ struct MixerThreadArgs {
     sys: Arc<dyn AudioSystem>,
     duck_depth_db: Arc<Vec<AtomicU32>>,
     limiter_engaged: Arc<Vec<AtomicU64>>,
+    /// `CaptureControl::apply_capture_sources` sends per-pid add/remove here —
+    /// drained once per tick, same as `persistent.commands`.
+    capture_rx: Receiver<CaptureMsg>,
 }
 
 fn mixer_loop(
@@ -953,7 +1105,7 @@ fn mixer_loop(
 
     let mut group_scratch: Vec<Vec<f32>> = group_consumers
         .iter()
-        .map(|(_, _, channels, _)| vec![0.0f32; args.max_block_frames * channels])
+        .map(|slot| vec![0.0f32; args.max_block_frames * slot.channels])
         .collect();
     let mut output_scratch: Vec<Vec<f32>> = output_producers
         .iter()
@@ -965,12 +1117,13 @@ fn mixer_loop(
     // Built once at thread start (not per-tick — plain lookups only below):
     // parallel id lists matching `args.duck_depth_db`/`args.limiter_engaged`'s
     // index order, which was built from the same topology.
-    let group_ids: Vec<GroupId> = group_consumers.iter().map(|(id, ..)| *id).collect();
+    let group_ids: Vec<GroupId> = group_consumers.iter().map(|slot| slot.group_id).collect();
     let output_ids: Vec<OutputId> = output_producers.iter().map(|(id, ..)| *id).collect();
 
     while !args.stop.load(Ordering::Relaxed) {
         let tick_start = Instant::now();
 
+        drain_capture_commands(&args.capture_rx, &mut group_consumers);
         drain_commands(&args.persistent, &mut mixer, &args.ring_fill, &args.output_index_of);
         pull_group_inputs(
             &mut group_consumers,
@@ -1055,36 +1208,64 @@ fn drain_commands(
     }
 }
 
+/// Applies pending `CaptureControl::apply_capture_sources` add/remove
+/// requests to the mixer thread's own local `GroupSlot` list — the only
+/// place `GroupSlot.pids` is ever mutated, so no lock is needed even though
+/// the requests originate on another thread (process-loopback-capture L4).
+fn drain_capture_commands(capture_rx: &Receiver<CaptureMsg>, group_consumers: &mut [GroupSlot]) {
+    while let Ok(msg) = capture_rx.try_recv() {
+        match msg {
+            CaptureMsg::Add { group, pid, consumer } => {
+                if let Some(slot) = group_consumers.iter_mut().find(|s| s.group_id == group) {
+                    slot.pids.push((pid, consumer));
+                }
+            }
+            CaptureMsg::Remove { group, pid } => {
+                if let Some(slot) = group_consumers.iter_mut().find(|s| s.group_id == group) {
+                    slot.pids.retain(|(p, _)| *p != pid);
+                }
+            }
+        }
+    }
+}
+
+/// Sums every pid currently captured into a group's scratch buffer, one
+/// frame at a time — a group with zero pids (nothing matched yet, or every
+/// pid starved this tick) behaves exactly like the old single-consumer
+/// "starved" case: silence, never a stall (the mixer tick is timer-paced).
+/// `real_this_tick` for a group's output is set if *any* pid fully filled
+/// the block this tick (even WASAPI-silent audio still delivers
+/// SILENT-flagged packets — notes §6).
 fn pull_group_inputs(
-    group_consumers: &mut [(GroupId, rtrb::Consumer<f32>, usize, usize)],
+    group_consumers: &mut [GroupSlot],
     group_scratch: &mut [Vec<f32>],
     mixer: &mut Mixer,
     real_this_tick: &mut [bool],
 ) {
     real_this_tick.fill(false);
-    for (i, (group_id, consumer, _, output_index)) in group_consumers.iter_mut().enumerate() {
+    for (i, slot) in group_consumers.iter_mut().enumerate() {
         let scratch = &mut group_scratch[i];
-        let mut filled = 0;
-        while filled < scratch.len() {
-            match consumer.pop() {
-                Ok(sample) => {
-                    scratch[filled] = sample;
-                    filled += 1;
+        scratch.fill(0.0);
+        let mut any_full = false;
+        for (_, consumer) in slot.pids.iter_mut() {
+            let mut filled = 0;
+            while filled < scratch.len() {
+                match consumer.pop() {
+                    Ok(sample) => {
+                        scratch[filled] += sample;
+                        filled += 1;
+                    }
+                    Err(_) => break,
                 }
-                Err(_) => break,
+            }
+            if filled == scratch.len() {
+                any_full = true;
             }
         }
-        if filled < scratch.len() {
-            // Starved group (silent bus produces no loopback packets) — synthesize
-            // silence rather than stalling; this is why the mixer tick is timer-paced.
-            scratch[filled..].fill(0.0);
-        } else {
-            // Fully filled: the source app is actually producing packets (even
-            // WASAPI-silent audio still delivers SILENT-flagged packets) — this
-            // output is "active" for the drift loop's idle guard (notes §6).
-            real_this_tick[*output_index] = true;
+        if any_full {
+            real_this_tick[slot.output_index] = true;
         }
-        mixer.push_group(*group_id, scratch);
+        mixer.push_group(slot.group_id, scratch);
     }
 }
 
@@ -1143,21 +1324,14 @@ fn ring_capacity_samples(period_s: f64, sample_rate: u32, channels: u16) -> usiz
 }
 
 /// notes §5: tick period is half the minimum device period across the graph.
-/// Capture ports expose only their poll interval (~period/2, so device period
-/// is ~2x that); render ports expose `period_frames` directly.
-fn compute_tick_period(
-    captures: &[(GroupId, Box<dyn CapturePort>)],
-    renders: &[(OutputId, Box<dyn RenderPort>)],
-) -> Duration {
-    let capture_periods = captures
+/// No more capture ports here (process-loopback-capture pivot — capture
+/// sources are opened dynamically per pid, long after the tick period is
+/// fixed at build time): render ports alone set the floor, same fallback for
+/// an empty topology as before.
+fn compute_tick_period(renders: &[(OutputId, Box<dyn RenderPort>)]) -> Duration {
+    let min_period_s = renders
         .iter()
-        .map(|(_, c)| c.poll_interval().as_secs_f64() * 2.0);
-    let render_periods = renders
-        .iter()
-        .map(|(_, r)| r.period_frames() as f64 / r.format().sample_rate.max(1) as f64);
-
-    let min_period_s = capture_periods
-        .chain(render_periods)
+        .map(|(_, r)| r.period_frames() as f64 / r.format().sample_rate.max(1) as f64)
         .fold(f64::INFINITY, f64::min);
 
     let period_s = if min_period_s.is_finite() {
@@ -1472,7 +1646,7 @@ fn handle_device_added(
 mod tests {
     use super::*;
     use crate::ports::mock::MockSystem;
-    use crate::ports::{Endpoint, EndpointId, EndpointKind};
+    use crate::ports::{Endpoint, EndpointId};
     use audio_core::{ChannelLayout, Format, Gain};
     use std::thread::sleep;
 
@@ -1484,21 +1658,20 @@ mod tests {
         }
     }
 
+    fn mono(rate: u32) -> Format {
+        Format {
+            sample_rate: rate,
+            channels: 1,
+            layout: ChannelLayout::MONO,
+        }
+    }
+
     fn mock_endpoints() -> Vec<Endpoint> {
-        vec![
-            Endpoint {
-                id: EndpointId("bus-1".into()),
-                name: "Game".into(),
-                kind: EndpointKind::Bus,
-                format: stereo(48_000),
-            },
-            Endpoint {
-                id: EndpointId("out-1".into()),
-                name: "Speakers".into(),
-                kind: EndpointKind::Physical,
-                format: stereo(48_000),
-            },
-        ]
+        vec![Endpoint {
+            id: EndpointId("out-1".into()),
+            name: "Speakers".into(),
+            format: stereo(48_000),
+        }]
     }
 
     fn two_output_endpoints() -> Vec<Endpoint> {
@@ -1506,7 +1679,6 @@ mod tests {
         eps.push(Endpoint {
             id: EndpointId("out-2".into()),
             name: "Headphones".into(),
-            kind: EndpointKind::Physical,
             format: stereo(48_000),
         });
         eps
@@ -1520,7 +1692,6 @@ mod tests {
             app: graph::AppConfig::default(),
             groups: vec![graph::GroupConfig {
                 name: "Game".into(),
-                bus_endpoint: "Game".into(),
                 output_device: "Speakers".into(),
                 gain: Gain::UNITY,
                 follow_master: true,
@@ -1567,7 +1738,7 @@ mod tests {
         let handle = start(&snapshot(), sys).unwrap();
 
         let mut broken = snapshot();
-        broken.groups[0].bus_endpoint = "does-not-exist".into();
+        broken.groups[0].output_device = "does-not-exist".into();
         assert!(matches!(
             handle.rebuild(&broken),
             Err(EngineError::Resolve(_))
@@ -1658,7 +1829,7 @@ mod tests {
         let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(mock_endpoints()));
         let handle = start(&snapshot(), sys).unwrap();
         let mut broken = snapshot();
-        broken.groups[0].bus_endpoint = "does-not-exist".into();
+        broken.groups[0].output_device = "does-not-exist".into();
         assert!(handle.rebuild(&broken).is_err());
 
         assert!(matches!(
@@ -1684,7 +1855,7 @@ mod tests {
         let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(mock_endpoints()));
         let handle = start(&snapshot(), sys).unwrap();
         let mut broken = snapshot();
-        broken.groups[0].bus_endpoint = "does-not-exist".into();
+        broken.groups[0].output_device = "does-not-exist".into();
         assert!(handle.rebuild(&broken).is_err());
 
         assert!(matches!(
@@ -1755,25 +1926,16 @@ mod tests {
     }
 
     #[test]
-    fn capture_loop_reports_device_invalidated_fault_and_marks_faulted() {
+    fn pid_capture_loop_exits_quietly_on_a_read_failure() {
+        // No fault reporting for per-pid captures (process-loopback-capture
+        // pivot): a read error just ends this one thread — asserting on the
+        // absence of a panic/hang is the point, there's nothing else to
+        // observe from outside the loop.
         let stop = AtomicBool::new(false);
-        let faulted = [AtomicBool::new(false)];
-        let (fault_tx, fault_rx) = mpsc::channel();
         let sys = MockSystem::new(vec![]);
         let (producer, _consumer) = RingBuffer::<f32>::new(4);
-        let ctx = CaptureFaultCtx {
-            faulted: &faulted,
-            group_index: 0,
-            group_id: GroupId(0),
-            faults: &fault_tx,
-        };
 
-        capture_loop(Box::new(FailingCapture), producer, &stop, &ctx, &sys);
-
-        assert!(faulted[0].load(Ordering::Relaxed));
-        let fault = fault_rx.recv().unwrap();
-        assert!(matches!(fault.source, FaultSource::Group(GroupId(0))));
-        assert!(matches!(fault.kind, FaultKind::DeviceInvalidated));
+        pid_capture_loop(Box::new(FailingCapture), producer, &stop, &sys);
     }
 
     #[test]
@@ -1940,7 +2102,6 @@ mod tests {
         let speakers = Endpoint {
             id: EndpointId("out-1".into()),
             name: "Speakers".into(),
-            kind: EndpointKind::Physical,
             format: stereo(48_000),
         };
         sys.add_endpoint(speakers.clone());
@@ -1980,7 +2141,6 @@ mod tests {
         let mic = Endpoint {
             id: EndpointId("mic-1".into()),
             name: "USB Mic".into(),
-            kind: EndpointKind::Physical,
             format: stereo(48_000),
         };
         sys.emit_device_event(DeviceEvent::Added(mic.clone()));
@@ -2012,7 +2172,6 @@ mod tests {
         let mic = Endpoint {
             id: EndpointId("mic-1".into()),
             name: "USB Mic".into(),
-            kind: EndpointKind::Physical,
             format: stereo(48_000),
         };
         sys.emit_device_event(DeviceEvent::Added(mic.clone()));
@@ -2052,6 +2211,174 @@ mod tests {
 
         handle.apply_params(vec![]).unwrap();
         assert_eq!(handle.stats().ring_fill.len(), 1);
+        handle.shutdown().unwrap();
+    }
+
+    fn slot(group_id: GroupId, channels: usize, output_index: usize) -> GroupSlot {
+        GroupSlot {
+            group_id,
+            pids: Vec::new(),
+            channels,
+            output_index,
+        }
+    }
+
+    #[test]
+    fn pull_group_inputs_sums_two_pids_captured_into_the_same_group() {
+        let (mut p1, c1) = RingBuffer::<f32>::new(16);
+        let (mut p2, c2) = RingBuffer::<f32>::new(16);
+        p1.push(0.2).unwrap();
+        p1.push(0.3).unwrap();
+        p2.push(0.5).unwrap();
+        p2.push(-0.1).unwrap();
+
+        let mut consumers = vec![slot(GroupId(0), 1, 0)];
+        consumers[0].pids.push((100, c1));
+        consumers[0].pids.push((200, c2));
+        let mut scratch = vec![vec![0.0f32; 2]];
+        let mut real_this_tick = vec![false];
+
+        // A real `Mixer` isn't needed to observe `push_group`'s input —
+        // exercised for real via `apply_capture_sources_wires_pids_into_the_running_mixer`
+        // below; this test isolates the pure summing arithmetic in
+        // `pull_group_inputs` itself with a minimal real `Mixer`.
+        let topology = Topology {
+            master: audio_core::Gain::UNITY,
+            groups: vec![audio_core::GroupSpec {
+                id: GroupId(0),
+                gain: audio_core::Gain::UNITY,
+                follow_master: false,
+                output: OutputId(0),
+                input_format: mono(48_000),
+                dsp: Vec::new(),
+                duck: None,
+                spatial: false,
+            }],
+            outputs: vec![audio_core::OutputSpec { id: OutputId(0), format: mono(48_000) }],
+        };
+        let mut mixer = Mixer::new(&topology, 8).unwrap();
+
+        pull_group_inputs(&mut consumers, &mut scratch, &mut mixer, &mut real_this_tick);
+
+        assert!(real_this_tick[0], "both pids fully filled this tick");
+        // The two pids' contributions are summed sample-by-sample before
+        // reaching the mixer: 0.2+0.5, 0.3+(-0.1).
+        assert!((scratch[0][0] - 0.7).abs() < 1e-6, "got {}", scratch[0][0]);
+        assert!((scratch[0][1] - 0.2).abs() < 1e-6, "got {}", scratch[0][1]);
+    }
+
+    #[test]
+    fn pull_group_inputs_on_a_group_with_zero_pids_produces_silence() {
+        let mut consumers = vec![slot(GroupId(0), 1, 0)];
+        let mut scratch = vec![vec![1.0f32; 4]]; // pre-filled with garbage to prove it gets zeroed
+        let mut real_this_tick = vec![true];
+        let topology = Topology {
+            master: audio_core::Gain::UNITY,
+            groups: vec![audio_core::GroupSpec {
+                id: GroupId(0),
+                gain: audio_core::Gain::UNITY,
+                follow_master: false,
+                output: OutputId(0),
+                input_format: mono(48_000),
+                dsp: Vec::new(),
+                duck: None,
+                spatial: false,
+            }],
+            outputs: vec![audio_core::OutputSpec { id: OutputId(0), format: mono(48_000) }],
+        };
+        let mut mixer = Mixer::new(&topology, 8).unwrap();
+
+        pull_group_inputs(&mut consumers, &mut scratch, &mut mixer, &mut real_this_tick);
+
+        assert!(!real_this_tick[0], "no pids -> not active");
+        assert_eq!(scratch[0], vec![0.0; 4]);
+    }
+
+    #[test]
+    fn drain_capture_commands_adds_and_removes_pid_consumers() {
+        let (tx, rx) = mpsc::channel();
+        let (_p1, c1) = RingBuffer::<f32>::new(4);
+        let (_p2, c2) = RingBuffer::<f32>::new(4);
+        let mut consumers = vec![slot(GroupId(0), 1, 0)];
+
+        tx.send(CaptureMsg::Add { group: GroupId(0), pid: 100, consumer: c1 }).unwrap();
+        tx.send(CaptureMsg::Add { group: GroupId(0), pid: 200, consumer: c2 }).unwrap();
+        drain_capture_commands(&rx, &mut consumers);
+        assert_eq!(consumers[0].pids.len(), 2);
+
+        tx.send(CaptureMsg::Remove { group: GroupId(0), pid: 100 }).unwrap();
+        drain_capture_commands(&rx, &mut consumers);
+        assert_eq!(consumers[0].pids.len(), 1);
+        assert_eq!(consumers[0].pids[0].0, 200);
+    }
+
+    #[test]
+    fn apply_capture_sources_wires_a_pid_into_the_running_mixer_and_removes_it_cleanly() {
+        let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(mock_endpoints()));
+        let handle = start(&snapshot(), sys).unwrap();
+        let capture = handle.capture_control();
+
+        let failed = capture.apply_capture_sources(GroupId(0), vec![100, 200]).unwrap();
+        assert!(failed.is_empty());
+        sleep(Duration::from_millis(30));
+        // No panic / no stall is the assertion here — two pid capture threads
+        // are now feeding the running mixer's GroupSlot(0).
+
+        let failed = capture.apply_capture_sources(GroupId(0), vec![200]).unwrap();
+        assert!(failed.is_empty());
+        sleep(Duration::from_millis(30));
+        // pid 100's capture thread is stopped+joined synchronously inside
+        // `apply_capture_sources` — reaching here without hanging is the proof.
+
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn apply_capture_sources_on_a_stopped_engine_is_an_error() {
+        let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(mock_endpoints()));
+        let handle = start(&snapshot(), sys).unwrap();
+        let capture = handle.capture_control();
+        handle.shutdown().unwrap();
+
+        assert!(matches!(
+            capture.apply_capture_sources(GroupId(0), vec![100]),
+            Err(EngineError::AlreadyStopped)
+        ));
+    }
+
+    #[test]
+    fn a_pid_whose_capture_thread_dies_mid_stream_is_reaped_and_retried() {
+        // Regression test (review finding, 2026-07-21): a pid's capture
+        // thread that exits from a runtime read error (not an open failure)
+        // used to stay "current" forever — never reaped, never retried, even
+        // though the same still-matching session keeps getting handed to
+        // every subsequent reconcile.
+        let sys = Arc::new(MockSystem::new(mock_endpoints()));
+        sys.die_on_read(100);
+        let sys_dyn: Arc<dyn AudioSystem> = sys.clone();
+        let handle = start(&snapshot(), sys_dyn).unwrap();
+        let capture = handle.capture_control();
+
+        let failed = capture.apply_capture_sources(GroupId(0), vec![100]).unwrap();
+        assert!(failed.is_empty(), "open itself succeeds — only read() fails");
+        assert_eq!(sys.open_count(100), 1);
+
+        // The capture thread dies on its very first read (poll_interval is
+        // 1ms) — wait for that to actually happen before reconciling again.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while sys.open_count(100) < 2 && std::time::Instant::now() < deadline {
+            // Reconcile again: if the dead pid were still wrongly considered
+            // "current", this would be a no-op and open_count would never
+            // advance past 1.
+            capture.apply_capture_sources(GroupId(0), vec![100]).unwrap();
+            sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            sys.open_count(100) >= 2,
+            "expected the dead pid to be reaped and re-opened, got open_count={}",
+            sys.open_count(100)
+        );
         handle.shutdown().unwrap();
     }
 }

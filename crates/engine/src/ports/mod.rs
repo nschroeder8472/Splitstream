@@ -15,17 +15,10 @@ pub mod mock;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EndpointId(pub String);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EndpointKind {
-    Bus,
-    Physical,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Endpoint {
     pub id: EndpointId,
     pub name: String,
-    pub kind: EndpointKind,
     pub format: Format,
 }
 
@@ -75,7 +68,12 @@ impl Drop for RtGuard {
 
 pub trait AudioSystem: Send + Sync {
     fn enumerate(&self) -> Result<Vec<Endpoint>, PortError>;
-    fn open_capture(&self, id: &EndpointId) -> Result<Box<dyn CapturePort>, PortError>;
+    /// Per-process loopback capture (process-loopback-capture L4):
+    /// `ActivateAudioInterfaceAsync` + `PROCESS_LOOPBACK` in the real
+    /// `win-audio` impl — replaces the old per-endpoint `open_capture`.
+    /// `include_tree` captures the process's child processes too (same
+    /// activation parameter WASAPI exposes).
+    fn open_process_capture(&self, pid: u32, include_tree: bool) -> Result<Box<dyn CapturePort>, PortError>;
     fn open_render(&self, id: &EndpointId) -> Result<Box<dyn RenderPort>, PortError>;
     fn promote_rt_thread(&self) -> RtGuard;
     /// Current default render endpoint — the supervisor's fallback target on device removal.
@@ -95,36 +93,20 @@ pub enum SessionEvent {
 
 /// Separate from `AudioSystem` (session-routing decision, deliberate exception
 /// to the grow-facade learning): session enumeration is a distinct,
-/// always-available concern from policy routing below — best-effort and
-/// possibly unavailable — and RoutingCoordinator owns each behind its own
-/// `Box<dyn _>`, not a shared facade.
+/// best-effort, possibly-unavailable concern — `RoutingCoordinator` owns it
+/// behind its own `Box<dyn _>`, not folded into the main facade.
 pub trait SessionPort: Send {
     /// Must prime new-session notifications (real `win-audio` impl: calls
     /// `GetSessionEnumerator` at least once — notes §14 gotcha 1).
     fn enumerate(&mut self) -> Result<Vec<SessionInfo>, PortError>;
     /// Single-consume, same pattern as `EngineHandle::take_events`.
     fn take_events(&mut self) -> Receiver<SessionEvent>;
-}
-
-/// `AudioPolicyConfig`/`IPolicyConfig` are undocumented (spec §9.3–9.4) — every
-/// call is best-effort. `Unavailable` = the surface itself isn't usable
-/// (feature off, activation failed); `Failed` = the surface is usable but
-/// this particular call didn't succeed. RoutingCoordinator's degradation
-/// posture treats both the same (one notice, skip further calls).
-#[derive(Debug)]
-pub enum PolicyError {
-    Unavailable(String),
-    Failed(String),
-}
-
-/// All methods best-effort (spec §9.3–9.4) — a failure degrades routing
-/// polish, never audio. Separate from `AudioSystem` for the same reason as
-/// `SessionPort`.
-pub trait PolicyPort: Send {
-    fn route(&mut self, pid: u32, bus: &EndpointId) -> Result<(), PolicyError>;
-    fn clear_route(&mut self, pid: u32) -> Result<(), PolicyError>;
-    fn set_visibility(&mut self, endpoint: &EndpointId, visible: bool) -> Result<(), PolicyError>;
-    fn set_default(&mut self, endpoint: &EndpointId) -> Result<(), PolicyError>;
+    /// Best-effort — pid not currently found among live sessions (already
+    /// exited) is `Ok(())`, not an error (session-mute-on-capture L3 flow E:
+    /// failures are isolated, caller logs and moves on, never blocks
+    /// reconcile). `&self`, not `&mut self` — same "this is really an OS RPC
+    /// call" reasoning as `AudioSystem`'s methods; no persistent state needed.
+    fn set_muted(&self, pid: u32, muted: bool) -> Result<(), PortError>;
 }
 
 /// Polled ~period/2 (spec Appendix A) — loopback event mode is historically unreliable.

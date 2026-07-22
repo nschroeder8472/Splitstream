@@ -1,11 +1,11 @@
 //! `IAudioSessionManager2` → `SessionPort` (session-routing L4, notes §14).
-//! Sessions are enumerated/notified per-endpoint, not globally — an app
-//! already redirected to a Splitstream bus in a prior run would never show
-//! up in the *default* device's session list, since WASAPI redirects it
-//! straight to the persisted endpoint before the default device's session
-//! manager ever sees it. So this scans every bus + physical endpoint the
-//! enumerator reports, not just the default (session-routing 2026-07-20
-//! decision), merging by pid.
+//! Sessions are enumerated/notified per-endpoint, not globally — a session
+//! can be live on any active render endpoint, not just the default one. So
+//! this scans every endpoint the enumerator reports, not just the default
+//! (session-routing 2026-07-20 decision), merging by pid. Unaffected by the
+//! process-loopback-capture pivot — session discovery (which processes are
+//! playing audio) is a separate concern from where their audio is captured
+//! from.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,6 +18,7 @@ use windows::Win32::Media::Audio::{
     AudioSessionDisconnectReason, AudioSessionState, AudioSessionStateExpired,
     IAudioSessionControl, IAudioSessionControl2, IAudioSessionEvents, IAudioSessionEvents_Impl,
     IAudioSessionManager2, IAudioSessionNotification, IAudioSessionNotification_Impl,
+    ISimpleAudioVolume,
 };
 use windows::Win32::System::Com::CLSCTX_ALL;
 use windows::Win32::System::Threading::{
@@ -89,12 +90,18 @@ pub struct WasapiSessions {
 unsafe impl Send for WasapiSessions {}
 
 impl WasapiSessions {
-    pub fn new(bus_name_prefix: impl Into<String>) -> WasapiSessions {
+    pub fn new() -> WasapiSessions {
         WasapiSessions {
-            enumerator: EndpointEnumerator::new(bus_name_prefix),
+            enumerator: EndpointEnumerator::new(),
             session_registrations: Arc::new(Mutex::new(Vec::new())),
             manager_registrations: Vec::new(),
         }
+    }
+}
+
+impl Default for WasapiSessions {
+    fn default() -> WasapiSessions {
+        WasapiSessions::new()
     }
 }
 
@@ -164,6 +171,52 @@ impl SessionPort for WasapiSessions {
         }
         rx
     }
+
+    /// Scans every render endpoint's session manager (same multi-endpoint
+    /// reasoning as `enumerate`/`take_events` above) for the live session
+    /// whose pid matches, casts to `ISimpleAudioVolume`, calls `SetMute`.
+    /// Pid not found on any endpoint (already exited) is `Ok(())` — best-effort,
+    /// per the trait's documented contract.
+    fn set_muted(&self, pid: u32, muted: bool) -> Result<(), PortError> {
+        crate::com::ensure_initialized().map_err(|e| PortError::Backend(e.to_string()))?;
+        let endpoints = self.enumerator.enumerate()?;
+        for endpoint in &endpoints {
+            let Ok(manager) = activate_manager(&endpoint.id) else {
+                continue;
+            };
+            let Some(control) = find_session_control(&manager, pid) else {
+                continue;
+            };
+            let volume: ISimpleAudioVolume = control
+                .cast()
+                .map_err(|e| PortError::Backend(e.to_string()))?;
+            unsafe {
+                volume
+                    .SetMute(muted, std::ptr::null())
+                    .map_err(|e| PortError::Backend(e.to_string()))?;
+            }
+            return Ok(());
+        }
+        Ok(())
+    }
+}
+
+/// Finds the live session control whose pid matches, scanning `manager`'s
+/// session enumerator. Best-effort per-session lookup failures are skipped,
+/// not propagated — same posture as `enumerate_sessions`.
+fn find_session_control(manager: &IAudioSessionManager2, pid: u32) -> Option<IAudioSessionControl> {
+    unsafe {
+        let session_enum = manager.GetSessionEnumerator().ok()?;
+        let count = session_enum.GetCount().unwrap_or(0);
+        for i in 0..count {
+            if let Ok(control) = session_enum.GetSession(i) {
+                if session_pid(&control) == Some(pid) {
+                    return Some(control);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn activate_manager(id: &EndpointId) -> Result<IAudioSessionManager2, PortError> {
@@ -390,7 +443,7 @@ mod tests {
     #[test]
     #[ignore]
     fn enumerate_real_sessions() {
-        let mut sessions = WasapiSessions::new("Splitstream Bus");
+        let mut sessions = WasapiSessions::new();
         let list = sessions.enumerate().expect("enumerate");
         for s in &list {
             println!("pid={} path={:?} name={:?}", s.pid, s.process_path, s.display_name);
@@ -405,11 +458,29 @@ mod tests {
     #[test]
     #[ignore]
     fn subscribe_and_print_real_session_events() {
-        let mut sessions = WasapiSessions::new("Splitstream Bus");
+        let mut sessions = WasapiSessions::new();
         let rx = sessions.take_events();
         println!("listening for session events for 15s — start/stop audio in another app now");
         while let Ok(evt) = rx.recv_timeout(std::time::Duration::from_secs(15)) {
             println!("{evt:?}");
         }
+    }
+
+    /// Manual smoke test (session-mute-on-capture) — mutes the first live
+    /// session found for 3s (verify in Volume Mixer / listen for silence),
+    /// then unmutes it. Run explicitly: `cargo test -p win-audio -- --ignored
+    /// --nocapture mute_and_unmute_a_real_session`, with some app already
+    /// playing audio.
+    #[test]
+    #[ignore]
+    fn mute_and_unmute_a_real_session() {
+        let mut sessions = WasapiSessions::new();
+        let list = sessions.enumerate().expect("enumerate");
+        let target = list.first().expect("need at least one live session playing audio");
+        println!("muting pid={} name={:?} for 3s...", target.pid, target.display_name);
+        sessions.set_muted(target.pid, true).expect("mute");
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        println!("unmuting pid={}", target.pid);
+        sessions.set_muted(target.pid, false).expect("unmute");
     }
 }

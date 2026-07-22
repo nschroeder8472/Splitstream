@@ -1,12 +1,9 @@
-//! `IMMDeviceEnumerator` → discover bus + physical endpoints (spec F1).
+//! `IMMDeviceEnumerator` → discover physical render endpoints (spec F1).
 //!
-//! Bus vs Physical classification: Splitstream sits on top of a bundled
-//! third-party signed virtual driver (VB-Audio matrix or multiple VB-CABLE
-//! instances — spec §9.5). Shipping our own driver (P6) is dropped, so this
-//! name-prefix scheme is the permanent design, not a stopgap: any active
-//! render endpoint whose friendly name starts with `bus_name_prefix` is a
-//! `Bus`, everything else is `Physical`. Configurable prefix keeps it vendor
-//! -agnostic across whichever bundled driver an install ships with.
+//! No more Bus/Physical classification (process-loopback-capture pivot):
+//! every active render endpoint is a plain output-device candidate now —
+//! there is no virtual bus to distinguish, since capture is per-process, not
+//! per-endpoint.
 
 use windows::core::PWSTR;
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
@@ -15,19 +12,15 @@ use windows::Win32::Media::Audio::{
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL, STGM_READ};
 
-use engine::ports::{Endpoint, EndpointId, EndpointKind, PortError};
+use engine::ports::{Endpoint, EndpointId, PortError};
 
 use crate::format::client_mix_format;
 
-pub struct EndpointEnumerator {
-    bus_name_prefix: String,
-}
+pub struct EndpointEnumerator;
 
 impl EndpointEnumerator {
-    pub fn new(bus_name_prefix: impl Into<String>) -> EndpointEnumerator {
-        EndpointEnumerator {
-            bus_name_prefix: bus_name_prefix.into(),
-        }
+    pub fn new() -> EndpointEnumerator {
+        EndpointEnumerator
     }
 
     pub fn enumerate(&self) -> Result<Vec<Endpoint>, PortError> {
@@ -49,7 +42,7 @@ impl EndpointEnumerator {
                 let device = collection
                     .Item(i)
                     .map_err(|e| PortError::Backend(e.to_string()))?;
-                if let Some(endpoint) = describe_device(&device, &self.bus_name_prefix)? {
+                if let Some(endpoint) = describe_device(&device)? {
                     endpoints.push(endpoint);
                 }
             }
@@ -59,7 +52,9 @@ impl EndpointEnumerator {
     }
 
     /// `default_output()` port method (drift-and-recovery L4): the recovery
-    /// supervisor's fallback target on device removal. `eConsole`, not
+    /// supervisor's fallback target on device removal, and
+    /// process-loopback-capture's `capture_format` source (every group's
+    /// `input_format` — `graph::resolve`'s doc). `eConsole`, not
     /// `eMultimedia`/`eCommunications` — matches what most apps (and the
     /// user's system volume mixer) treat as "the default device".
     pub fn default_output(&self) -> Result<Endpoint, PortError> {
@@ -71,14 +66,16 @@ impl EndpointEnumerator {
             let device = enumerator
                 .GetDefaultAudioEndpoint(eRender, eConsole)
                 .map_err(|e| PortError::Backend(e.to_string()))?;
-            describe_device(&device, &self.bus_name_prefix)?.ok_or_else(|| {
+            describe_device(&device)?.ok_or_else(|| {
                 PortError::Backend("default render endpoint has no usable mix format".into())
             })
         }
     }
+}
 
-    pub(crate) fn bus_name_prefix(&self) -> &str {
-        &self.bus_name_prefix
+impl Default for EndpointEnumerator {
+    fn default() -> EndpointEnumerator {
+        EndpointEnumerator::new()
     }
 }
 
@@ -86,22 +83,16 @@ impl EndpointEnumerator {
 /// monitor (`monitor.rs`) to turn the bare device-id string an
 /// `IMMNotificationClient` callback hands us into a full `Endpoint` for
 /// `DeviceEvent::Added`.
-pub(crate) fn describe_device_by_id(
-    id: &EndpointId,
-    bus_name_prefix: &str,
-) -> Result<Option<Endpoint>, PortError> {
+pub(crate) fn describe_device_by_id(id: &EndpointId) -> Result<Option<Endpoint>, PortError> {
     crate::com::ensure_initialized().map_err(|e| PortError::Backend(e.to_string()))?;
     let device = crate::device::open(id)?;
-    unsafe { describe_device(&device, bus_name_prefix) }
+    unsafe { describe_device(&device) }
 }
 
-/// Reads id/name/format for one device and classifies it. Returns `Ok(None)`
-/// when the format can't be determined — skip that one endpoint rather than
-/// failing the whole enumeration.
-unsafe fn describe_device(
-    device: &IMMDevice,
-    bus_name_prefix: &str,
-) -> Result<Option<Endpoint>, PortError> {
+/// Reads id/name/format for one device. Returns `Ok(None)` when the format
+/// can't be determined — skip that one endpoint rather than failing the
+/// whole enumeration.
+unsafe fn describe_device(device: &IMMDevice) -> Result<Option<Endpoint>, PortError> {
     let id = device
         .GetId()
         .map_err(|e| PortError::Backend(e.to_string()))?;
@@ -121,16 +112,9 @@ unsafe fn describe_device(
         Err(_) => return Ok(None),
     };
 
-    let kind = if name.starts_with(bus_name_prefix) {
-        EndpointKind::Bus
-    } else {
-        EndpointKind::Physical
-    };
-
     Ok(Some(Endpoint {
         id: EndpointId(id),
         name,
-        kind,
         format,
     }))
 }
@@ -151,14 +135,11 @@ mod tests {
     #[test]
     #[ignore]
     fn enumerate_real_render_endpoints() {
-        let endpoints = EndpointEnumerator::new("Splitstream Bus")
+        let endpoints = EndpointEnumerator::new()
             .enumerate()
             .expect("enumerate should succeed on a machine with any render device");
         for e in &endpoints {
-            println!(
-                "{:?} kind={:?} format={:?} name={:?}",
-                e.id, e.kind, e.format, e.name
-            );
+            println!("{:?} format={:?} name={:?}", e.id, e.format, e.name);
         }
         assert!(
             !endpoints.is_empty(),

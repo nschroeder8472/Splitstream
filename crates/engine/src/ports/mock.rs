@@ -1,7 +1,7 @@
 //! Fake `AudioSystem` + ports. This is why the port traits live in `engine`,
 //! not `win-audio`: the whole graph runs on any platform against these fakes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::f32::consts::TAU;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -11,8 +11,8 @@ use std::time::Duration;
 use audio_core::Format;
 
 use super::{
-    AudioSystem, CapturePort, DeviceEvent, Endpoint, EndpointId, EndpointKind, PolicyError,
-    PolicyPort, PortError, RenderPort, RtGuard, SessionEvent, SessionPort,
+    AudioSystem, CapturePort, DeviceEvent, Endpoint, EndpointId, PortError, RenderPort, RtGuard,
+    SessionEvent, SessionPort,
 };
 use crate::rules::SessionInfo;
 
@@ -28,6 +28,18 @@ pub struct MockSystem {
     /// fails on its next `wait_event`, simulating a real mid-stream format
     /// change (as opposed to a device that's actually gone).
     render_invalidated: Mutex<HashMap<EndpointId, Arc<AtomicBool>>>,
+    /// Pids `open_process_capture` should fail for — simulates permission
+    /// denied / a protected process (process-loopback-capture L3 flow E:
+    /// per-attempt, isolated failure, no global degraded flag).
+    failing_pids: Mutex<std::collections::HashSet<u32>>,
+    /// Pids whose capture *opens* fine but errors on the very first `read()`
+    /// — simulates a runtime failure mid-stream (as opposed to `failing_pids`,
+    /// which fails at open time), for testing that a dead capture thread gets
+    /// reaped and retried rather than permanently zombied.
+    dying_pids: Mutex<std::collections::HashSet<u32>>,
+    /// Successful `open_process_capture` calls per pid — lets a test prove a
+    /// pid was actually re-opened (not just skipped as "still current").
+    open_counts: Mutex<HashMap<u32, usize>>,
 }
 
 impl MockSystem {
@@ -37,6 +49,9 @@ impl MockSystem {
             default_output: Mutex::new(None),
             events: Mutex::new(None),
             render_invalidated: Mutex::new(HashMap::new()),
+            failing_pids: Mutex::new(std::collections::HashSet::new()),
+            dying_pids: Mutex::new(std::collections::HashSet::new()),
+            open_counts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -84,6 +99,32 @@ impl MockSystem {
             flag.store(true, Ordering::Relaxed);
         }
     }
+
+    /// Test hook: make `open_process_capture(pid, _)` fail for `pid` until
+    /// `unfail_process_capture` is called — simulates a permission-denied or
+    /// protected-process activation failure for one pid, isolated from every
+    /// other pid (process-loopback-capture L3 flow E).
+    pub fn fail_process_capture(&self, pid: u32) {
+        self.failing_pids.lock().unwrap().insert(pid);
+    }
+
+    pub fn unfail_process_capture(&self, pid: u32) {
+        self.failing_pids.lock().unwrap().remove(&pid);
+    }
+
+    /// Test hook: `open_process_capture(pid, _)` succeeds for `pid`, but the
+    /// returned port's `read()` always errors — simulates a capture stream
+    /// that dies mid-run (as opposed to `fail_process_capture`, which fails
+    /// at open time).
+    pub fn die_on_read(&self, pid: u32) {
+        self.dying_pids.lock().unwrap().insert(pid);
+    }
+
+    /// Test hook: how many times `open_process_capture` actually succeeded
+    /// for `pid` — proves a re-open attempt happened, not just a skip.
+    pub fn open_count(&self, pid: u32) -> usize {
+        self.open_counts.lock().unwrap().get(&pid).copied().unwrap_or(0)
+    }
 }
 
 impl AudioSystem for MockSystem {
@@ -91,9 +132,22 @@ impl AudioSystem for MockSystem {
         Ok(self.endpoints.lock().unwrap().clone())
     }
 
-    fn open_capture(&self, id: &EndpointId) -> Result<Box<dyn CapturePort>, PortError> {
-        let endpoint = self.find(id)?;
-        Ok(Box::new(SineCapture::new(440.0, endpoint.format)))
+    fn open_process_capture(&self, pid: u32, _include_tree: bool) -> Result<Box<dyn CapturePort>, PortError> {
+        if self.failing_pids.lock().unwrap().contains(&pid) {
+            return Err(PortError::Backend(format!("mock: process capture denied for pid {pid}")));
+        }
+        *self.open_counts.lock().unwrap().entry(pid).or_insert(0) += 1;
+        // Fixed default format — process capture streams aren't tied to any
+        // configured endpoint, unlike the old per-bus loopback capture.
+        let format = Format {
+            sample_rate: 48_000,
+            channels: 2,
+            layout: audio_core::ChannelLayout::STEREO,
+        };
+        if self.dying_pids.lock().unwrap().contains(&pid) {
+            return Ok(Box::new(DyingCapture { format }));
+        }
+        Ok(Box::new(SineCapture::new(440.0, format)))
     }
 
     fn open_render(&self, id: &EndpointId) -> Result<Box<dyn RenderPort>, PortError> {
@@ -120,8 +174,7 @@ impl AudioSystem for MockSystem {
         self.endpoints
             .lock()
             .unwrap()
-            .iter()
-            .find(|e| e.kind == EndpointKind::Physical)
+            .first()
             .cloned()
             .ok_or_else(|| PortError::Backend("no physical endpoint configured".into()))
     }
@@ -130,6 +183,26 @@ impl AudioSystem for MockSystem {
         let (tx, rx) = mpsc::channel();
         *self.events.lock().unwrap() = Some(tx);
         Ok(rx)
+    }
+}
+
+/// A capture port that opens successfully but errors on every `read()` —
+/// simulates a stream that dies mid-run (`MockSystem::die_on_read`).
+struct DyingCapture {
+    format: Format,
+}
+
+impl CapturePort for DyingCapture {
+    fn read(&mut self, _buf: &mut [f32]) -> Result<usize, PortError> {
+        Err(PortError::Backend("mock: capture died mid-stream".into()))
+    }
+
+    fn format(&self) -> Format {
+        self.format
+    }
+
+    fn poll_interval(&self) -> Duration {
+        Duration::from_millis(1)
     }
 }
 
@@ -233,6 +306,12 @@ impl RenderPort for SinkRender {
 struct SessionPortState {
     sessions: Mutex<Vec<SessionInfo>>,
     events: Mutex<Option<mpsc::Sender<SessionEvent>>>,
+    /// Pids `set_muted` has been called with `true` for, per this mock's own
+    /// bookkeeping — cleared again on `set_muted(pid, false)`.
+    muted: Mutex<HashSet<u32>>,
+    /// Pids `set_muted` should fail for (session-mute-on-capture L3 flow E:
+    /// isolated, best-effort failure) — same shape as `MockSystem::failing_pids`.
+    failing_mute: Mutex<HashSet<u32>>,
 }
 
 /// Fake `SessionPort`. Test hooks (`add_session`/`remove_session`/`emit_event`)
@@ -267,6 +346,16 @@ impl MockSessionPort {
             let _ = tx.send(event);
         }
     }
+
+    /// Test hook: pids currently muted per this mock's own bookkeeping.
+    pub fn muted_pids(&self) -> HashSet<u32> {
+        self.0.muted.lock().unwrap().clone()
+    }
+
+    /// Test hook: make `set_muted(pid, _)` fail until cleared.
+    pub fn fail_mute(&self, pid: u32) {
+        self.0.failing_mute.lock().unwrap().insert(pid);
+    }
 }
 
 impl SessionPort for MockSessionPort {
@@ -279,94 +368,17 @@ impl SessionPort for MockSessionPort {
         *self.0.events.lock().unwrap() = Some(tx);
         rx
     }
-}
 
-/// Simulated failure mode for `MockPolicyPort` — reconstructs a fresh
-/// `PolicyError` per call rather than storing/cloning one, since `PolicyError`
-/// (like `PortError`) intentionally doesn't derive `Clone`.
-enum MockFailure {
-    Unavailable,
-    Failed,
-}
-
-#[derive(Default)]
-struct PolicyPortState {
-    routes: Mutex<HashMap<u32, EndpointId>>,
-    visibility: Mutex<HashMap<EndpointId, bool>>,
-    default: Mutex<Option<EndpointId>>,
-    failing: Mutex<Option<MockFailure>>,
-}
-
-/// Fake `PolicyPort`. Records every applied route/visibility/default for
-/// test assertions, and `fail_with_*`/`stop_failing` let degradation-path
-/// tests (RoutingCoordinator: "first PolicyPort failure degrades") simulate
-/// the undocumented surface breaking. `Clone` + `Arc`-backed state — same
-/// rationale as `MockSessionPort` above.
-#[derive(Clone, Default)]
-pub struct MockPolicyPort(Arc<PolicyPortState>);
-
-impl MockPolicyPort {
-    pub fn new() -> MockPolicyPort {
-        MockPolicyPort::default()
-    }
-
-    pub fn fail_with_unavailable(&self) {
-        *self.0.failing.lock().unwrap() = Some(MockFailure::Unavailable);
-    }
-
-    pub fn fail_with_failed(&self) {
-        *self.0.failing.lock().unwrap() = Some(MockFailure::Failed);
-    }
-
-    pub fn stop_failing(&self) {
-        *self.0.failing.lock().unwrap() = None;
-    }
-
-    pub fn routes(&self) -> HashMap<u32, EndpointId> {
-        self.0.routes.lock().unwrap().clone()
-    }
-
-    pub fn is_visible(&self, endpoint: &EndpointId) -> Option<bool> {
-        self.0.visibility.lock().unwrap().get(endpoint).copied()
-    }
-
-    pub fn default_endpoint(&self) -> Option<EndpointId> {
-        self.0.default.lock().unwrap().clone()
-    }
-
-    fn check_failure(&self) -> Result<(), PolicyError> {
-        match &*self.0.failing.lock().unwrap() {
-            Some(MockFailure::Unavailable) => {
-                Err(PolicyError::Unavailable("mock: simulated unavailable".into()))
-            }
-            Some(MockFailure::Failed) => Err(PolicyError::Failed("mock: simulated failure".into())),
-            None => Ok(()),
+    fn set_muted(&self, pid: u32, muted: bool) -> Result<(), PortError> {
+        if self.0.failing_mute.lock().unwrap().contains(&pid) {
+            return Err(PortError::Backend(format!("mock: set_muted denied for pid {pid}")));
         }
-    }
-}
-
-impl PolicyPort for MockPolicyPort {
-    fn route(&mut self, pid: u32, bus: &EndpointId) -> Result<(), PolicyError> {
-        self.check_failure()?;
-        self.0.routes.lock().unwrap().insert(pid, bus.clone());
-        Ok(())
-    }
-
-    fn clear_route(&mut self, pid: u32) -> Result<(), PolicyError> {
-        self.check_failure()?;
-        self.0.routes.lock().unwrap().remove(&pid);
-        Ok(())
-    }
-
-    fn set_visibility(&mut self, endpoint: &EndpointId, visible: bool) -> Result<(), PolicyError> {
-        self.check_failure()?;
-        self.0.visibility.lock().unwrap().insert(endpoint.clone(), visible);
-        Ok(())
-    }
-
-    fn set_default(&mut self, endpoint: &EndpointId) -> Result<(), PolicyError> {
-        self.check_failure()?;
-        *self.0.default.lock().unwrap() = Some(endpoint.clone());
+        let mut set = self.0.muted.lock().unwrap();
+        if muted {
+            set.insert(pid);
+        } else {
+            set.remove(&pid);
+        }
         Ok(())
     }
 }
@@ -383,30 +395,43 @@ mod tests {
         }
     }
 
-    fn endpoint(id: &str, kind: EndpointKind) -> Endpoint {
+    fn endpoint(id: &str) -> Endpoint {
         Endpoint {
             id: EndpointId(id.to_string()),
             name: id.to_string(),
-            kind,
             format: stereo(48_000),
         }
     }
 
     #[test]
     fn enumerate_returns_configured_endpoints() {
-        let sys = MockSystem::new(vec![
-            endpoint("bus-1", EndpointKind::Bus),
-            endpoint("out-1", EndpointKind::Physical),
-        ]);
+        let sys = MockSystem::new(vec![endpoint("out-1"), endpoint("out-2")]);
         let eps = sys.enumerate().unwrap();
         assert_eq!(eps.len(), 2);
     }
 
     #[test]
-    fn open_capture_on_unknown_id_returns_not_found() {
+    fn open_process_capture_succeeds_for_any_pid_by_default() {
         let sys = MockSystem::new(vec![]);
-        let result = sys.open_capture(&EndpointId("missing".into()));
-        assert!(matches!(result, Err(PortError::NotFound(_))));
+        assert!(sys.open_process_capture(1234, false).is_ok());
+    }
+
+    #[test]
+    fn open_process_capture_fails_for_a_pid_marked_failing() {
+        let sys = MockSystem::new(vec![]);
+        sys.fail_process_capture(1234);
+        assert!(matches!(
+            sys.open_process_capture(1234, false),
+            Err(PortError::Backend(_))
+        ));
+    }
+
+    #[test]
+    fn unfail_process_capture_lets_a_previously_failing_pid_succeed() {
+        let sys = MockSystem::new(vec![]);
+        sys.fail_process_capture(1234);
+        sys.unfail_process_capture(1234);
+        assert!(sys.open_process_capture(1234, false).is_ok());
     }
 
     #[test]
@@ -432,28 +457,21 @@ mod tests {
     }
 
     #[test]
-    fn default_output_falls_back_to_first_physical_endpoint() {
-        let sys = MockSystem::new(vec![
-            endpoint("bus-1", EndpointKind::Bus),
-            endpoint("out-1", EndpointKind::Physical),
-            endpoint("out-2", EndpointKind::Physical),
-        ]);
+    fn default_output_falls_back_to_first_endpoint() {
+        let sys = MockSystem::new(vec![endpoint("out-1"), endpoint("out-2")]);
         assert_eq!(sys.default_output().unwrap().id, EndpointId("out-1".into()));
     }
 
     #[test]
     fn default_output_honors_explicit_override() {
-        let sys = MockSystem::new(vec![
-            endpoint("out-1", EndpointKind::Physical),
-            endpoint("out-2", EndpointKind::Physical),
-        ]);
+        let sys = MockSystem::new(vec![endpoint("out-1"), endpoint("out-2")]);
         sys.set_default_output(EndpointId("out-2".into()));
         assert_eq!(sys.default_output().unwrap().id, EndpointId("out-2".into()));
     }
 
     #[test]
-    fn default_output_with_no_physical_endpoint_is_backend_error() {
-        let sys = MockSystem::new(vec![endpoint("bus-1", EndpointKind::Bus)]);
+    fn default_output_with_no_endpoints_is_backend_error() {
+        let sys = MockSystem::new(vec![]);
         assert!(matches!(sys.default_output(), Err(PortError::Backend(_))));
     }
 
@@ -513,44 +531,4 @@ mod tests {
         sessions.emit_event(SessionEvent::Ended(1)); // no subscriber yet — must not panic
     }
 
-    #[test]
-    fn policy_port_records_applied_route() {
-        let mut policy = MockPolicyPort::new();
-        let bus = EndpointId("bus-1".into());
-        policy.route(1, &bus).unwrap();
-        assert_eq!(policy.routes().get(&1), Some(&bus));
-    }
-
-    #[test]
-    fn policy_port_clear_route_removes_the_recorded_route() {
-        let mut policy = MockPolicyPort::new();
-        let bus = EndpointId("bus-1".into());
-        policy.route(1, &bus).unwrap();
-        policy.clear_route(1).unwrap();
-        assert!(!policy.routes().contains_key(&1));
-    }
-
-    #[test]
-    fn policy_port_records_visibility_and_default() {
-        let mut policy = MockPolicyPort::new();
-        let bus = EndpointId("bus-1".into());
-        let out = EndpointId("out-1".into());
-        policy.set_visibility(&bus, false).unwrap();
-        policy.set_default(&out).unwrap();
-        assert_eq!(policy.is_visible(&bus), Some(false));
-        assert_eq!(policy.default_endpoint(), Some(out));
-    }
-
-    #[test]
-    fn policy_port_fails_every_call_once_failing_and_recovers_after_stop_failing() {
-        let mut policy = MockPolicyPort::new();
-        policy.fail_with_unavailable();
-        assert!(matches!(
-            policy.route(1, &EndpointId("bus-1".into())),
-            Err(PolicyError::Unavailable(_))
-        ));
-
-        policy.stop_failing();
-        assert!(policy.route(1, &EndpointId("bus-1".into())).is_ok());
-    }
 }

@@ -12,4 +12,4 @@ pub use graph::{
 };
 pub use routing::{start_routing, RoutingHandle, RoutingReader};
 pub use rules::{match_session, GlobPattern, GroupRules, MatchRule, SessionInfo};
-pub use runtime::{start, EngineError, EngineEvent, EngineHandle, EngineStats, Epoch};
+pub use runtime::{start, CaptureControl, EngineError, EngineEvent, EngineHandle, EngineStats, Epoch};

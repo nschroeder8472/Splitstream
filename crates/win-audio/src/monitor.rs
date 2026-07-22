@@ -23,7 +23,6 @@ use crate::enumerator::describe_device_by_id;
 #[implement(IMMNotificationClient)]
 struct NotificationSink {
     tx: Sender<DeviceEvent>,
-    bus_name_prefix: String,
 }
 
 impl IMMNotificationClient_Impl for NotificationSink_Impl {
@@ -51,9 +50,8 @@ impl IMMNotificationClient_Impl for NotificationSink_Impl {
         // `enumerate()` will pick it up once it settles.
         let id = EndpointId(pwstr_to_string(device_id));
         let tx = self.tx.clone();
-        let bus_name_prefix = self.bus_name_prefix.clone();
         thread::spawn(move || {
-            if let Ok(Some(endpoint)) = describe_device_by_id(&id, &bus_name_prefix) {
+            if let Ok(Some(endpoint)) = describe_device_by_id(&id) {
                 let _ = tx.send(DeviceEvent::Added(endpoint));
             }
         });
@@ -123,16 +121,13 @@ impl Drop for DeviceMonitor {
     }
 }
 
-pub fn subscribe(bus_name_prefix: &str) -> Result<(DeviceMonitor, Receiver<DeviceEvent>), PortError> {
+pub fn subscribe() -> Result<(DeviceMonitor, Receiver<DeviceEvent>), PortError> {
     crate::com::ensure_initialized().map_err(|e| PortError::Backend(e.to_string()))?;
     let (tx, rx) = mpsc::channel();
     unsafe {
         let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
             .map_err(|e| PortError::Backend(e.to_string()))?;
-        let sink = NotificationSink {
-            tx,
-            bus_name_prefix: bus_name_prefix.to_string(),
-        };
+        let sink = NotificationSink { tx };
         let client: IMMNotificationClient = sink.into();
         enumerator
             .RegisterEndpointNotificationCallback(&client)
