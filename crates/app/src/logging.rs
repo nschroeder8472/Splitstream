@@ -46,7 +46,7 @@ pub fn fatal_dialog(context: &str, detail: &str) {
     tracing::error!("fatal: {context}: {detail}");
     rfd::MessageDialog::new()
         .set_title("Splitstream failed to start")
-        .set_description(&format!("{context}: {detail}"))
+        .set_description(format!("{context}: {detail}"))
         .set_level(rfd::MessageLevel::Error)
         .set_buttons(rfd::MessageButtons::Ok)
         .show();

@@ -493,6 +493,7 @@ Real code must: register the thread with MMCSS before the loop; handle `AUDCLNT_
 - Design alignment: `F5`/`§9.2` (session enumeration, per-app match rules by process name/path) — unchanged, still accurate. See `.lattice/context/process-loopback-capture.md`.
 - Design alignment: `§15.1` UI toolkit unchanged (`egui`/`eframe`); settings-window layout/interaction model (columns, dropdown-backed pickers, drag-assign) has no prior spec text to diverge from — pure elaboration on app-shell.md's approved F9/§6.5 contracts. See `.lattice/context/mixer-ui-redesign.md`.
 - Design addition: `§9.3` gains session-mute-on-capture — found live (process-loopback capture is a tap, not a redirect, so a captured session's own Windows output kept playing unmuted, double-audio whenever the group's output device is also Windows' default). Splitstream now mutes (`ISimpleAudioVolume::SetMute`) a session's own volume for exactly as long as it's actively captured, unmuted on release or clean shutdown. `§10` gains a matching error-table row. No existing spec text overridden — nothing previously said the source session would be left alone, this fills a genuine gap. See `.lattice/context/session-mute-on-capture.md`.
+- Design alignment: `§15.1` UI toolkit unchanged (`egui`/`eframe`); settings-window responsive layout, gear-navigated group settings page, and speaker-icon mute control have no prior spec text to diverge from — pure elaboration on app-shell.md's approved F9/§6.5 contracts, same posture as mixer-ui-redesign. See `.lattice/context/responsive-ui-refinement.md`.
 
 ---
 

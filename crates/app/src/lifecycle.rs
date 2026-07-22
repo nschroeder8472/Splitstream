@@ -16,6 +16,11 @@ use single_instance::SingleInstance;
 /// autostart registration (`set_autostart`) — one app, one name.
 pub const APP_ID: &str = "Splitstream";
 
+/// Every variant's `String` is read via `{:?}` at its call sites
+/// (`eprintln!`/`tracing`) for diagnostics — dead-code analysis doesn't see
+/// through the derived `Debug` impl, so the lint is a false positive here,
+/// same shape as `engine::ports::PortError::Backend(String)`.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum ShellError {
     Instance(String),
