@@ -2,6 +2,7 @@
 
 mod channel;
 mod dsp;
+mod meter;
 mod mixer;
 mod resample;
 mod sample;
@@ -10,6 +11,7 @@ mod spatial;
 
 pub use channel::ChannelMatrix;
 pub use dsp::{DspChain, DspParam, DspSpec, DspStage, EqBandSpec, Limiter, ParametricEq};
+pub use meter::{MeterLevel, PeakMeter};
 pub use mixer::{Mixer, MixerCommand, Render, Retired};
 pub use resample::{Src, SrcProgress};
 pub use sample::{

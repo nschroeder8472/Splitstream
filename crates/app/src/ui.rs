@@ -22,13 +22,14 @@
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use eframe::egui;
 
-use audio_core::{DspSpec, EqBandSpec, Gain, GroupId};
+use audio_core::{DspSpec, EqBandSpec, Gain, GroupId, MeterLevel, OutputId};
 use control::ConfigEdit;
 use engine::ports::Endpoint;
-use engine::{DuckSpecConfig, GroupConfig, MatchRule, RoutingReader, SessionInfo};
+use engine::{DuckSpecConfig, GroupConfig, MatchRule, RoutingReader, SessionInfo, StatsReader};
 
 use crate::event_pump::UiState;
 use crate::ShellAction;
@@ -89,10 +90,50 @@ struct GroupColumnCtx<'a> {
     all_sessions: &'a [SessionInfo],
     all_groups: &'a [GroupConfig],
     devices: &'a [Endpoint],
+    /// Per-group meter readings this frame (level-meters.md), keyed by
+    /// `GroupId`, polled from `StatsReader` in `ui()`.
+    group_peak: &'a [(GroupId, MeterLevel)],
     /// Responsive sizing (responsive-ui-refinement L4) — computed once per
     /// frame in `ui()` from `ui.available_size()`, shared by every column.
     width: f32,
     fader_height: f32,
+}
+
+/// Read-only data `master_column` needs besides `self`/`ui` — bundled once the
+/// meter/device-list params pushed the plain list past clippy's
+/// `too_many_arguments` threshold (operational learnings: extract at that
+/// point, same idiom as `GroupColumnCtx`). All borrows/`Copy`, so trivially
+/// `Copy`.
+#[derive(Clone, Copy)]
+struct MasterColumnCtx<'a> {
+    snapshot: &'a engine::ConfigSnapshot,
+    routes: &'a [(GroupId, Vec<SessionInfo>)],
+    all_sessions: &'a [SessionInfo],
+    output_peak: &'a [(OutputId, MeterLevel)],
+    /// Friendly device name per `OutputId` (level-meters.md) — from
+    /// `EngineStats::output_names`, so labels track the engine's real output
+    /// assignment even when a group is parked.
+    output_names: &'a [(OutputId, String)],
+    width: f32,
+    height: f32,
+}
+
+/// One frame's owned copy of everything the render pass reads out of the
+/// shared [`UiState`], taken under a single short lock by
+/// [`SettingsApp::take_frame`]. A named struct rather than a tuple: the
+/// destructure had reached twelve positional elements, the same creep the
+/// `GroupColumnCtx`/`MasterColumnCtx` extractions exist to prevent — and
+/// clippy's `too_many_arguments` doesn't police tuples. `stats` is carried
+/// whole instead of decomposed into its five separately-cloned fields.
+struct Frame {
+    snapshot: engine::ConfigSnapshot,
+    routes: Vec<(GroupId, Vec<SessionInfo>)>,
+    all_sessions: Vec<SessionInfo>,
+    degraded: bool,
+    stats: engine::EngineStats,
+    first_run: bool,
+    available_devices: Vec<Endpoint>,
+    default_output_name: Option<String>,
 }
 
 /// Which page `SettingsApp` is currently showing (responsive-ui-refinement
@@ -144,8 +185,17 @@ impl Default for OnboardingDraft {
 pub struct SettingsApp {
     ui: Arc<Mutex<UiState>>,
     routing: RoutingReader,
+    /// Polled every frame for live level meters (level-meters.md), the same
+    /// per-frame pull as `routing`. Kept distinct from `UiState.stats` on
+    /// purpose: `ui()` writes the fresh pull into `UiState.stats` so the whole
+    /// window (meters + xrun/fault footer) reads one consistent snapshot.
+    stats: StatsReader,
     actions: Sender<ShellAction>,
     drafts: HashMap<String, GroupDraft>,
+    /// Peak-hold marker state per meter, keyed by group name / device name.
+    /// UI-only (level-meters.md decision — no domain footprint); decays in
+    /// frame time inside `level_meter`.
+    holds: HashMap<String, HoldDot>,
     new_group: NewGroupDraft,
     onboarding: OnboardingDraft,
     /// Which page is showing — mixer or one group's full-screen settings
@@ -159,12 +209,19 @@ pub struct SettingsApp {
 }
 
 impl SettingsApp {
-    pub fn new(ui: Arc<Mutex<UiState>>, routing: RoutingReader, actions: Sender<ShellAction>) -> SettingsApp {
+    pub fn new(
+        ui: Arc<Mutex<UiState>>,
+        routing: RoutingReader,
+        stats: StatsReader,
+        actions: Sender<ShellAction>,
+    ) -> SettingsApp {
         SettingsApp {
             ui,
             routing,
+            stats,
             actions,
             drafts: HashMap::new(),
+            holds: HashMap::new(),
             new_group: NewGroupDraft::default(),
             onboarding: OnboardingDraft::default(),
             screen: Screen::Mixer,
@@ -181,31 +238,51 @@ impl SettingsApp {
             match_rules: group.match_rules.join(", "),
         })
     }
+
+    /// Copies this frame's view of the shared state out under one short lock.
+    /// Nothing here calls into another subsystem — every cross-thread pull
+    /// already happened before the lock was taken (see `ui`).
+    fn take_frame(&self) -> Frame {
+        let state = self.ui.lock().unwrap();
+        Frame {
+            snapshot: state.snapshot.clone(),
+            routes: state.routes.clone(),
+            all_sessions: state.all_sessions.clone(),
+            degraded: state.routing_degraded,
+            stats: state.stats.clone(),
+            first_run: state.first_run,
+            available_devices: state.available_devices.clone(),
+            default_output_name: state.default_output_name.clone(),
+        }
+    }
 }
 
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Every per-frame pull happens *before* `self.ui` is locked, never
+        // inside the lock scope. Each of these reads takes another mutex one
+        // hop down (`RoutingReader`'s, and `StatsReader`'s engine `running`
+        // cell) — and `running` is held across blocking WASAPI device opens
+        // during a rebuild, so pulling under the UI lock would stall the render
+        // thread *while holding the state every other thread needs*. Read
+        // unlocked, assign under a short lock (the recurring "blocking call
+        // under a shared lock" shape, operational learnings 2026-07-22).
+        let fresh_routes = self.routing.current_routes();
+        let fresh_degraded = self.routing.is_degraded();
+        let fresh_sessions = self.routing.all_sessions();
+        // Fresh telemetry every frame (level-meters.md L3 flow C) — feeds both
+        // the meters and the xrun/fault footer from one snapshot.
+        let fresh_stats = self.stats.stats();
         {
             let mut state = self.ui.lock().unwrap();
-            state.routes = self.routing.current_routes();
-            state.routing_degraded = self.routing.is_degraded();
-            state.all_sessions = self.routing.all_sessions();
+            state.routes = fresh_routes;
+            state.routing_degraded = fresh_degraded;
+            state.all_sessions = fresh_sessions;
+            state.stats = fresh_stats;
         }
 
-        let (snapshot, routes, all_sessions, degraded, xruns, faults, first_run, available_devices, default_output_name) = {
-            let state = self.ui.lock().unwrap();
-            (
-                state.snapshot.clone(),
-                state.routes.clone(),
-                state.all_sessions.clone(),
-                state.routing_degraded,
-                state.stats.xruns,
-                state.stats.group_faults.len(),
-                state.first_run,
-                state.available_devices.clone(),
-                state.default_output_name.clone(),
-            )
-        };
+        let Frame { snapshot, routes, all_sessions, degraded, stats, first_run, available_devices, default_output_name } =
+            self.take_frame();
 
         if first_run {
             egui::CentralPanel::default().show(ui, |ui| {
@@ -250,12 +327,22 @@ impl eframe::App for SettingsApp {
                     all_sessions: &all_sessions,
                     all_groups: &snapshot.groups,
                     devices: &available_devices,
+                    group_peak: &stats.group_peak,
                     width,
                     fader_height: height,
                 };
                 egui::ScrollArea::horizontal().show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        self.master_column(ui, &snapshot, &routes, &all_sessions, width, height);
+                        let master_ctx = MasterColumnCtx {
+                            snapshot: &snapshot,
+                            routes: &routes,
+                            all_sessions: &all_sessions,
+                            output_peak: &stats.output_peak,
+                            output_names: &stats.output_names,
+                            width,
+                            height,
+                        };
+                        self.master_column(ui, &master_ctx);
                         for (i, group) in snapshot.groups.iter().enumerate() {
                             self.group_column(ui, group, GroupId(i as u16), &group_ctx);
                         }
@@ -271,7 +358,18 @@ impl eframe::App for SettingsApp {
                 }
 
                 ui.separator();
-                ui.label(format!("xruns: {xruns}   group faults: {faults}"));
+                ui.label(format!(
+                    "xruns: {}   group faults: {}",
+                    stats.xruns,
+                    stats.group_faults.len()
+                ));
+
+                // Meters animate only while this screen is visible (L3 flow D):
+                // egui idles without input, so ask for a ~60 fps repaint here.
+                // The cost exists only when the mixer is open — closed / on the
+                // group-settings page there's no meter to drive, so no repaint
+                // request, and the tray-only idle footprint (N1) is untouched.
+                ui.ctx().request_repaint_after(Duration::from_millis(16));
             }
             Screen::GroupSettings(name) => {
                 // `screen_is_stale` above already guarantees this exists.
@@ -342,15 +440,8 @@ impl SettingsApp {
     /// *unassigned*-session pool (mixer-ui-redesign L2 decision — Master's
     /// footer, not a separate strip). Dropping a chip here unassigns it
     /// (drag-assign target `None`).
-    fn master_column(
-        &mut self,
-        ui: &mut egui::Ui,
-        snapshot: &engine::ConfigSnapshot,
-        routes: &[(GroupId, Vec<SessionInfo>)],
-        all_sessions: &[SessionInfo],
-        width: f32,
-        height: f32,
-    ) {
+    fn master_column(&mut self, ui: &mut egui::Ui, ctx: &MasterColumnCtx) {
+        let MasterColumnCtx { snapshot, routes, all_sessions, output_peak, output_names, width, height } = *ctx;
         ui.group(|ui| {
             ui.set_width(width);
             ui.vertical_centered(|ui| {
@@ -368,6 +459,25 @@ impl SettingsApp {
                     self.send(ShellAction::EditParams(vec![ConfigEdit::SetMuted(!snapshot.muted)]));
                 }
 
+                // Per-output device meters (level-meters.md): one row per
+                // distinct output device, labeled by name (positional against
+                // `EngineStats::output_peak`). These read silent under master
+                // mute — the group meters above stay live (see mixer.rs).
+                if !output_peak.is_empty() {
+                    ui.separator();
+                    ui.label("Outputs");
+                    let dt = ui.input(|i| i.stable_dt);
+                    for (id, level) in output_peak {
+                        let name = output_names
+                            .iter()
+                            .find(|(oid, _)| oid == id)
+                            .map(|(_, n)| n.as_str())
+                            .unwrap_or("output");
+                        let hold = self.holds.entry(format!("out:{name}")).or_default();
+                        output_meter_row(ui, name, *level, width * 0.6, hold, dt);
+                    }
+                }
+
                 ui.label("Routed Apps");
                 let unassigned = unassigned_sessions(all_sessions, routes);
                 if let Some(pid) = session_drop_zone(ui, &unassigned) {
@@ -383,7 +493,7 @@ impl SettingsApp {
     /// to `ctx.fader_height`, "Routed Apps" footer as a drop zone
     /// (mixer-ui-redesign L2/L3).
     fn group_column(&mut self, ui: &mut egui::Ui, group: &GroupConfig, id: GroupId, ctx: &GroupColumnCtx) {
-        let GroupColumnCtx { routes, all_sessions, all_groups, devices, width, fader_height } = *ctx;
+        let GroupColumnCtx { routes, all_sessions, all_groups, devices, group_peak, width, fader_height } = *ctx;
         let name = group.name.clone();
 
         ui.group(|ui| {
@@ -404,13 +514,20 @@ impl SettingsApp {
                     )]));
                 }
 
-                let mut gain = group.gain.value();
-                ui.spacing_mut().slider_width = fader_height;
-                if ui.add(egui::Slider::new(&mut gain, 0.0..=1.0).vertical()).changed() {
-                    if let Ok(g) = Gain::new(gain) {
-                        self.send(ShellAction::EditParams(vec![ConfigEdit::SetGroupGain(name.clone(), g)]));
+                // Fader + its post-fader level meter side by side (level-meters.md).
+                ui.horizontal(|ui| {
+                    let mut gain = group.gain.value();
+                    ui.spacing_mut().slider_width = fader_height;
+                    if ui.add(egui::Slider::new(&mut gain, 0.0..=1.0).vertical()).changed() {
+                        if let Ok(g) = Gain::new(gain) {
+                            self.send(ShellAction::EditParams(vec![ConfigEdit::SetGroupGain(name.clone(), g)]));
+                        }
                     }
-                }
+                    let dt = ui.input(|i| i.stable_dt);
+                    let level = peak_for(group_peak, id);
+                    let hold = self.holds.entry(format!("grp:{name}")).or_default();
+                    level_meter(ui, level, fader_height, hold, dt);
+                });
 
                 ui.label("Routed Apps");
                 let sessions = routed_sessions(routes, id);
@@ -651,6 +768,158 @@ impl SettingsApp {
             }
         });
     }
+}
+
+/// Fixed on-screen width of a vertical level meter's bar (level-meters.md) —
+/// narrow, sits right beside a fader.
+const METER_WIDTH: f32 = 12.0;
+/// Bottom of the meter's dB scale: signal at or below this reads as an empty
+/// bar. −60 dBFS keeps quiet-but-present signal visible without the bar looking
+/// alive on pure noise.
+const METER_FLOOR_DB: f32 = -60.0;
+/// How fast the peak-hold marker falls, in bar-fraction per second. Slow enough
+/// to catch a transient by eye, fast enough to track a dropping signal.
+const HOLD_FALL_PER_S: f32 = 0.5;
+
+const METER_GREEN: egui::Color32 = egui::Color32::from_rgb(60, 180, 90);
+const METER_AMBER: egui::Color32 = egui::Color32::from_rgb(220, 170, 40);
+const METER_RED: egui::Color32 = egui::Color32::from_rgb(220, 70, 45);
+
+/// Per-meter peak-hold marker state (level-meters.md) — UI-only, no domain
+/// footprint. `value` is the held bar fraction (0..1); it snaps up to a new
+/// peak and decays in frame time. `Default` = rest at the floor.
+#[derive(Default)]
+struct HoldDot {
+    value: f32,
+}
+
+/// Maps a linear peak to a 0..1 bar fraction on the dBFS scale (floor
+/// [`METER_FLOOR_DB`], top 0 dBFS). Pure.
+fn meter_fraction(peak: f32) -> f32 {
+    if peak <= 1.0e-6 {
+        return 0.0;
+    }
+    let db = 20.0 * peak.log10();
+    ((db - METER_FLOOR_DB) / -METER_FLOOR_DB).clamp(0.0, 1.0)
+}
+
+/// Fill color by how hot the bar is — green normal, amber approaching, red near
+/// full scale. Pure.
+fn meter_color(fraction: f32) -> egui::Color32 {
+    if fraction > 0.9 {
+        METER_RED
+    } else if fraction > 0.75 {
+        METER_AMBER
+    } else {
+        METER_GREEN
+    }
+}
+
+/// Advances a hold marker one frame: snaps up to `fraction`, else falls at
+/// [`HOLD_FALL_PER_S`]. Returns the new held value. Pure.
+fn advance_hold(previous: f32, fraction: f32, dt: f32) -> f32 {
+    (previous - HOLD_FALL_PER_S * dt).max(fraction)
+}
+
+/// dBFS label for a meter's hover text, or `-inf` at silence. Pure.
+fn peak_db_label(level: MeterLevel) -> String {
+    let db = if level.peak <= 1.0e-6 { f32::NEG_INFINITY } else { 20.0 * level.peak.log10() };
+    let clip = if level.clipped { " • clip" } else { "" };
+    if db.is_finite() {
+        format!("{db:.1} dBFS{clip}")
+    } else {
+        format!("-inf dBFS{clip}")
+    }
+}
+
+/// This frame's meter reading for `id` (level-meters.md). Unknown / not-yet-
+/// reported id reads `SILENT`, so a freshly-added group shows an empty bar
+/// rather than nothing.
+fn peak_for(peaks: &[(GroupId, MeterLevel)], id: GroupId) -> MeterLevel {
+    peaks.iter().find(|(g, _)| *g == id).map(|(_, m)| *m).unwrap_or(MeterLevel::SILENT)
+}
+
+/// Paints a peak meter into an already-allocated `rect` (level-meters.md):
+/// dB-scaled fill, zone color, peak-hold marker, red clip cap, dBFS hover.
+/// Custom paint (like [`speaker_mute_button`]) so it renders identically in any
+/// theme and carries no glyph-font risk. `vertical` picks the fill/marker/cap
+/// axis — the *only* thing that differs between the fader meter and the device
+/// row; every other rule lives here once so the two can't drift. `hold` is this
+/// meter's persistent marker state, `dt` the frame delta driving its fall.
+fn paint_meter(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    response: egui::Response,
+    level: MeterLevel,
+    hold: &mut HoldDot,
+    dt: f32,
+    vertical: bool,
+) {
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+
+    let fraction = meter_fraction(level.peak);
+    hold.value = advance_hold(hold.value, fraction, dt);
+
+    if fraction > 0.0 {
+        let fill = if vertical {
+            let fill_top = rect.max.y - rect.height() * fraction;
+            egui::Rect::from_min_max(egui::pos2(rect.min.x, fill_top), rect.max)
+        } else {
+            let fill_right = rect.min.x + rect.width() * fraction;
+            egui::Rect::from_min_max(rect.min, egui::pos2(fill_right, rect.max.y))
+        };
+        painter.rect_filled(fill, 2.0, meter_color(fraction));
+    }
+
+    if hold.value > 0.0 {
+        let held = hold.value.min(1.0);
+        let stroke = egui::Stroke::new(1.5, ui.visuals().strong_text_color());
+        if vertical {
+            let y = rect.max.y - rect.height() * held;
+            painter.hline(rect.x_range(), y, stroke);
+        } else {
+            let x = rect.min.x + rect.width() * held;
+            painter.vline(x, rect.y_range(), stroke);
+        }
+    }
+
+    if level.clipped {
+        let cap = if vertical {
+            egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, rect.min.y + 3.0))
+        } else {
+            egui::Rect::from_min_max(egui::pos2(rect.max.x - 3.0, rect.min.y), rect.max)
+        };
+        painter.rect_filled(cap, 1.0, METER_RED);
+    }
+
+    response.on_hover_text(peak_db_label(level));
+}
+
+/// Vertical peak meter beside a fader (level-meters.md): dB-scaled fill,
+/// zone-colored, peak-hold marker, red clip cap. Delegates the paint to
+/// [`paint_meter`] (vertical axis); only the fixed narrow width is meter-
+/// specific here.
+fn level_meter(ui: &mut egui::Ui, level: MeterLevel, height: f32, hold: &mut HoldDot, dt: f32) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(METER_WIDTH, height), egui::Sense::hover());
+    paint_meter(ui, rect, response, level, hold, dt, true);
+}
+
+/// Height of a horizontal device-row meter bar (level-meters.md).
+const OUTPUT_METER_HEIGHT: f32 = 10.0;
+
+/// A `name  [====  ]` row for the master column's per-output device list
+/// (level-meters.md): device name label + a horizontal peak bar. Same scale,
+/// coloring, hold, and clip semantics as [`level_meter`] — both share
+/// [`paint_meter`] (horizontal axis), laid out so a list of named devices reads
+/// cleanly.
+fn output_meter_row(ui: &mut egui::Ui, name: &str, level: MeterLevel, width: f32, hold: &mut HoldDot, dt: f32) {
+    ui.horizontal(|ui| {
+        ui.small(name);
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, OUTPUT_METER_HEIGHT), egui::Sense::hover());
+        paint_meter(ui, rect, response, level, hold, dt, false);
+    });
 }
 
 /// Custom-painted speaker icon + click sense (responsive-ui-refinement L4)
@@ -1048,4 +1317,48 @@ mod tests {
         };
         assert_eq!(chip_label(&s), "4242");
     }
+
+    #[test]
+    fn meter_fraction_maps_full_scale_to_a_full_bar() {
+        assert!((meter_fraction(1.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn meter_fraction_is_empty_at_and_below_the_floor() {
+        assert_eq!(meter_fraction(0.0), 0.0);
+        // −60 dBFS = 0.001 linear, exactly the floor → still empty.
+        assert!(meter_fraction(0.001) < 1e-3);
+    }
+
+    #[test]
+    fn meter_fraction_puts_minus_thirty_db_near_the_middle() {
+        // −30 dBFS on a −60..0 scale → 0.5.
+        let frac = meter_fraction(10f32.powf(-30.0 / 20.0));
+        assert!((frac - 0.5).abs() < 1e-3, "got {frac}");
+    }
+
+    #[test]
+    fn advance_hold_snaps_up_to_a_new_peak() {
+        assert_eq!(advance_hold(0.2, 0.8, 0.016), 0.8);
+    }
+
+    #[test]
+    fn advance_hold_decays_toward_the_floor_when_below() {
+        let next = advance_hold(0.8, 0.1, 0.1); // 100 ms
+        assert!(next < 0.8 && next > 0.1, "got {next}");
+    }
+
+    #[test]
+    fn peak_for_returns_silent_for_an_unknown_group() {
+        let peaks = vec![(GroupId(0), MeterLevel { peak: 0.5, clipped: false })];
+        assert_eq!(peak_for(&peaks, GroupId(9)), MeterLevel::SILENT);
+    }
+
+    #[test]
+    fn peak_for_finds_the_matching_group() {
+        let level = MeterLevel { peak: 0.5, clipped: true };
+        let peaks = vec![(GroupId(0), level)];
+        assert_eq!(peak_for(&peaks, GroupId(0)), level);
+    }
+
 }

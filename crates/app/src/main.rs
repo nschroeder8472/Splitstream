@@ -354,6 +354,7 @@ fn edits_to_mixer_commands(edits: &[ConfigEdit], current: &ConfigSnapshot) -> Ve
 struct Handoff {
     ui_state: Arc<Mutex<UiState>>,
     routing_reader: engine::RoutingReader,
+    stats_reader: engine::StatsReader,
     actions_tx: mpsc::Sender<ShellAction>,
 }
 
@@ -418,7 +419,12 @@ fn main() {
     // eframe owns the main thread (required on Windows/macOS); the window
     // closing sets `should_quit` so the dispatcher thread runs the real
     // shutdown sequence and exits the process.
-    let app = ui::SettingsApp::new(handoff.ui_state, handoff.routing_reader, handoff.actions_tx);
+    let app = ui::SettingsApp::new(
+        handoff.ui_state,
+        handoff.routing_reader,
+        handoff.stats_reader,
+        handoff.actions_tx,
+    );
     let _ = eframe::run_native(
         "Splitstream",
         eframe::NativeOptions::default(),
@@ -535,6 +541,7 @@ fn run_startup_and_dispatch(
         .send(Handoff {
             ui_state: Arc::clone(&ui_state),
             routing_reader,
+            stats_reader: handle.stats_reader(),
             actions_tx: actions_tx.clone(),
         })
         .is_err()
