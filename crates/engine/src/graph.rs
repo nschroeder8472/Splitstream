@@ -131,6 +131,12 @@ impl HotkeyChord {
 pub struct GraphPlan {
     pub topology: Topology,
     pub output_endpoints: Vec<(OutputId, EndpointId)>,
+    /// Friendly device name per `OutputId`, captured as each output is first
+    /// assigned (level-meters.md) — the exact name the settings UI shows in its
+    /// device pickers. Built here, by the same code that assigns `OutputId`s
+    /// across *non-parked* groups, so a parked group never shifts the mapping
+    /// the way reproducing it UI-side from `snapshot.groups` would.
+    pub output_devices: Vec<(OutputId, String)>,
 }
 
 /// Resolves group/device names against the live endpoint list. Multiple
@@ -161,6 +167,7 @@ pub fn resolve(
     let mut groups = Vec::with_capacity(snapshot.groups.len());
     let mut outputs: Vec<OutputSpec> = Vec::new();
     let mut output_endpoints: Vec<(OutputId, EndpointId)> = Vec::new();
+    let mut output_devices: Vec<(OutputId, String)> = Vec::new();
     let mut output_by_device: Vec<(&str, OutputId)> = Vec::new();
 
     for (i, g) in snapshot.groups.iter().enumerate() {
@@ -190,6 +197,7 @@ pub fn resolve(
                     format: physical.format,
                 });
                 output_endpoints.push((id, physical.id.clone()));
+                output_devices.push((id, g.output_device.clone()));
                 output_by_device.push((g.output_device.as_str(), id));
                 id
             }
@@ -238,6 +246,7 @@ pub fn resolve(
             outputs,
         },
         output_endpoints,
+        output_devices,
     })
 }
 
@@ -332,6 +341,26 @@ mod tests {
         assert_eq!(plan.topology.groups.len(), 1);
         assert_eq!(plan.topology.outputs.len(), 1);
         assert_eq!(plan.output_endpoints[0].1, EndpointId("out-1".into()));
+        // Friendly device name captured per OutputId (level-meters.md).
+        assert_eq!(plan.output_devices, vec![(OutputId(0), "Speakers".to_string())]);
+    }
+
+    #[test]
+    fn a_parked_earlier_group_does_not_shift_later_output_device_names() {
+        // Two groups on distinct devices; the first is parked. The engine must
+        // assign OutputId(0) to the *second* group's device — the exact case
+        // where reproducing the mapping from all groups UI-side would mislabel.
+        let snapshot = ConfigSnapshot {
+            schema_version: 2,
+            muted: false,
+            app: AppConfig::default(),
+            master: Gain::UNITY,
+            groups: vec![group("Music", "Speakers"), group("Game", "Headphones")],
+        };
+        let mut parked = HashSet::new();
+        parked.insert("Music".to_string());
+        let plan = resolve_test(&snapshot, &endpoints(), &parked).unwrap();
+        assert_eq!(plan.output_devices, vec![(OutputId(0), "Headphones".to_string())]);
     }
 
     #[test]

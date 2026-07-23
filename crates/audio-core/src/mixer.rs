@@ -4,6 +4,7 @@
 
 use crate::channel::ChannelMatrix;
 use crate::dsp::{db_to_linear, DspChain, DspParam, DspStage, Limiter};
+use crate::meter::{MeterLevel, PeakMeter};
 use crate::resample::Src;
 use crate::sample::{
     ChannelLayout, DomainError, DuckSpec, Format, Gain, GroupId, GroupSpec, OutputId,
@@ -269,6 +270,13 @@ struct GroupState {
     /// This group's own envelope, computed fresh every tick before any
     /// target's duck gain is applied — see `Mixer::mix_tick` phase 1.
     last_env_db: f32,
+    /// Post-fader level meter (level-meters.md): sampled on the group's
+    /// post-gain/DSP/duck signal (`scratch`), before matrix/SRC — the audible
+    /// contribution this group makes to its output. Independent of the global
+    /// mute kill (which happens at the output accumulator, not here), so the
+    /// bar reflects what the group is producing even while master is muted;
+    /// the output meter is what reads silent under mute.
+    meter: PeakMeter,
 }
 
 struct OutputState {
@@ -280,6 +288,10 @@ struct OutputState {
     /// Always-on headroom limiter (L1 capability 4) — runs after every
     /// group has summed into `accum`, before the render thread reads it.
     limiter: Limiter,
+    /// Per-output level meter (level-meters.md): sampled on the final summed +
+    /// limited signal, so it reads silent whenever the output is muted or
+    /// idle this tick.
+    meter: PeakMeter,
 }
 
 pub struct Mixer {
@@ -379,6 +391,7 @@ fn build_group(
         duck_gain,
         env_follower: EnvFollower::new(sample_rate),
         last_env_db: f32::NEG_INFINITY,
+        meter: PeakMeter::new(sample_rate),
     })
 }
 
@@ -395,6 +408,7 @@ impl Mixer {
                 filled: 0,
                 format: spec.format,
                 limiter: Limiter::new(OUTPUT_HEADROOM_CEILING_DB, spec.format, max_block_frames),
+                meter: PeakMeter::new(spec.format.sample_rate),
             });
         }
 
@@ -548,9 +562,20 @@ impl Mixer {
             }
         }
 
+        let max_block_frames = self.max_block_frames;
         for i in 0..self.groups.len() {
             let n = self.groups[i].valid_len;
             let g = &mut self.groups[i];
+
+            // Post-fader meter tap (level-meters.md): the group's fully-faded
+            // post-duck signal, at source layout, before matrix/SRC. Empty
+            // this tick (no input pushed) → decay across the nominal block so
+            // the bar falls instead of freezing at its last peak.
+            if n > 0 {
+                g.meter.observe(&g.scratch[..n], g.channels);
+            } else {
+                g.meter.observe_silence(max_block_frames);
+            }
 
             // Render stage: skipped entirely (no copy) when the matrix is
             // identity — the common case should pay nothing extra. `Spatial`
@@ -591,6 +616,15 @@ impl Mixer {
         for out in self.outputs.iter_mut() {
             let filled = out.filled;
             out.limiter.process(&mut out.accum[..filled], out.format);
+
+            // Per-output meter tap (level-meters.md): final summed + limited
+            // signal. Nothing summed this tick (muted or idle) → decay across
+            // the nominal block so the device bar falls to the floor.
+            if filled > 0 {
+                out.meter.observe(&out.accum[..filled], out.format.channels as usize);
+            } else {
+                out.meter.observe_silence(max_block_frames);
+            }
         }
     }
 
@@ -632,6 +666,27 @@ impl Mixer {
             .and_then(|g| g.duck_gain.as_ref())
             .map(|dg| dg.depth_db())
             .unwrap_or(0.0)
+    }
+
+    /// Telemetry accessor (`EngineStats::group_peak`, level-meters.md): this
+    /// group's current post-fader meter level. Unknown id: `SILENT`, same
+    /// "nothing to report" convention as the accessors above.
+    pub fn group_peak(&self, group: GroupId) -> MeterLevel {
+        self.groups
+            .iter()
+            .find(|g| g.id == group)
+            .map(|g| g.meter.sample())
+            .unwrap_or(MeterLevel::SILENT)
+    }
+
+    /// Telemetry accessor (`EngineStats::output_peak`, level-meters.md): this
+    /// output device's current post-limiter meter level. Unknown id: `SILENT`.
+    pub fn output_peak(&self, output: OutputId) -> MeterLevel {
+        self.outputs
+            .iter()
+            .find(|o| o.id == output)
+            .map(|o| o.meter.sample())
+            .unwrap_or(MeterLevel::SILENT)
     }
 }
 
@@ -750,6 +805,69 @@ mod tests {
         let mut out = vec![9.0f32; 32 * 2];
         let n = mixer.take_output(OutputId(1), &mut out);
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn group_peak_reflects_the_post_fader_signal() {
+        let topo = single_group_topology(1.0, false, 1.0);
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        let frames = vec![0.5f32; 64 * 2];
+
+        mixer.push_group(GroupId(1), &frames);
+        mixer.mix_tick();
+
+        // Sampled pre-SRC, so one tick is enough (no resampler warm-up).
+        assert!((mixer.group_peak(GroupId(1)).peak - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn group_peak_scales_with_the_fader() {
+        let topo = single_group_topology(0.5, false, 1.0);
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        let frames = vec![0.8f32; 64 * 2];
+
+        mixer.push_group(GroupId(1), &frames);
+        mixer.mix_tick();
+
+        // 0.8 signal * 0.5 fader = 0.4.
+        assert!((mixer.group_peak(GroupId(1)).peak - 0.4).abs() < 1e-3);
+    }
+
+    #[test]
+    fn group_peak_decays_when_the_group_goes_idle() {
+        let topo = single_group_topology(1.0, false, 1.0);
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+
+        mixer.push_group(GroupId(1), &vec![0.5f32; 64 * 2]);
+        mixer.mix_tick();
+        let loud = mixer.group_peak(GroupId(1)).peak;
+
+        // Ticks with nothing pushed — the idle-decay path must lower the bar.
+        for _ in 0..50 {
+            mixer.push_group(GroupId(1), &[]);
+            mixer.mix_tick();
+        }
+        assert!(mixer.group_peak(GroupId(1)).peak < loud);
+    }
+
+    #[test]
+    fn output_peak_reflects_the_summed_output() {
+        let topo = single_group_topology(1.0, false, 1.0);
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        let frames = vec![0.5f32; 64 * 2];
+
+        // Settle the resampler so the output accumulator is actually filled.
+        run_ticks(&mut mixer, GroupId(1), OutputId(1), &frames, 80);
+
+        assert!(mixer.output_peak(OutputId(1)).peak > 0.4);
+    }
+
+    #[test]
+    fn unknown_meter_ids_report_silent() {
+        let topo = single_group_topology(1.0, false, 1.0);
+        let mixer = Mixer::new(&topo, 256).unwrap();
+        assert_eq!(mixer.group_peak(GroupId(99)), MeterLevel::SILENT);
+        assert_eq!(mixer.output_peak(OutputId(99)), MeterLevel::SILENT);
     }
 
     #[test]

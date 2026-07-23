@@ -1,5 +1,12 @@
 # Review Log
 
+## 2026-07-22 — level-meters, full implementation
+- **Scope**: 5 files (audio-core meter.rs new + mixer.rs taps, engine runtime.rs telemetry + StatsReader, engine graph.rs output-name map, app ui.rs widgets + main.rs handoff) — domain + engine + shell
+- **Atoms**: clean-code, architecture, DDD, test-quality (secure-coding skipped — read-only telemetry, no trust boundary)
+- **Result**: 0 critical, 1 warning, 3 suggestion — labels-warning fixed same session; re-review of working tree confirmed no correctness/concurrency defects; open items (widget DRY between `level_meter`/`output_meter_row`, unbounded `holds` map, per-frame double-clone of stats vecs into locals) left as optional
+- **Key findings**: master-column output-meter labels reproduced the engine's `OutputId` order from `snapshot.groups`, which mislabels every device after a parked group during a device-loss episode (values correct, names wrong) — fixed by exposing a real `OutputId → name` map from `graph::resolve` through `EngineStats.output_names`; regression test added for the parked-earlier-group case
+- **Strengths**: rides the existing RT-atomic→EngineStats→poll telemetry path with zero new transport (domain stays transport-free); idle-freeze trap caught with `observe_silence`; peak+clip packed into one `AtomicU64` (no torn pair); egui 0.35 painter APIs verified against vendored source before writing; strong AAA tests incl. silence-paths-agree invariant
+
 ## 2026-07-22 — responsive-ui-refinement, full implementation
 - **Scope**: 3 files (ui.rs main delta, lifecycle.rs/logging.rs minor fixes), single shell layer
 - **Atoms**: clean-code, test-quality (architecture/DDD/secure-coding skipped — single-file/layer, no domain, no trust boundary)
@@ -111,3 +118,10 @@
 - **Result**: 0 critical, 1 warning, 2 suggestion — all 3 fixed same session
 - **Key findings**: `log_channel_conversions` called `HrirSet::embedded(rate)` a second time purely to read `.taps()` for a log line, duplicating the real construction `Render::build` already did for the same group — fixed via new pure `HrirSet::taps_for(rate)`; a doc comment in `hrir_data.rs` referenced a nonexistent `synth::ear_pair` (actual fn is the top-level `synth_pair`) — fixed; `Spatializer::process` was missing the interleaved-length `debug_assert` its sibling `ChannelMatrix::process` has — added
 - **Strengths**: `PartitionedConvolver`'s FDL overlap-save algorithm verified against 3 hand-derived closed-form test cases (unit-impulse identity, 2-tap average, 2-partition/BRIR-shaped reconstruction) before any real audio path touched it; `Render::build` fallback rule shared cleanly between the off-thread graph-build and live-toggle paths with zero duplication; full workspace (audio-core 70, control 43, engine 88, app 15) green throughout all 4 layers
+
+## 2026-07-22 — level-meters, full implementation (unreviewed working tree)
+- **Scope**: 10 files (meter.rs new) across audio-core/engine/app, domain+orchestration+shell+UI layers
+- **Atoms**: clean-code, architecture, domain-driven-design, test-quality (secure-coding skipped — no trust-boundary surface in the delta)
+- **Result**: 0 critical, 3 warning (1 severity-borderline), 5 suggestion — **all 3 warnings fixed same session** (lock hoist; `PeakMeter` flush-to-zero + 2 regression tests; 12-element tuple replaced by a named `Frame` struct carrying `EngineStats` whole). All 5 suggestions remain open. 280 workspace tests green, clippy clean.
+- **Key findings**: `ui.rs`'s per-frame `state.stats = self.stats.stats()` sits inside the `self.ui.lock()` scope while `stats()` takes the engine's `running` mutex that `apply_rebuild` holds across blocking WASAPI device opens — **4th occurrence** of this project's blocking-call-under-a-shared-lock shape, fix is hoisting the read above the lock. `PeakMeter`'s envelope now advances through silence (the frozen-bar fix) and therefore decays into permanent subnormal floats on the RT thread — needs a flush-to-zero guard. The frame-data destructure reached a 12-element tuple in the same file that had just had two ctx structs extracted for parameter-count creep.
+- **Strengths**: `paint_meter` shares one painter between the vertical fader meter and horizontal device row with `vertical` as the only axis difference, so scale/color/hold/clip semantics structurally cannot drift; `graph.rs`'s `output_devices` fixes parked-group mislabeling at the authoritative side with a test naming the exact failure case; `encode_meter` packs peak+clip into one `AtomicU64` so the pair cannot tear, with `0` decoding to `SILENT`

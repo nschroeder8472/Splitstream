@@ -17,8 +17,8 @@ use crossbeam_queue::ArrayQueue;
 use rtrb::RingBuffer;
 
 use audio_core::{
-    ChannelLayout, DomainError, DspChain, DspSpec, Format, GroupId, HrirSet, Mixer, MixerCommand,
-    OutputId, Render, Retired, Topology,
+    ChannelLayout, DomainError, DspChain, DspSpec, Format, GroupId, HrirSet, MeterLevel, Mixer,
+    MixerCommand, OutputId, Render, Retired, Topology,
 };
 
 use crate::clock::{DriftConfig, DriftController, FillSample};
@@ -131,6 +131,7 @@ pub enum EngineEvent {
     },
 }
 
+#[derive(Debug, Clone)]
 pub struct EngineStats {
     pub xruns: u64,
     pub ring_fill: Vec<(OutputId, f32)>,
@@ -142,6 +143,109 @@ pub struct EngineStats {
     /// Current duck gain reduction per group, in dB (0 = not reduced / not a
     /// duck target).
     pub duck_depth_db: Vec<(GroupId, f32)>,
+    /// Current post-fader level-meter reading per group (level-meters.md).
+    pub group_peak: Vec<(GroupId, MeterLevel)>,
+    /// Current post-limiter level-meter reading per output device.
+    pub output_peak: Vec<(OutputId, MeterLevel)>,
+    /// Friendly device name per `OutputId` (level-meters.md) — static for the
+    /// life of the graph, lets the UI label each `output_peak` entry by its
+    /// real device without reproducing the engine's `OutputId` assignment.
+    pub output_names: Vec<(OutputId, String)>,
+}
+
+/// Packs a [`MeterLevel`] into one `AtomicU64` cell: the f32 peak in the low
+/// 32 bits, the clip flag in bit 32. One atomic per meter keeps the peak and
+/// its clip flag consistent with each other across the cross-thread read (no
+/// AtomicF32 in std, and two separate atomics could tear the pair). `0` decodes
+/// to [`MeterLevel::SILENT`], so a freshly-zeroed cell is already correct.
+fn encode_meter(m: MeterLevel) -> u64 {
+    ((m.clipped as u64) << 32) | m.peak.to_bits() as u64
+}
+
+fn decode_meter(bits: u64) -> MeterLevel {
+    MeterLevel { peak: f32::from_bits(bits as u32), clipped: (bits >> 32) & 1 != 0 }
+}
+
+/// Clone-able read-only handle over the running graph's telemetry, for a
+/// thread that isn't the `EngineHandle` owner (the settings UI's per-frame
+/// meter poll — level-meters.md). Mirrors the `RoutingReader` idiom: it holds
+/// the same `Arc<Mutex<Option<RunningGraph>>>` cell, so it tracks rebuilds and
+/// reports empty stats while the engine is stopped, with no re-handoff.
+#[derive(Clone)]
+pub struct StatsReader {
+    running: Arc<Mutex<Option<RunningGraph>>>,
+}
+
+impl StatsReader {
+    pub fn stats(&self) -> EngineStats {
+        read_stats(&self.running)
+    }
+}
+
+/// Snapshots every cross-thread telemetry gauge under one short lock. Shared by
+/// `EngineHandle::stats` and `StatsReader::stats`. Empty vectors when the
+/// engine is stopped (no running graph), which the UI renders as meters at the
+/// floor.
+fn read_stats(running: &Mutex<Option<RunningGraph>>) -> EngineStats {
+    let running = running.lock().unwrap();
+    match running.as_ref() {
+        None => EngineStats {
+            xruns: 0,
+            ring_fill: Vec::new(),
+            applied_ratio: Vec::new(),
+            group_faults: Vec::new(),
+            limiter_engaged: Vec::new(),
+            duck_depth_db: Vec::new(),
+            group_peak: Vec::new(),
+            output_peak: Vec::new(),
+            output_names: Vec::new(),
+        },
+        Some(rg) => EngineStats {
+            xruns: rg.xruns.load(Ordering::Relaxed),
+            ring_fill: rg
+                .output_ids
+                .iter()
+                .zip(rg.ring_fill.iter())
+                .map(|(id, gauge)| (*id, gauge.fill_permille.load(Ordering::Relaxed) as f32 / 1000.0))
+                .collect(),
+            applied_ratio: rg
+                .output_ids
+                .iter()
+                .zip(rg.ring_fill.iter())
+                .map(|(id, gauge)| (*id, f64::from_bits(gauge.applied_ratio_bits.load(Ordering::Relaxed))))
+                .collect(),
+            // Always empty (process-loopback-capture pivot): a per-pid capture
+            // failure is isolated to that one pid, never "the whole group" —
+            // no group-level fault concept remains. Field kept for API
+            // stability (app-shell reads only its `.len()`).
+            group_faults: Vec::new(),
+            limiter_engaged: rg
+                .output_ids
+                .iter()
+                .zip(rg.limiter_engaged.iter())
+                .map(|(id, count)| (*id, count.load(Ordering::Relaxed)))
+                .collect(),
+            duck_depth_db: rg
+                .group_ids
+                .iter()
+                .zip(rg.duck_depth_db.iter())
+                .map(|(id, bits)| (*id, f32::from_bits(bits.load(Ordering::Relaxed))))
+                .collect(),
+            group_peak: rg
+                .group_ids
+                .iter()
+                .zip(rg.group_peak.iter())
+                .map(|(id, cell)| (*id, decode_meter(cell.load(Ordering::Relaxed))))
+                .collect(),
+            output_peak: rg
+                .output_ids
+                .iter()
+                .zip(rg.output_peak.iter())
+                .map(|(id, cell)| (*id, decode_meter(cell.load(Ordering::Relaxed))))
+                .collect(),
+            output_names: rg.output_devices.clone(),
+        },
+    }
 }
 
 const COMMAND_QUEUE_CAPACITY: usize = 256;
@@ -275,6 +379,15 @@ struct RunningGraph {
     /// cross-thread by `EngineHandle::stats` — same pattern as `ring_fill`.
     duck_depth_db: Arc<Vec<AtomicU32>>,
     limiter_engaged: Arc<Vec<AtomicU64>>,
+    /// Level-meter gauges (level-meters.md), one packed `AtomicU64` per group /
+    /// per output — written by the mixer thread each tick, read cross-thread by
+    /// `stats`. Same publish pattern as `duck_depth_db`; index order matches
+    /// `group_ids` / `output_ids`.
+    group_peak: Arc<Vec<AtomicU64>>,
+    output_peak: Arc<Vec<AtomicU64>>,
+    /// Friendly device name per `OutputId` (level-meters.md) — fixed at build,
+    /// surfaced verbatim via `EngineStats::output_names`.
+    output_devices: Vec<(OutputId, String)>,
 }
 
 pub struct EngineHandle {
@@ -361,60 +474,15 @@ impl EngineHandle {
     }
 
     pub fn stats(&self) -> EngineStats {
-        let running = self.running.lock().unwrap();
-        match running.as_ref() {
-            None => EngineStats {
-                xruns: 0,
-                ring_fill: Vec::new(),
-                applied_ratio: Vec::new(),
-                group_faults: Vec::new(),
-                limiter_engaged: Vec::new(),
-                duck_depth_db: Vec::new(),
-            },
-            Some(rg) => EngineStats {
-                xruns: rg.xruns.load(Ordering::Relaxed),
-                ring_fill: rg
-                    .output_ids
-                    .iter()
-                    .zip(rg.ring_fill.iter())
-                    .map(|(id, gauge)| {
-                        (
-                            *id,
-                            gauge.fill_permille.load(Ordering::Relaxed) as f32 / 1000.0,
-                        )
-                    })
-                    .collect(),
-                applied_ratio: rg
-                    .output_ids
-                    .iter()
-                    .zip(rg.ring_fill.iter())
-                    .map(|(id, gauge)| {
-                        (
-                            *id,
-                            f64::from_bits(gauge.applied_ratio_bits.load(Ordering::Relaxed)),
-                        )
-                    })
-                    .collect(),
-                // Always empty (process-loopback-capture pivot): a per-pid
-                // capture failure is isolated to that one pid, never "the
-                // whole group" — there is no group-level fault concept left
-                // to report. Field kept for API stability (app-shell reads
-                // only its `.len()`).
-                group_faults: Vec::new(),
-                limiter_engaged: rg
-                    .output_ids
-                    .iter()
-                    .zip(rg.limiter_engaged.iter())
-                    .map(|(id, count)| (*id, count.load(Ordering::Relaxed)))
-                    .collect(),
-                duck_depth_db: rg
-                    .group_ids
-                    .iter()
-                    .zip(rg.duck_depth_db.iter())
-                    .map(|(id, bits)| (*id, f32::from_bits(bits.load(Ordering::Relaxed))))
-                    .collect(),
-            },
-        }
+        read_stats(&self.running)
+    }
+
+    /// A `Clone`-able read-only stats handle (level-meters.md) for a second
+    /// thread — the settings UI polls it every frame for live meters, the same
+    /// idiom as `RoutingHandle::reader`. Shares the same `running` cell, so it
+    /// reflects rebuilds without any re-handoff.
+    pub fn stats_reader(&self) -> StatsReader {
+        StatsReader { running: Arc::clone(&self.running) }
     }
 
     /// Add/remove-stage change (P5): builds each group's new `DspChain`
@@ -920,6 +988,7 @@ fn build_running_graph(
         .map(|g| (g.id, g.output))
         .collect();
     let output_endpoints: Vec<(OutputId, EndpointId)> = opened.plan.output_endpoints.clone();
+    let output_devices: Vec<(OutputId, String)> = opened.plan.output_devices.clone();
     let group_formats: Vec<(GroupId, Format)> = opened
         .plan
         .topology
@@ -946,6 +1015,10 @@ fn build_running_graph(
             .map(|_| AtomicU64::new(0))
             .collect::<Vec<_>>(),
     );
+    // Level-meter gauges (level-meters.md): 0 == encode_meter(SILENT), so a
+    // freshly-built graph already reports silent bars before the first tick.
+    let group_peak = Arc::new(group_ids.iter().map(|_| AtomicU64::new(0)).collect::<Vec<_>>());
+    let output_peak = Arc::new(output_ids.iter().map(|_| AtomicU64::new(0)).collect::<Vec<_>>());
 
     let (fault_tx, fault_rx) = mpsc::channel();
     let group_consumers = build_group_slots(&opened.plan, &group_output_index);
@@ -963,6 +1036,8 @@ fn build_running_graph(
         sys: Arc::clone(sys),
         duck_depth_db: Arc::clone(&duck_depth_db),
         limiter_engaged: Arc::clone(&limiter_engaged),
+        group_peak: Arc::clone(&group_peak),
+        output_peak: Arc::clone(&output_peak),
         capture_rx,
     };
     let mixer_thread = thread::spawn(move || {
@@ -987,6 +1062,9 @@ fn build_running_graph(
         max_block_frames,
         duck_depth_db,
         limiter_engaged,
+        group_peak,
+        output_peak,
+        output_devices,
     })
 }
 
@@ -1089,6 +1167,8 @@ struct MixerThreadArgs {
     sys: Arc<dyn AudioSystem>,
     duck_depth_db: Arc<Vec<AtomicU32>>,
     limiter_engaged: Arc<Vec<AtomicU64>>,
+    group_peak: Arc<Vec<AtomicU64>>,
+    output_peak: Arc<Vec<AtomicU64>>,
     /// `CaptureControl::apply_capture_sources` sends per-pid add/remove here —
     /// drained once per tick, same as `persistent.commands`.
     capture_rx: Receiver<CaptureMsg>,
@@ -1132,7 +1212,7 @@ fn mixer_loop(
             &mut real_this_tick,
         );
         mixer.mix_tick();
-        update_dsp_telemetry(&mixer, &group_ids, &args.duck_depth_db, &output_ids, &args.limiter_engaged);
+        update_telemetry(&mixer, &group_ids, &output_ids, &args);
         flush_outputs(
             &mut output_producers,
             &mut output_scratch,
@@ -1147,25 +1227,22 @@ fn mixer_loop(
     }
 }
 
-/// Copies this tick's DSP telemetry (P5) out of the `Mixer` into the
-/// cross-thread gauges `EngineHandle::stats` reads — same pattern as
-/// `RingGauge`. Must run after `mix_tick` (duck depth) and before
-/// `take_output` isn't required (limiter engagement reflects the buffer
-/// `mix_tick` already finished processing).
-fn update_dsp_telemetry(
-    mixer: &Mixer,
-    group_ids: &[GroupId],
-    duck_depth_db: &[AtomicU32],
-    output_ids: &[OutputId],
-    limiter_engaged: &[AtomicU64],
-) {
+/// Copies this tick's telemetry (P5 DSP gauges + level-meters.md peak meters)
+/// out of the `Mixer` into the cross-thread gauges `stats` reads — same pattern
+/// as `RingGauge`. Runs after `mix_tick`, so every reading reflects the buffer
+/// `mix_tick` just finished processing; `take_output` (which clears the
+/// accumulator) has not run yet, so the output meter still sees this tick's
+/// audio.
+fn update_telemetry(mixer: &Mixer, group_ids: &[GroupId], output_ids: &[OutputId], args: &MixerThreadArgs) {
     for (i, id) in group_ids.iter().enumerate() {
-        duck_depth_db[i].store(mixer.group_duck_depth_db(*id).to_bits(), Ordering::Relaxed);
+        args.duck_depth_db[i].store(mixer.group_duck_depth_db(*id).to_bits(), Ordering::Relaxed);
+        args.group_peak[i].store(encode_meter(mixer.group_peak(*id)), Ordering::Relaxed);
     }
     for (i, id) in output_ids.iter().enumerate() {
         if mixer.output_limiter_engaged(*id) {
-            limiter_engaged[i].fetch_add(1, Ordering::Relaxed);
+            args.limiter_engaged[i].fetch_add(1, Ordering::Relaxed);
         }
+        args.output_peak[i].store(encode_meter(mixer.output_peak(*id)), Ordering::Relaxed);
     }
 }
 
@@ -1782,7 +1859,36 @@ mod tests {
         assert_eq!(stats.duck_depth_db.len(), 1); // one group in `snapshot()`
         assert_eq!(stats.duck_depth_db[0], (GroupId(0), 0.0)); // no duck configured
         assert_eq!(stats.limiter_engaged.len(), 1); // one output in `snapshot()`
+        // Level meters (level-meters.md): one gauge per group / per output,
+        // keyed by the same ids, silent under the mock's no-signal capture.
+        assert_eq!(stats.group_peak.len(), 1);
+        assert_eq!(stats.group_peak[0].0, GroupId(0));
+        assert_eq!(stats.output_peak.len(), 1);
+        assert_eq!(stats.output_peak[0].0, OutputId(0));
+        // Device-name mapping for the master-column labels (level-meters.md).
+        assert_eq!(stats.output_names.len(), 1);
+        assert_eq!(stats.output_names[0].0, OutputId(0));
         handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_stats_reader_sees_the_same_gauges_as_the_handle() {
+        let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(mock_endpoints()));
+        let handle = start(&snapshot(), sys).unwrap();
+        let reader = handle.stats_reader();
+        sleep(Duration::from_millis(30));
+
+        // The clone-able reader is what the UI thread holds; it must report the
+        // same shape as the owning handle while the engine runs.
+        let via_reader = reader.clone().stats();
+        assert_eq!(via_reader.group_peak.len(), handle.stats().group_peak.len());
+        assert_eq!(via_reader.output_peak.len(), handle.stats().output_peak.len());
+
+        handle.shutdown().unwrap();
+        // After the graph stops, the same reader reports empty (the UI renders
+        // this as meters at the floor), never a stale panic.
+        assert!(reader.stats().group_peak.is_empty());
+        assert!(reader.stats().output_peak.is_empty());
     }
 
     #[test]
