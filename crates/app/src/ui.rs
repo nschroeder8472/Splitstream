@@ -19,7 +19,7 @@
 //! in-progress state to protect, so they read the live value fresh every
 //! frame like the gain/duck sliders already do.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -134,6 +134,7 @@ struct Frame {
     first_run: bool,
     available_devices: Vec<Endpoint>,
     default_output_name: Option<String>,
+    rebuild_generation: u64,
 }
 
 /// Which page `SettingsApp` is currently showing (responsive-ui-refinement
@@ -206,6 +207,13 @@ pub struct SettingsApp {
     /// default, matching the mockup's floating button rather than today's
     /// always-inline row.
     show_new_group_panel: bool,
+    /// Session-only solo set, keyed by group name (per-group-mute-solo.md
+    /// decision 5: UI-owned, not shell-owned). A `HashSet` because multiple
+    /// groups may be soloed at once.
+    soloed: HashSet<String>,
+    /// Last `UiState.rebuild_generation` this UI has reacted to — a jump
+    /// clears `soloed` (decision 8).
+    seen_generation: u64,
 }
 
 impl SettingsApp {
@@ -226,6 +234,8 @@ impl SettingsApp {
             onboarding: OnboardingDraft::default(),
             screen: Screen::Mixer,
             show_new_group_panel: false,
+            soloed: HashSet::new(),
+            seen_generation: 0,
         }
     }
 
@@ -253,8 +263,29 @@ impl SettingsApp {
             first_run: state.first_run,
             available_devices: state.available_devices.clone(),
             default_output_name: state.default_output_name.clone(),
+            rebuild_generation: state.rebuild_generation,
         }
     }
+}
+
+/// Rebuild-generation jump clears the session-only solo set (decision 8,
+/// resolves open question 1). Pure so the clear-on-rebuild rule is
+/// unit-testable without an egui frame.
+fn clear_solo_on_rebuild(soloed: &mut HashSet<String>, seen: &mut u64, current: u64) {
+    if current != *seen {
+        soloed.clear();
+        *seen = current;
+    }
+}
+
+/// Mute-excludes-dim precedence for the "silenced by someone else's solo"
+/// visual state (per-group-mute-solo.md L1 capability 7). A muted group is
+/// already visually distinct via its own lit M button, so it's deliberately
+/// excluded here rather than double-marked. Pure, so this precedence is
+/// unit-testable without an egui frame — same rationale as
+/// `clear_solo_on_rebuild`.
+fn is_dimmed_by_other_solo(solo_active: bool, is_soloed: bool, muted: bool) -> bool {
+    solo_active && !is_soloed && !muted
 }
 
 impl eframe::App for SettingsApp {
@@ -281,8 +312,18 @@ impl eframe::App for SettingsApp {
             state.stats = fresh_stats;
         }
 
-        let Frame { snapshot, routes, all_sessions, degraded, stats, first_run, available_devices, default_output_name } =
-            self.take_frame();
+        let Frame {
+            snapshot,
+            routes,
+            all_sessions,
+            degraded,
+            stats,
+            first_run,
+            available_devices,
+            default_output_name,
+            rebuild_generation,
+        } = self.take_frame();
+        clear_solo_on_rebuild(&mut self.soloed, &mut self.seen_generation, rebuild_generation);
 
         if first_run {
             egui::CentralPanel::default().show(ui, |ui| {
@@ -425,6 +466,7 @@ impl SettingsApp {
                 dsp: Vec::new(),
                 duck: None,
                 spatial: false,
+                muted: false,
             };
             self.send(ShellAction::EditStructure(vec![
                 ConfigEdit::AddGroup(group),
@@ -496,8 +538,18 @@ impl SettingsApp {
         let GroupColumnCtx { routes, all_sessions, all_groups, devices, group_peak, width, fader_height } = *ctx;
         let name = group.name.clone();
 
+        // Solo scope is global (decision 3): `self.soloed` is the one set for
+        // every column, not per-output. Silenced-by-someone-else's-solo is
+        // its own dim state, distinct from this group's own (lit) mute.
+        let solo_active = !self.soloed.is_empty();
+        let is_soloed = self.soloed.contains(&name);
+        let dimmed_by_other_solo = is_dimmed_by_other_solo(solo_active, is_soloed, group.muted);
+
         ui.group(|ui| {
             ui.set_width(width);
+            if dimmed_by_other_solo {
+                ui.multiply_opacity(0.5);
+            }
             ui.vertical_centered(|ui| {
                 ui.horizontal(|ui| {
                     ui.strong(&group.name);
@@ -514,7 +566,8 @@ impl SettingsApp {
                     )]));
                 }
 
-                // Fader + its post-fader level meter side by side (level-meters.md).
+                // Fader + its post-fader level meter + M/S toggles
+                // (per-group-mute-solo.md), side by side (level-meters.md).
                 ui.horizontal(|ui| {
                     let mut gain = group.gain.value();
                     ui.spacing_mut().slider_width = fader_height;
@@ -527,6 +580,26 @@ impl SettingsApp {
                     let level = peak_for(group_peak, id);
                     let hold = self.holds.entry(format!("grp:{name}")).or_default();
                     level_meter(ui, level, fader_height, hold, dt);
+
+                    ui.vertical(|ui| {
+                        let mute_color = ui.visuals().error_fg_color;
+                        if toggle_button(ui, "M", group.muted, mute_color) {
+                            self.send(ShellAction::EditParams(vec![ConfigEdit::SetGroupMute(
+                                name.clone(),
+                                !group.muted,
+                            )]));
+                        }
+                        let solo_color = ui.visuals().warn_fg_color;
+                        if toggle_button(ui, "S", is_soloed, solo_color) {
+                            let on = !is_soloed;
+                            if on {
+                                self.soloed.insert(name.clone());
+                            } else {
+                                self.soloed.remove(&name);
+                            }
+                            self.send(ShellAction::SetSolo(name.clone(), on));
+                        }
+                    });
                 });
 
                 ui.label("Routed Apps");
@@ -761,6 +834,7 @@ impl SettingsApp {
                     dsp: Vec::new(),
                     duck: None,
                     spatial: false,
+                    muted: false,
                 };
                 self.send(ShellAction::EditStructure(vec![ConfigEdit::AddGroup(group)]));
                 self.new_group = NewGroupDraft::default();
@@ -966,6 +1040,23 @@ fn speaker_mute_button(ui: &mut egui::Ui, muted: bool) -> bool {
     response.on_hover_text(if muted { "Unmute" } else { "Mute" }).clicked()
 }
 
+/// Plain-letter toggle (M / S) — ASCII only, no glyph-font risk unlike an
+/// emoji-range icon; `speaker_mute_button`'s custom paint isn't needed for a
+/// letter. Returns whether clicked this frame — holds no state of its own,
+/// caller flips its own bool/set.
+fn toggle_button(ui: &mut egui::Ui, label: &str, active: bool, tint: egui::Color32) -> bool {
+    let text = if active {
+        egui::RichText::new(label).strong().color(egui::Color32::WHITE)
+    } else {
+        egui::RichText::new(label).strong()
+    };
+    let mut button = egui::Button::new(text);
+    if active {
+        button = button.fill(tint);
+    }
+    ui.add(button).clicked()
+}
+
 /// Reusable device picker — replaces `text_edit_singleline` at every call
 /// site (onboarding, existing-group output, new-group output). Returns true
 /// on selection change; `id_source` must be unique among all comboboxes
@@ -1142,6 +1233,7 @@ mod tests {
             dsp: Vec::new(),
             duck: None,
             spatial: false,
+            muted: false,
         }
     }
 
@@ -1361,4 +1453,47 @@ mod tests {
         assert_eq!(peak_for(&peaks, GroupId(0)), level);
     }
 
+    #[test]
+    fn a_bumped_rebuild_generation_clears_the_solo_set() {
+        let mut soloed: HashSet<String> = ["Game".to_string()].into_iter().collect();
+        let mut seen = 3;
+
+        clear_solo_on_rebuild(&mut soloed, &mut seen, 4);
+
+        assert!(soloed.is_empty());
+        assert_eq!(seen, 4);
+    }
+
+    #[test]
+    fn an_unchanged_rebuild_generation_leaves_the_solo_set_alone() {
+        let mut soloed: HashSet<String> = ["Game".to_string()].into_iter().collect();
+        let mut seen = 3;
+
+        clear_solo_on_rebuild(&mut soloed, &mut seen, 3);
+
+        assert_eq!(soloed, ["Game".to_string()].into_iter().collect());
+        assert_eq!(seen, 3);
+    }
+
+    #[test]
+    fn a_non_soloed_unmuted_group_is_dimmed_while_another_group_is_soloed() {
+        assert!(is_dimmed_by_other_solo(true, false, false));
+    }
+
+    #[test]
+    fn the_soloed_group_itself_is_not_dimmed() {
+        assert!(!is_dimmed_by_other_solo(true, true, false));
+    }
+
+    #[test]
+    fn a_muted_group_is_not_dimmed_even_when_silenced_by_another_groups_solo() {
+        // Mute wins over solo (per-group-mute-solo.md decision 2) and already
+        // shows its own lit M button -- dimming on top would double-mark it.
+        assert!(!is_dimmed_by_other_solo(true, false, true));
+    }
+
+    #[test]
+    fn no_group_is_dimmed_when_solo_is_inactive() {
+        assert!(!is_dimmed_by_other_solo(false, false, false));
+    }
 }

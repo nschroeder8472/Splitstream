@@ -38,6 +38,10 @@ pub struct GroupConfig {
     /// Per-group virtual-surround/stereo-widen toggle (spatial-audio.md) —
     /// mirrors `audio_core::GroupSpec.spatial`.
     pub spatial: bool,
+    /// Persisted per-group mute (per-group-mute-solo.md) — mirrors
+    /// `audio_core::GroupSpec.mute`. No `solo` counterpart: solo is
+    /// session-only, never sourced from config.
+    pub muted: bool,
 }
 
 /// Pairs a stage's construction spec with its persisted bypass state.
@@ -236,6 +240,7 @@ pub fn resolve(
             dsp: g.dsp.iter().map(|s| s.spec.clone()).collect(),
             duck,
             spatial: g.spatial,
+            mute: g.muted,
         });
     }
 
@@ -296,6 +301,7 @@ mod tests {
             dsp: Vec::new(),
             duck: None,
             spatial: false,
+            muted: false,
         }
     }
 

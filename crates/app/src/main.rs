@@ -54,6 +54,10 @@ pub enum ShellAction {
     /// scalar value.
     EditSpatial(Vec<ConfigEdit>),
     ToggleMute,
+    /// Session-only per-group solo (per-group-mute-solo.md). Deliberately NOT
+    /// an `EditParams` variant: `apply_params` always follows the mixer
+    /// command with `store.apply`, and solo must never reach TOML.
+    SetSolo(String, bool),
     ShowSettings,
     Quit,
 }
@@ -77,6 +81,11 @@ struct Dispatcher {
     ui: Arc<Mutex<UiState>>,
     current: ConfigSnapshot,
     shared_ctx: Arc<Mutex<Option<eframe::egui::Context>>>,
+    /// Bumped on every mixer rebuild (per-group-mute-solo.md decision 8) so
+    /// the settings window can drop its session-only solo set. Published to
+    /// `UiState` in `set_current`, never re-derived by the UI from a snapshot
+    /// diff or `EngineHandle::epoch()` (that also bumps on DSP chain swaps).
+    rebuild_generation: u64,
 }
 
 enum Outcome {
@@ -100,6 +109,7 @@ impl Dispatcher {
 
         let mut ui = self.ui.lock().unwrap();
         ui.snapshot = snapshot.clone();
+        ui.rebuild_generation = self.rebuild_generation;
         if ui.first_run {
             ui.first_run = needs_onboarding(&snapshot);
         }
@@ -133,6 +143,7 @@ impl Dispatcher {
             if let Err(e) = self.handle.rebuild(&new_snapshot) {
                 eprintln!("rebuild failed: {e:?}");
             }
+            self.rebuild_generation += 1;
             self.routing.update_rules(group_rules(&new_snapshot));
         } else {
             if !delta.params.is_empty() {
@@ -156,10 +167,22 @@ impl Dispatcher {
                 if let Err(e) = self.handle.rebuild(&new_snapshot) {
                     eprintln!("rebuild failed: {e:?}");
                 }
+                self.rebuild_generation += 1;
                 self.routing.update_rules(group_rules(&new_snapshot));
                 self.set_current(new_snapshot);
             }
             Err(e) => eprintln!("structural edit rejected: {e:?}"),
+        }
+    }
+
+    /// Flow B (solo): session-only, resolved against the *current* snapshot's
+    /// positional `GroupId` like `apply_params`, but with no `store.apply`
+    /// call at all — solo must never reach TOML (decision 1).
+    fn apply_solo(&mut self, name: &str, on: bool) {
+        if let Some(id) = control::group_id_for(&self.current, name) {
+            if let Err(e) = self.handle.apply_params(vec![audio_core::MixerCommand::SetGroupSolo(id, on)]) {
+                eprintln!("apply_params (solo) failed: {e:?}");
+            }
         }
     }
 
@@ -269,6 +292,7 @@ impl Dispatcher {
                 let muted = !self.current.muted;
                 self.apply_params(&[ConfigEdit::SetMuted(muted)]);
             }
+            ShellAction::SetSolo(name, on) => self.apply_solo(&name, on),
             ShellAction::ShowSettings => self.focus_window(),
             ShellAction::Quit => return Outcome::Quit,
         }
@@ -291,6 +315,9 @@ fn edits_to_mixer_commands(edits: &[ConfigEdit], current: &ConfigSnapshot) -> Ve
             ConfigEdit::SetMuted(muted) => Some(MixerCommand::SetMuted(*muted)),
             ConfigEdit::SetFollowMaster(name, follow) => {
                 control::group_id_for(current, name).map(|id| MixerCommand::SetFollowMaster(id, *follow))
+            }
+            ConfigEdit::SetGroupMute(name, muted) => {
+                control::group_id_for(current, name).map(|id| MixerCommand::SetGroupMute(id, *muted))
             }
             ConfigEdit::SetEqBand(name, band, spec) => {
                 let group = current.groups.iter().find(|g| &g.name == name)?;
@@ -514,6 +541,7 @@ fn run_startup_and_dispatch(
         available_devices: endpoints,
         default_output_name: default_output_endpoint.map(|ep| ep.name),
         all_sessions: routing.all_sessions(),
+        rebuild_generation: 0,
     }));
 
     let (actions_tx, actions_rx) = mpsc::channel::<ShellAction>();
@@ -556,6 +584,7 @@ fn run_startup_and_dispatch(
         ui: ui_state,
         current: snapshot,
         shared_ctx,
+        rebuild_generation: 0,
     };
     while !should_quit.load(Ordering::Relaxed) {
         match config_rx.recv_timeout(Duration::from_millis(50)) {
@@ -610,6 +639,7 @@ mod tests {
                 dsp: Vec::new(),
                 duck: None,
                 spatial: false,
+                muted: false,
             }],
             app: engine::AppConfig::default(),
         }
@@ -690,5 +720,16 @@ mod tests {
         assert_eq!(commands.len(), 2);
         assert!(matches!(commands[0], MixerCommand::SetMaster(g) if g == Gain::new(0.7).unwrap()));
         assert!(matches!(commands[1], MixerCommand::SetMuted(true)));
+    }
+
+    #[test]
+    fn edits_to_mixer_commands_maps_set_group_mute() {
+        let snapshot = snapshot_with_group("Game");
+        let edits = vec![ConfigEdit::SetGroupMute("Game".into(), true)];
+
+        let commands = edits_to_mixer_commands(&edits, &snapshot);
+
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(commands[0], MixerCommand::SetGroupMute(GroupId(0), true)));
     }
 }

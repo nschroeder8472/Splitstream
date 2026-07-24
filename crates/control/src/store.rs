@@ -26,6 +26,10 @@ pub enum ConfigEdit {
     SetMaster(Gain),
     SetMuted(bool),
     SetFollowMaster(String, bool),
+    /// Persisted per-group mute (per-group-mute-solo.md). Solo is
+    /// deliberately not here -- it is session-only and reaches the mixer via
+    /// `ShellAction::SetSolo`, never through `ConfigStore`.
+    SetGroupMute(String, bool),
     SetGroupOutput(String, String),
     AddGroup(GroupConfig),
     RemoveGroup(String),
@@ -126,6 +130,9 @@ fn apply_edit(doc: &mut DocumentMut, edit: &ConfigEdit) -> Result<(), StoreError
         }
         ConfigEdit::SetFollowMaster(name, follow) => {
             find_group_table(doc, name)?["follow_master"] = value(*follow);
+        }
+        ConfigEdit::SetGroupMute(name, muted) => {
+            find_group_table(doc, name)?["muted"] = value(*muted);
         }
         ConfigEdit::SetGroupOutput(name, device) => {
             find_group_table(doc, name)?["output_device"] = value(device.as_str());
@@ -318,6 +325,7 @@ fn group_table(g: &GroupConfig) -> Table {
     t["gain"] = value(g.gain.value() as f64);
     t["follow_master"] = value(g.follow_master);
     t["spatial"] = value(g.spatial);
+    t["muted"] = value(g.muted);
     t["match_rules"] = value(string_array(&g.match_rules));
     if !g.dsp.is_empty() {
         let mut arr = ArrayOfTables::new();
@@ -433,6 +441,7 @@ follow_master = true
             dsp: Vec::new(),
             duck: None,
             spatial: false,
+            muted: false,
         };
         let snapshot = store.apply(&[ConfigEdit::AddGroup(added)]).unwrap();
         assert_eq!(snapshot.groups.len(), 2);
@@ -596,6 +605,24 @@ output_device = "Speakers"
 
         let snapshot = store.apply(&[ConfigEdit::SetSpatial("Game".into(), false)]).unwrap();
         assert!(!snapshot.groups[0].spatial);
+    }
+
+    #[test]
+    fn set_group_mute_then_unset_round_trips_through_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let snapshot = store
+            .apply(&[ConfigEdit::SetGroupMute("Game".into(), true)])
+            .unwrap();
+        assert!(snapshot.groups[0].muted);
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("# master volume"), "comment must survive an edit");
+        assert!(on_disk.contains("muted = true"));
+
+        let snapshot = store.apply(&[ConfigEdit::SetGroupMute("Game".into(), false)]).unwrap();
+        assert!(!snapshot.groups[0].muted);
     }
 
     #[test]

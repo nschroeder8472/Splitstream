@@ -82,6 +82,12 @@ pub enum MixerCommand {
     /// every group's contribution to every output. Gain/master smoothers
     /// keep running so unmute resumes at the same value with no re-ramp.
     SetMuted(bool),
+    /// Per-group output-stage kill, persisted in config. Same skip point as
+    /// `SetMuted` (after matrix/SRC), so smoothers and the resampler stay warm.
+    SetGroupMute(GroupId, bool),
+    /// Session-only solo, never persisted. Any group soloed puts the whole
+    /// mixer in solo mode: non-soloed groups are silenced on every output.
+    SetGroupSolo(GroupId, bool),
     /// Param tweak or bypass toggle on a pre-allocated stage — smoothed
     /// internally, never a stepped change (notes §8).
     SetDspParam {
@@ -233,6 +239,12 @@ struct GroupState {
     output: OutputId,
     channels: usize,
     follow_master: bool,
+    /// Persisted per-group kill (per-group-mute-solo.md). `GroupSpec.mute`
+    /// precedent.
+    mute: bool,
+    /// Session-only; never sourced from `GroupSpec` -- every rebuild starts
+    /// unsoloed (decision 5).
+    solo: bool,
     gain: Smoothed,
     // Each group carries its own copy of the master ramp rather than sharing
     // one Smoothed across groups: push_group() advances it sample-by-sample,
@@ -299,6 +311,14 @@ pub struct Mixer {
     groups: Vec<GroupState>,
     outputs: Vec<OutputState>,
     muted: bool,
+}
+
+/// The single effective-silence rule (decision 2: mute wins over solo). Free
+/// function, not a method -- it needs one group and one flag, and keeping it
+/// callable from both phase 1 and phase 3 of `mix_tick` avoids a second borrow
+/// of `self`.
+fn silenced(g: &GroupState, solo_active: bool) -> bool {
+    g.mute || (solo_active && !g.solo)
 }
 
 /// A `Format`'s `layout` must describe exactly as many speakers as
@@ -373,6 +393,8 @@ fn build_group(
         output: gspec.output,
         channels,
         follow_master: gspec.follow_master,
+        mute: gspec.mute,
+        solo: false,
         gain: Smoothed::new(gspec.gain.value(), sample_rate, GAIN_TIME_CONSTANT_S),
         master: Smoothed::new(topology.master.value(), sample_rate, GAIN_TIME_CONSTANT_S),
         render,
@@ -425,6 +447,12 @@ impl Mixer {
         })
     }
 
+    /// Derived once per `mix_tick`, never cached (decision 6: a maintained
+    /// counter is state that can desync from the flags it summarizes).
+    fn solo_active(&self) -> bool {
+        self.groups.iter().any(|g| g.solo)
+    }
+
     /// Unknown ids are dropped silently: the command ring may still carry a
     /// stale-epoch command past the point its group/output was torn down.
     /// Returns the retired chain/render on `SwapChain`/`SwapRender` — the
@@ -457,6 +485,18 @@ impl Mixer {
             }
             MixerCommand::SetMuted(muted) => {
                 self.muted = muted;
+                None
+            }
+            MixerCommand::SetGroupMute(id, mute) => {
+                if let Some(g) = self.groups.iter_mut().find(|g| g.id == id) {
+                    g.mute = mute;
+                }
+                None
+            }
+            MixerCommand::SetGroupSolo(id, solo) => {
+                if let Some(g) = self.groups.iter_mut().find(|g| g.id == id) {
+                    g.solo = solo;
+                }
                 None
             }
             MixerCommand::SetDspParam { group, stage, param } => {
@@ -534,10 +574,20 @@ impl Mixer {
     /// matrix -> SRC -> sum per group (phase 3), then the always-on
     /// per-output headroom limiter (phase 4).
     pub fn mix_tick(&mut self) {
+        let solo_active = self.solo_active();
+
         for i in 0..self.groups.len() {
             let g = &mut self.groups[i];
             let n = g.valid_len;
-            g.last_env_db = g.env_follower.process_block(&g.scratch[..n], g.channels);
+            let env = g.env_follower.process_block(&g.scratch[..n], g.channels);
+            // Ballistics always advance (frozen-meter learning, 2026-07-22);
+            // only the published trigger env is forced down for a silenced
+            // group, so it stops driving any duck target (decision 4).
+            g.last_env_db = if silenced(g, solo_active) {
+                f32::NEG_INFINITY
+            } else {
+                env
+            };
         }
 
         for i in 0..self.groups.len() {
@@ -596,8 +646,9 @@ impl Mixer {
             // Output-stage kill: gain/chain/duck/matrix/SRC still ran above
             // (smoothers and resampler state stay warm), only the write into
             // the shared output accumulator is skipped — unmute resumes with
-            // no re-ramp or glitch.
-            if self.muted {
+            // no re-ramp or glitch. Per-group mute/solo silencing rides the
+            // same skip point.
+            if self.muted || silenced(g, solo_active) {
                 continue;
             }
 
@@ -724,6 +775,7 @@ mod tests {
                 dsp: Vec::new(),
                 duck: None,
                 spatial: false,
+                mute: false,
             }],
             outputs: vec![OutputSpec {
                 id: OutputId(1),
@@ -894,6 +946,7 @@ mod tests {
                 dsp: Vec::new(),
                 duck: None,
                 spatial: false,
+                mute: false,
             }],
             outputs: vec![],
         };
@@ -919,6 +972,7 @@ mod tests {
                 dsp: Vec::new(),
                 duck: None,
                 spatial: false,
+                mute: false,
             }],
             outputs: vec![OutputSpec {
                 id: OutputId(1),
@@ -941,6 +995,7 @@ mod tests {
                 dsp: Vec::new(),
                 duck: None,
                 spatial: false,
+                mute: false,
             }],
             outputs: vec![OutputSpec {
                 id: OutputId(1),
@@ -994,6 +1049,197 @@ mod tests {
     }
 
     #[test]
+    fn a_muted_group_contributes_nothing_while_other_groups_still_sum() {
+        let topo = Topology {
+            master: Gain::UNITY,
+            groups: vec![
+                GroupSpec {
+                    id: GroupId(1),
+                    gain: Gain::UNITY,
+                    follow_master: false,
+                    output: OutputId(1),
+                    input_format: stereo(48_000),
+                    dsp: Vec::new(),
+                    duck: None,
+                    spatial: false,
+                    mute: true,
+                },
+                GroupSpec {
+                    id: GroupId(2),
+                    gain: Gain::UNITY,
+                    follow_master: false,
+                    output: OutputId(1),
+                    input_format: stereo(48_000),
+                    dsp: Vec::new(),
+                    duck: None,
+                    spatial: false,
+                    mute: false,
+                },
+            ],
+            outputs: vec![OutputSpec {
+                id: OutputId(1),
+                format: stereo(48_000),
+            }],
+        };
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        let frames = vec![0.5f32; 64 * 2];
+
+        let mut settled = Vec::new();
+        for _ in 0..80 {
+            mixer.push_group(GroupId(1), &frames);
+            mixer.push_group(GroupId(2), &frames);
+            mixer.mix_tick();
+            let mut out = vec![0.0f32; 128 * 2];
+            let n = mixer.take_output(OutputId(1), &mut out);
+            settled = out[..n].to_vec();
+        }
+
+        assert!(!settled.is_empty());
+        for &s in &settled {
+            assert!(
+                (s - 0.5).abs() < 1e-2,
+                "expected only group 2's 0.5 to sum (group 1 muted), got {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn solo_silences_every_non_soloed_group_across_outputs() {
+        let topo = Topology {
+            master: Gain::UNITY,
+            groups: vec![
+                GroupSpec {
+                    id: GroupId(1),
+                    gain: Gain::UNITY,
+                    follow_master: false,
+                    output: OutputId(1),
+                    input_format: stereo(48_000),
+                    dsp: Vec::new(),
+                    duck: None,
+                    spatial: false,
+                    mute: false,
+                },
+                GroupSpec {
+                    id: GroupId(2),
+                    gain: Gain::UNITY,
+                    follow_master: false,
+                    output: OutputId(2),
+                    input_format: stereo(48_000),
+                    dsp: Vec::new(),
+                    duck: None,
+                    spatial: false,
+                    mute: false,
+                },
+            ],
+            outputs: vec![
+                OutputSpec { id: OutputId(1), format: stereo(48_000) },
+                OutputSpec { id: OutputId(2), format: stereo(48_000) },
+            ],
+        };
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        mixer.apply(MixerCommand::SetGroupSolo(GroupId(1), true));
+        let frames = vec![0.5f32; 64 * 2];
+
+        let mut soloed_output_produced_audio = false;
+        let mut non_soloed_output_ever_produced_samples = false;
+        for _ in 0..80 {
+            mixer.push_group(GroupId(1), &frames);
+            mixer.push_group(GroupId(2), &frames);
+            mixer.mix_tick();
+            let mut out1 = vec![0.0f32; 128 * 2];
+            let n1 = mixer.take_output(OutputId(1), &mut out1);
+            if n1 > 0 {
+                soloed_output_produced_audio = true;
+            }
+            let mut out2 = vec![0.0f32; 128 * 2];
+            let n2 = mixer.take_output(OutputId(2), &mut out2);
+            if n2 > 0 {
+                non_soloed_output_ever_produced_samples = true;
+            }
+        }
+
+        assert!(soloed_output_produced_audio, "soloed group's output should produce audio");
+        assert!(
+            !non_soloed_output_ever_produced_samples,
+            "non-soloed group's output must never sum any samples across all outputs"
+        );
+    }
+
+    #[test]
+    fn an_explicitly_muted_group_stays_silent_while_soloed() {
+        let topo = Topology {
+            master: Gain::UNITY,
+            groups: vec![GroupSpec {
+                id: GroupId(1),
+                gain: Gain::UNITY,
+                follow_master: false,
+                output: OutputId(1),
+                input_format: stereo(48_000),
+                dsp: Vec::new(),
+                duck: None,
+                spatial: false,
+                mute: true,
+            }],
+            outputs: vec![OutputSpec {
+                id: OutputId(1),
+                format: stereo(48_000),
+            }],
+        };
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        mixer.apply(MixerCommand::SetGroupSolo(GroupId(1), true));
+        let frames = vec![0.5f32; 64 * 2];
+
+        let collected = run_ticks(&mut mixer, GroupId(1), OutputId(1), &frames, 80);
+
+        assert!(
+            collected.is_empty(),
+            "an explicitly muted group must stay silent even while soloed, got {} samples",
+            collected.len()
+        );
+    }
+
+    #[test]
+    fn a_silenced_group_stops_triggering_its_duck_target() {
+        let topo = two_group_topology(); // GroupId(1) trigger, GroupId(2) ducks under it
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        mixer.apply(MixerCommand::SetGroupMute(GroupId(1), true));
+        let loud_trigger = vec![0.8f32; 64 * 2];
+        let target = vec![0.5f32; 64 * 2];
+
+        for _ in 0..80 {
+            mixer.push_group(GroupId(1), &loud_trigger);
+            mixer.push_group(GroupId(2), &target);
+            mixer.mix_tick();
+            let mut out = vec![0.0f32; 128 * 2];
+            mixer.take_output(OutputId(1), &mut out);
+        }
+
+        assert!(
+            mixer.group_duck_depth_db(GroupId(2)) < 0.5,
+            "a silenced (muted) trigger must not duck its target, got {} dB",
+            mixer.group_duck_depth_db(GroupId(2))
+        );
+    }
+
+    #[test]
+    fn a_muted_groups_own_meter_stays_live() {
+        let topo = single_group_topology(1.0, false, 1.0);
+        let mut mixer = Mixer::new(&topo, 256).unwrap();
+        mixer.apply(MixerCommand::SetGroupMute(GroupId(1), true));
+        let frames = vec![0.5f32; 64 * 2];
+
+        mixer.push_group(GroupId(1), &frames);
+        mixer.mix_tick();
+
+        // Sampled pre-skip (mixer.rs meter tap), so a muted group's own bar
+        // must keep reading its unrouted signal — same invariant as master mute.
+        assert!(
+            (mixer.group_peak(GroupId(1)).peak - 0.5).abs() < 1e-3,
+            "a muted group's own meter must stay live"
+        );
+    }
+
+    #[test]
     fn format_layout_disagreeing_with_channel_count_is_rejected() {
         let bad_format = Format {
             sample_rate: 48_000,
@@ -1011,6 +1257,7 @@ mod tests {
                 dsp: Vec::new(),
                 duck: None,
                 spatial: false,
+                mute: false,
             }],
             outputs: vec![OutputSpec {
                 id: OutputId(1),
@@ -1042,6 +1289,7 @@ mod tests {
                     release_ms: 200.0,
                 }),
                 spatial: false,
+                mute: false,
             }],
             outputs: vec![OutputSpec {
                 id: OutputId(1),
@@ -1067,6 +1315,7 @@ mod tests {
                     dsp: Vec::new(),
                     duck: None,
                     spatial: false,
+                    mute: false,
                 },
                 GroupSpec {
                     id: GroupId(2), // target — e.g. music, ducks under GroupId(1)
@@ -1083,6 +1332,7 @@ mod tests {
                         release_ms: 200.0,
                     }),
                     spatial: false,
+                    mute: false,
                 },
             ],
             outputs: vec![OutputSpec {
@@ -1210,6 +1460,7 @@ mod tests {
                 dsp: vec![DspSpec::Limiter { ceiling_db: -6.0 }],
                 duck: None,
                 spatial: false,
+                mute: false,
             }],
             outputs: vec![OutputSpec {
                 id: OutputId(1),
@@ -1248,6 +1499,7 @@ mod tests {
                     dsp: Vec::new(),
                     duck: None,
                     spatial: false,
+                    mute: false,
                 },
                 GroupSpec {
                     id: GroupId(2),
@@ -1258,6 +1510,7 @@ mod tests {
                     dsp: Vec::new(),
                     duck: None,
                     spatial: false,
+                    mute: false,
                 },
             ],
             outputs: vec![OutputSpec {
@@ -1313,6 +1566,7 @@ mod tests {
                 dsp: Vec::new(),
                 duck: None,
                 spatial: true,
+                mute: false,
             }],
             outputs: vec![OutputSpec {
                 id: OutputId(1),
