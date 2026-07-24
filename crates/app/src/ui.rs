@@ -302,6 +302,15 @@ fn clear_solo_on_rebuild(soloed: &mut HashSet<String>, seen: &mut u64, current: 
     }
 }
 
+/// Whether the mixer screen should keep asking for the steady ~60fps repaint
+/// that drives the live meters. `ctx.input(|i| i.focused)` is false whenever
+/// the user alt-tabs away (egui's own definition -- input_state/mod.rs),
+/// with nothing of the meters visible to animate; requesting repaint anyway
+/// burns CPU/GPU with no window in the foreground to show for it.
+fn should_repaint_for_meters(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.focused)
+}
+
 /// Mute-excludes-dim precedence for the "silenced by someone else's solo"
 /// visual state (per-group-mute-solo.md L1 capability 7). A muted group is
 /// already visually distinct via its own lit M button, so it's deliberately
@@ -438,19 +447,24 @@ impl eframe::App for SettingsApp {
                     self.add_group_controls(ui, &available_devices);
                 }
 
-                ui.separator();
-                ui.label(format!(
-                    "xruns: {}   group faults: {}",
-                    stats.xruns,
-                    stats.group_faults.len()
-                ));
-
                 // Meters animate only while this screen is visible (L3 flow D):
-                // egui idles without input, so ask for a ~60 fps repaint here.
-                // The cost exists only when the mixer is open — closed / on the
-                // group-settings page there's no meter to drive, so no repaint
-                // request, and the tray-only idle footprint (N1) is untouched.
-                ui.ctx().request_repaint_after(Duration::from_millis(16));
+                // egui idles without input, so ask for a repaint here. Full
+                // ~60fps only while a meter has real signal or a hold marker
+                // is still decaying (meters_have_motion) — dragging a widget
+                // already wakes eframe via its own input events regardless of
+                // this schedule. Otherwise fall back to a slow idle-rate
+                // repaint, just fast enough to notice when audio resumes.
+                // No repaint at all when closed, on the group-settings page,
+                // or backgrounded (`focused` is false) — the tray-only idle
+                // footprint (N1) is untouched either way.
+                if should_repaint_for_meters(ui.ctx()) {
+                    let interval = if meters_have_motion(&stats.group_peak, &stats.output_peak, &self.holds) {
+                        METER_REPAINT_ACTIVE_MS
+                    } else {
+                        METER_REPAINT_IDLE_MS
+                    };
+                    ui.ctx().request_repaint_after(Duration::from_millis(interval));
+                }
             }
             Screen::GroupSettings(name) => {
                 // `screen_is_stale` above already guarantees this exists.
@@ -948,6 +962,13 @@ const METER_FLOOR_DB: f32 = -60.0;
 /// How fast the peak-hold marker falls, in bar-fraction per second. Slow enough
 /// to catch a transient by eye, fast enough to track a dropping signal.
 const HOLD_FALL_PER_S: f32 = 0.5;
+/// Repaint interval while a meter has real signal or a hold marker is still
+/// decaying — ~60fps, smooth enough for the bars/handles to read as live.
+const METER_REPAINT_ACTIVE_MS: u64 = 16;
+/// Repaint interval while every meter is silent and settled — cheap on
+/// CPU/GPU, still fast enough that resumed audio is noticeable almost
+/// immediately rather than looking frozen.
+const METER_REPAINT_IDLE_MS: u64 = 250;
 
 const METER_GREEN: egui::Color32 = egui::Color32::from_rgb(60, 180, 90);
 const METER_AMBER: egui::Color32 = egui::Color32::from_rgb(220, 170, 40);
@@ -987,6 +1008,21 @@ fn meter_color(fraction: f32) -> egui::Color32 {
 /// [`HOLD_FALL_PER_S`]. Returns the new held value. Pure.
 fn advance_hold(previous: f32, fraction: f32, dt: f32) -> f32 {
     (previous - HOLD_FALL_PER_S * dt).max(fraction)
+}
+
+/// Whether any level meter has real signal or a still-decaying hold marker to
+/// animate. If every meter is silent and settled, continuous ~60fps repaint
+/// has nothing visible to drive — the caller falls back to a slow idle-rate
+/// repaint instead, just fast enough to notice when audio resumes.
+fn meters_have_motion(
+    group_peak: &[(GroupId, MeterLevel)],
+    output_peak: &[(OutputId, MeterLevel)],
+    holds: &HashMap<String, HoldDot>,
+) -> bool {
+    let is_active = |level: &MeterLevel| level.peak > 1.0e-6 || level.clipped;
+    group_peak.iter().any(|(_, l)| is_active(l))
+        || output_peak.iter().any(|(_, l)| is_active(l))
+        || holds.values().any(|h| h.value > 0.0)
 }
 
 /// dBFS label for a meter's hover text, or `-inf` at silence. Pure.
@@ -2091,6 +2127,31 @@ mod tests {
     }
 
     #[test]
+    fn meters_do_not_request_repaint_while_the_window_is_unfocused() {
+        // Regression: the mixer screen used to call request_repaint_after
+        // unconditionally, burning CPU/GPU at ~60fps even when the user had
+        // alt-tabbed away and there was nothing visible to animate.
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::empty());
+        let input = egui::RawInput { focused: false, ..Default::default() };
+
+        let _ = ctx.run_ui(input, |ctx| {
+            assert!(!should_repaint_for_meters(ctx), "an unfocused window must not request a meter repaint");
+        });
+    }
+
+    #[test]
+    fn meters_request_repaint_while_the_window_is_focused() {
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::empty());
+        let input = egui::RawInput { focused: true, ..Default::default() };
+
+        let _ = ctx.run_ui(input, |ctx| {
+            assert!(should_repaint_for_meters(ctx), "a focused window must still request the meter repaint");
+        });
+    }
+
+    #[test]
     fn meter_fraction_maps_full_scale_to_a_full_bar() {
         assert!((meter_fraction(1.0) - 1.0).abs() < 1e-6);
     }
@@ -2118,6 +2179,40 @@ mod tests {
     fn advance_hold_decays_toward_the_floor_when_below() {
         let next = advance_hold(0.8, 0.1, 0.1); // 100 ms
         assert!(next < 0.8 && next > 0.1, "got {next}");
+    }
+
+    #[test]
+    fn meters_have_motion_is_false_when_everything_is_silent_and_settled() {
+        let silent = MeterLevel { peak: 0.0, clipped: false };
+        let group_peak = vec![(GroupId(0), silent)];
+        let output_peak = vec![(OutputId(0), silent)];
+        let holds = HashMap::new();
+
+        assert!(!meters_have_motion(&group_peak, &output_peak, &holds));
+    }
+
+    #[test]
+    fn meters_have_motion_is_true_when_a_group_has_signal() {
+        let loud = MeterLevel { peak: 0.5, clipped: false };
+        let group_peak = vec![(GroupId(0), loud)];
+
+        assert!(meters_have_motion(&group_peak, &[], &HashMap::new()));
+    }
+
+    #[test]
+    fn meters_have_motion_is_true_when_an_output_is_clipped_even_at_zero_peak() {
+        let clipped = MeterLevel { peak: 0.0, clipped: true };
+        let output_peak = vec![(OutputId(0), clipped)];
+
+        assert!(meters_have_motion(&[], &output_peak, &HashMap::new()));
+    }
+
+    #[test]
+    fn meters_have_motion_is_true_while_a_hold_marker_is_still_decaying() {
+        let mut holds = HashMap::new();
+        holds.insert("grp:Game".to_string(), HoldDot { value: 0.2 });
+
+        assert!(meters_have_motion(&[], &[], &holds));
     }
 
     #[test]
