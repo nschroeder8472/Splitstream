@@ -32,6 +32,7 @@ use engine::ports::Endpoint;
 use engine::{DuckSpecConfig, GroupConfig, MatchRule, RoutingReader, SessionInfo, StatsReader};
 
 use crate::event_pump::UiState;
+use crate::icons::IconCache;
 use crate::ShellAction;
 
 /// Drag payload: a session's pid. `Any + Send + Sync` (egui dnd requirement) —
@@ -228,6 +229,8 @@ pub struct SettingsApp {
     /// text needs draft state, same reasoning as `GroupDraft.match_rules`.
     /// Never persisted; transient UI state only.
     search: String,
+    /// Path-keyed session chip icon cache (app-icons.md).
+    icons: IconCache,
 }
 
 impl SettingsApp {
@@ -251,6 +254,7 @@ impl SettingsApp {
             soloed: HashSet::new(),
             seen_generation: 0,
             search: String::new(),
+            icons: IconCache::new(),
         }
     }
 
@@ -305,6 +309,11 @@ fn is_dimmed_by_other_solo(solo_active: bool, is_soloed: bool, muted: bool) -> b
 
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Drains finished icon extractions and spawns the worker on first
+        // call (app-icons.md decision 10 — needs a live `Context`, the
+        // earliest point being here, not `SettingsApp::new`).
+        self.icons.poll(ui.ctx());
+
         // Every per-frame pull happens *before* `self.ui` is locked, never
         // inside the lock scope. Each of these reads takes another mutex one
         // hop down (`RoutingReader`'s, and `StatsReader`'s engine `running`
@@ -553,7 +562,7 @@ impl SettingsApp {
                     groups: &snapshot.groups,
                     any_sessions: !all_sessions.is_empty(),
                 };
-                match session_drop_zone(ui, &zone_ctx) {
+                match session_drop_zone(ui, &zone_ctx, &mut self.icons) {
                     Some(ChipAction::Dropped(pid)) => self.handle_drop(pid, None, all_sessions, &snapshot.groups),
                     Some(ChipAction::Assign { pid, target }) => {
                         self.handle_drop(pid, target.as_deref(), all_sessions, &snapshot.groups)
@@ -644,7 +653,7 @@ impl SettingsApp {
                     groups: all_groups,
                     any_sessions: !all_sessions.is_empty(),
                 };
-                match session_drop_zone(ui, &zone_ctx) {
+                match session_drop_zone(ui, &zone_ctx, &mut self.icons) {
                     Some(ChipAction::Dropped(pid)) => self.handle_drop(pid, Some(&name), all_sessions, all_groups),
                     Some(ChipAction::Assign { pid, target }) => {
                         self.handle_drop(pid, target.as_deref(), all_sessions, all_groups)
@@ -1185,6 +1194,51 @@ fn toggle_button(ui: &mut egui::Ui, label: &str, active: bool, tint: egui::Color
     ui.add(button).clicked()
 }
 
+/// Chip icon slot, in points. Fixed so the tile->icon swap never shifts
+/// layout (app-icons.md capability 7).
+const CHIP_ICON_SIZE: f32 = 16.0;
+
+/// Icon or fallback tile for one session, drawn at [`CHIP_ICON_SIZE`]. A
+/// cache miss still draws the tile this frame and returns immediately — the
+/// icon swaps in on a later frame once the worker finishes (capability 2).
+fn chip_icon(ui: &mut egui::Ui, icons: &mut IconCache, session: &SessionInfo) {
+    match icons.texture(&session.process_path) {
+        Some(handle) => {
+            ui.add(egui::Image::new((handle.id(), egui::vec2(CHIP_ICON_SIZE, CHIP_ICON_SIZE))));
+        }
+        None => letter_tile(ui, &chip_label(session), CHIP_ICON_SIZE),
+    }
+}
+
+/// Custom-painted fallback (per `speaker_mute_button`/`paint_meter`'s
+/// precedent, after this codebase's emoji-range tofu problem): a rounded
+/// square in [`tile_color`] with the label's first character centered. Shown
+/// while an icon is pending, on extraction failure, and for a pid-only
+/// session with no process path (capability 3).
+fn letter_tile(ui: &mut egui::Ui, label: &str, size: f32) {
+    let (rect, _response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 3.0, tile_color(label));
+    let letter = label.chars().next().map_or_else(String::new, |c| c.to_ascii_uppercase().to_string());
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        letter,
+        egui::FontId::proportional(size * 0.6),
+        ui.visuals().strong_text_color(),
+    );
+}
+
+/// Stable per-label tile color — pure, so identical labels always agree
+/// (app-icons.md capability 3). A fixed saturation/value keeps every tile
+/// readable regardless of label; only the hue varies, derived from a simple
+/// byte hash so the same label always lands on the same hue.
+fn tile_color(label: &str) -> egui::Color32 {
+    let hash = label.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(u32::from(b)));
+    let hue = (hash % 360) as f32 / 360.0;
+    egui::ecolor::Hsva::new(hue, 0.45, 0.55, 1.0).into()
+}
+
 /// Reusable device picker — replaces `text_edit_singleline` at every call
 /// site (onboarding, existing-group output, new-group output). Returns true
 /// on selection change; `id_source` must be unique among all comboboxes
@@ -1327,8 +1381,12 @@ fn chip_context_menu(
 /// Renders a chip zone: filters `ctx.sessions` against `ctx.query`, shows the
 /// matching empty state when nothing remains, and returns whichever gesture —
 /// drop or menu assign — fired this frame (decision 7: both collapse onto the
-/// same `handle_drop` at the call site, so they cannot diverge).
-fn session_drop_zone(ui: &mut egui::Ui, ctx: &ChipZoneCtx) -> Option<ChipAction> {
+/// same `handle_drop` at the call site, so they cannot diverge). `icons` is a
+/// separate parameter rather than a `ChipZoneCtx` field (app-icons.md's own
+/// coordination note proposed the latter) — `ChipZoneCtx` is `Copy` and passed
+/// as `&ChipZoneCtx`, and a `&mut IconCache` field on it could never be
+/// reborrowed back out through that shared reference.
+fn session_drop_zone(ui: &mut egui::Ui, ctx: &ChipZoneCtx, icons: &mut IconCache) -> Option<ChipAction> {
     let zone_had_chips = !ctx.sessions.is_empty();
     let shown: Vec<&SessionInfo> = ctx.sessions.iter().filter(|s| session_matches(s, ctx.query)).collect();
 
@@ -1343,7 +1401,10 @@ fn session_drop_zone(ui: &mut egui::Ui, ctx: &ChipZoneCtx) -> Option<ChipAction>
             let id = egui::Id::new(("session-chip", session.pid));
             let response = ui
                 .dnd_drag_source(id, DragSession(session.pid), |ui| {
-                    ui.label(chip_label(session));
+                    ui.horizontal(|ui| {
+                        chip_icon(ui, icons, session);
+                        ui.label(chip_label(session));
+                    });
                 })
                 .response;
             if let Some(choice) = chip_context_menu(ui, response.rect, id, ctx.groups, ctx.current_group) {
@@ -1838,6 +1899,16 @@ mod tests {
         let level = MeterLevel { peak: 0.5, clipped: true };
         let peaks = vec![(GroupId(0), level)];
         assert_eq!(peak_for(&peaks, GroupId(0)), level);
+    }
+
+    #[test]
+    fn tile_color_is_stable_for_the_same_label() {
+        assert_eq!(tile_color("Google Chrome"), tile_color("Google Chrome"));
+    }
+
+    #[test]
+    fn tile_color_differs_across_distinct_labels() {
+        assert_ne!(tile_color("Google Chrome"), tile_color("Discord"));
     }
 
     #[test]

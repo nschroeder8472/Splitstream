@@ -2,7 +2,7 @@
 feature: app-icons
 requirement_doc: null
 created: 2026-07-22
-status: approved
+status: complete
 note: >
   Roadmap Priority 2 (.lattice/ux-gap-roadmap.md). Real exe icons on the
   session chips, which are bare text today (often `game.exe`). No requirement
@@ -310,6 +310,7 @@ Plus the new member in the workspace `members` list.
 | 11 | 2026-07-22 | **`IconCache`'s public surface is `texture(&mut self, path) -> Option<TextureHandle>`, returning a clone; `IconSlot` stays private.** | An accessor handing back `Option<&IconSlot>` would hold a mutable borrow of the cache across the chip's rendering, fighting the `&mut egui::Ui` in the same scope. Cloning a `TextureHandle` is a refcount bump. Collapsing the enum out of the public API also means "pending", "failed" and "no path" are one case at the call site — exactly what decision 4 wanted (one fallback path). |
 | 12 | 2026-07-22 | **`extract_icon_rgba` must handle the all-zero-alpha legacy icon case**, and the real-environment test asserts on it. | A 24 bpp icon's DIB decodes with every alpha byte `0`; shipped verbatim that is a fully transparent texture — an invisible icon that looks exactly like "extraction silently didn't work", with no error to trace. Found by reasoning through the DIB contract at design time; the `#[ignore]`d real-exe test is written to fail on it rather than leaving it to a bug report. |
 | 13 | 2026-07-22 | **Design approved at Level 4. Status set to `approved` — ready for implementation.** | All four level sections persisted; no open questions. |
+| 14 | 2026-07-23 | **Implementation complete**, inside-out (`win-shell` crate -> `app::icons` -> `app::ui`). Two real corrections found before/during implementation, both fixed: (1) the blueprint's stated `win-shell` Cargo.toml feature list omitted `Win32_UI_WindowsAndMessaging` — `ExtractIconExW`, `DestroyIcon`, `GetIconInfo`, `ICONINFO`, and `HICON` all live under it, confirmed by reading the pinned `windows` 0.62.2 source before writing any code, not assumed from the design doc; (2) the coordination note proposing `ChipZoneCtx` absorb a `&mut IconCache` field doesn't compile — `ChipZoneCtx` is `Copy` and passed as `&ChipZoneCtx`, and a unique reference nested in a field can never be reborrowed back out through a shared reference to the struct. `session_drop_zone` instead takes `icons: &mut IconCache` as its own parameter. RAII cleanup uses `windows_core::Owned<HICON>`/`Owned<HBITMAP>` (both already implement the crate's own `Free` trait) rather than hand-written guard structs — "prefer the simpler path" over what the design's Grounding implied would be needed. All 6 planned test contracts present; the real-exe `#[ignore]` test was run manually against `notepad.exe` and the extracted icon was additionally dumped to a BMP and visually inspected (correct colors, correct orientation) — not just dimension/alpha-checked. Full workspace suite green (320 tests) and `cargo clippy --workspace --all-targets` clean. | Verified against the real diff before closing. No live-app screenshot: no project skill exists for launching this native desktop GUI, and the higher-risk code (the Win32/GDI pipeline) was already empirically verified; the remaining UI wiring is a plain, type-checked call site. |
 
 ## Open Questions
 
@@ -357,3 +358,25 @@ a new `win-shell` crate rather than stretching `win-audio`'s name or breaching
 all-zero-alpha legacy icon decoding to an invisible texture (decision 12), and
 the invisible dependency on the level meters' repaint for icons to ever appear
 (decision 10).
+
+**Traps caught during implementation, not design** — the Cargo.toml feature
+gap and the `ChipZoneCtx`/`&mut IconCache` borrow-check dead end (decision 14).
+
+**Found and fixed by `/review` (2026-07-23)** — `IconCache`'s decisions 4 and 5
+(path-keyed dedup, negative caching) had zero test coverage despite being pure
+`HashMap`-state assertions with no Win32 dependency. Added
+`a_failed_extraction_is_never_retried` and `a_pending_path_is_not_enqueued_twice`,
+both verified discriminating. See the operational learning — fourth occurrence
+this session-block of a new type's single most load-bearing guarantee shipping
+untested.
+
+## Key Files
+
+| Path | Role |
+|---|---|
+| crates/win-shell/Cargo.toml | New workspace member; `windows` feature list |
+| crates/win-shell/src/lib.rs | `IconImage`, `extract_icon_rgba` — the only `unsafe` this feature adds |
+| crates/app/src/icons.rs | `IconCache` (private `IconSlot`), `spawn_icon_worker` |
+| crates/app/src/ui.rs | `CHIP_ICON_SIZE`, `chip_icon`, `letter_tile`, `tile_color`; `session_drop_zone` gains `icons: &mut IconCache`; `SettingsApp.icons`; `poll()` called once per frame in `ui()` |
+| crates/app/src/main.rs | `mod icons;` |
+| crates/app/Cargo.toml, Cargo.toml | `win-shell` dependency; new workspace member |

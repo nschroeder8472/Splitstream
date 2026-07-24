@@ -25,3 +25,4 @@ tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "time"] }
 tray-icon = "0.24.1"
 win-audio = { version = "0.1.0", path = "../win-audio" }
+win-shell = { version = "0.1.0", path = "../win-shell" }

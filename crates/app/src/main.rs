@@ -11,6 +11,7 @@
 
 mod event_pump;
 mod hotkeys;
+mod icons;
 mod lifecycle;
 mod logging;
 mod paths;

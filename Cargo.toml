@@ -4,6 +4,7 @@ members = [
     "crates/audio-core",
     "crates/engine",
     "crates/win-audio",
+    "crates/win-shell",
     "crates/control",
     "crates/app",
 ]
