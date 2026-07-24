@@ -151,6 +151,11 @@ pub struct EngineStats {
     /// life of the graph, lets the UI label each `output_peak` entry by its
     /// real device without reproducing the engine's `OutputId` assignment.
     pub output_names: Vec<(OutputId, String)>,
+    /// Each group's input sample rate (graphical-eq.md). The EQ curve needs
+    /// it to draw the response the filter actually applies -- at 128 kHz a
+    /// treble bell is ~3 dB wider than the same band drawn at 48 kHz. Static
+    /// for the life of the graph.
+    pub group_rates: Vec<(GroupId, u32)>,
 }
 
 /// Packs a [`MeterLevel`] into one `AtomicU64` cell: the f32 peak in the low
@@ -199,6 +204,7 @@ fn read_stats(running: &Mutex<Option<RunningGraph>>) -> EngineStats {
             group_peak: Vec::new(),
             output_peak: Vec::new(),
             output_names: Vec::new(),
+            group_rates: Vec::new(),
         },
         Some(rg) => EngineStats {
             xruns: rg.xruns.load(Ordering::Relaxed),
@@ -244,6 +250,7 @@ fn read_stats(running: &Mutex<Option<RunningGraph>>) -> EngineStats {
                 .map(|(id, cell)| (*id, decode_meter(cell.load(Ordering::Relaxed))))
                 .collect(),
             output_names: rg.output_devices.clone(),
+            group_rates: rg.group_formats.iter().map(|(id, fmt)| (*id, fmt.sample_rate)).collect(),
         },
     }
 }

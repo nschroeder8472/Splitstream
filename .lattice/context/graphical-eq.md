@@ -2,7 +2,7 @@
 feature: graphical-eq
 requirement_doc: null
 created: 2026-07-22
-status: approved
+status: complete
 note: >
   Roadmap Priority 6 (.lattice/ux-gap-roadmap.md). Multi-band EQ with a
   draggable response curve and built-in preset curves. No requirement spec —
@@ -100,6 +100,8 @@ gain automation.
 | 13 | 2026-07-22 | **`SetEqBand` gains a stage index: `SetEqBand(group, stage, band, spec)`.** | Today it is `SetEqBand(group, band, spec)` and `store.rs:147` resolves the stage via `find_dsp_stage_mut(group, name, "eq")` — the *first* EQ stage; `edits_to_mixer_commands` does the same with `.position(|s| matches!(s.spec, DspSpec::Eq{..}))`. Under decision 11 (one editor per stage), dragging a handle in the second EQ would silently retune the first. Found by tracing flow B, not at implementation time. |
 | 14 | 2026-07-22 | **The real per-group sample rate is exposed to the UI** as `EngineStats.group_rates: Vec<(GroupId, u32)>`, falling back to 48 kHz only when the engine is stopped. | Measured: drawing a 15 kHz Q=1 +6 dB bell at an assumed 48 kHz when the group actually runs at 128 kHz is wrong by **1.34 dB at 10 kHz, 2.07 dB at 18 kHz and 2.97 dB at 20 kHz** — the drawn bell is visibly narrower than what is heard (44.1 kHz vs 128 kHz spans 3.6 dB at 20 kHz). The peak at f0 is always exact, so the error is entirely in the skirts. Below ~5 kHz every rate agrees within 0.1 dB, so the lie is confined to the top two octaves — but there it is half the boost the user asked for, which directly contradicts decision 10's purpose. Plumbing turned out to be nearly free: `RunningGraph.group_formats` already exists (runtime.rs:373) and is already cloned under the lock at two call sites, so this is one field plus one `read_stats` line. Rejected: nominal 48 kHz constant (zero engine change, exact for the common case, but ~3 dB wrong for treble bands elsewhere); drawing the rate-free analog prototype (lands near the 128 kHz curve, so equally wrong for a 44.1 kHz group, and cannot be tested against the real transfer function); clamping the plot to 10 kHz (defensible curve, but an EQ that cannot place a treble band is a real capability loss). |
 | 15 | 2026-07-22 | **Design approved at Level 4. Status set to `approved` — ready for implementation.** | All four level sections persisted; no open questions. |
+| 16 | 2026-07-23 | **Implementation complete**, layer-by-layer (audio-core -> engine -> control -> shell -> UI, the biggest feature yet across all 4 crates). `eq_response_db` built directly on `Biquad::set_coeffs_peaking` (same-file private access), never a second derivation; its pinning test independently measures a real filtered sine wave, not just re-evaluates the same formula. `SetEqBand`'s stage-index bug (decision 13) fixed at both the store layer (index-based lookup, not first-type-match) and the shell layer (`edits_to_mixer_commands` uses the index directly), each verified with its own regression test using two real EQ stages. `SetEqBands` fully replaces the bands array-of-tables rather than mutating in place — incidentally immune to the old inline-array-shape trap by construction, not by reuse of the existing guard. One test-contract layer mismatch: `set_eq_bands_is_a_chain_edit_not_a_param` was listed under "control" but has no home there (`control` has no `ShellAction`/routing concept) — written in `app::main.rs`'s own test module instead, alongside the mapping it actually tests. All 11 planned test contracts present plus one bonus (`edits_to_mixer_commands_maps_set_eq_band_using_its_own_stage_index`). Full workspace suite green (337 tests) and `cargo clippy --workspace --all-targets` clean. Diff matches the L2 component table exactly, no scope creep. | Verified against the real diff before closing. |
+| 17 | 2026-07-23 | **Self-caught during implementation: `Response::dragged()` is button-agnostic in egui 0.35.0** (fires for a secondary-button drag, not just primary), confirmed by reading `response.rs`'s own doc comment before trusting the assumption. `eq_editor`'s retune-on-drag branch used bare `dragged()`, so a right-click-drag on a handle would have retuned it by pointer position instead of falling through to the remove path Flow E describes. Fixed with `dragged_by(PointerButton::Primary)`/`drag_started_by(...)`; a right-drag is now a no-op (no test contract covers this edge case — it needs a live frame with a simulated drag gesture, judged not worth adding given how narrow the gesture is). | Same class as db-faders' `SliderClamping` and session-search's Escape/focus timing: verify a library method's exact semantics (which button, which frame) before building interaction logic on top of the "obvious" reading. |
 
 ## Design: Level 2 -- Components
 
@@ -358,3 +360,25 @@ do not).
 **Traps caught at design time** — `SetEqBand` silently targeting the first EQ
 stage regardless of which editor sent it (decision 13), and a ~3 dB curve error
 on high-rate devices from assuming 48 kHz (decision 14).
+
+**Trap caught during implementation** — `Response::dragged()`'s button-agnostic
+semantics would have let a right-drag retune a handle instead of falling
+through to remove (decision 17).
+
+**Found and fixed by `/review` (2026-07-23)** — `hit_test_handle` (every
+drag/click/scroll/remove routes through it) had zero test coverage, and no
+test contract in this doc covered it either. Added 3 tests, verified
+discriminating. See the operational learning — sixth occurrence this
+session-block of a new function's single most load-bearing piece shipping
+untested.
+
+## Key Files
+
+| Path | Role |
+|---|---|
+| crates/audio-core/src/dsp.rs, lib.rs | `eq_response_db`, built on `Biquad::set_coeffs_peaking` |
+| crates/engine/src/runtime.rs | `EngineStats.group_rates` |
+| crates/control/src/store.rs | `ConfigEdit::SetEqBand` (gained stage index), `ConfigEdit::SetEqBands`, both store write arms |
+| crates/app/src/main.rs | `apply_dsp_chain_edits`'s matcher, `edits_to_mixer_commands`' `SetEqBand`/`SetEqBands` arms |
+| crates/app/src/ui.rs | axis mapping (`freq_to_x`/`x_to_freq`/`db_to_y`/`y_to_db`), `EqPreset`/`preset_bands`, `EqEdit`, `hit_test_handle`, `eq_editor`, `SettingsApp.selected_band`, rewritten `dsp_controls` |
+| crates/app/src/event_pump.rs | `EngineStats` test-helper literal |

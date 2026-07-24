@@ -10,7 +10,7 @@ mod smoothing;
 mod spatial;
 
 pub use channel::ChannelMatrix;
-pub use dsp::{db_to_linear, linear_to_db, DspChain, DspParam, DspSpec, DspStage, EqBandSpec, Limiter, ParametricEq};
+pub use dsp::{db_to_linear, eq_response_db, linear_to_db, DspChain, DspParam, DspSpec, DspStage, EqBandSpec, Limiter, ParametricEq};
 pub use meter::{MeterLevel, PeakMeter};
 pub use mixer::{Mixer, MixerCommand, Render, Retired};
 pub use resample::{Src, SrcProgress};

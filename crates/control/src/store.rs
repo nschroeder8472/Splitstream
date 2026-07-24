@@ -34,7 +34,16 @@ pub enum ConfigEdit {
     AddGroup(GroupConfig),
     RemoveGroup(String),
     SetRules(String, Vec<String>),
-    SetEqBand(String, usize, EqBandSpec),
+    /// Retune one band of one EQ stage (graphical-eq.md decision 13 — gained
+    /// a stage index; previously resolved the stage by first-type-match,
+    /// which silently retuned the wrong stage under a second `Eq` stage).
+    /// Fast path, smoothed, no rebuild.
+    SetEqBand(String, usize, usize, EqBandSpec),
+    /// Replace an EQ stage's entire band list — add, remove, and preset-apply
+    /// all funnel through this one edit (decision 8). Structural: rebuilds
+    /// the stage off-RT and swaps it in, even when the band count is
+    /// unchanged (decision 12).
+    SetEqBands(String, usize, Vec<EqBandSpec>),
     SetLimiterCeiling(String, f32),
     SetDuck(String, Option<DuckSpecConfig>),
     SetDspBypass(String, usize, bool),
@@ -151,9 +160,11 @@ fn apply_edit(doc: &mut DocumentMut, edit: &ConfigEdit) -> Result<(), StoreError
         ConfigEdit::SetRules(name, rules) => {
             find_group_table(doc, name)?["match_rules"] = value(string_array(rules));
         }
-        ConfigEdit::SetEqBand(name, band, spec) => {
+        ConfigEdit::SetEqBand(name, stage_idx, band, spec) => {
             let group = find_group_table(doc, name)?;
-            let stage = find_dsp_stage_mut(group, name, "eq")?.ok_or_else(|| no_such_dsp_stage(name, "eq"))?;
+            let stage = dsp_array(group, name)?
+                .get_mut(*stage_idx)
+                .ok_or_else(|| no_such_dsp_stage_index(name, *stage_idx))?;
             let bands = stage["bands"]
                 .or_insert(Item::ArrayOfTables(ArrayOfTables::new()))
                 .as_array_of_tables_mut()
@@ -162,6 +173,23 @@ fn apply_edit(doc: &mut DocumentMut, edit: &ConfigEdit) -> Result<(), StoreError
             band_table["freq_hz"] = value(spec.freq_hz as f64);
             band_table["gain_db"] = value(spec.gain_db as f64);
             band_table["q"] = value(spec.q as f64);
+        }
+        ConfigEdit::SetEqBands(name, stage_idx, bands) => {
+            let group = find_group_table(doc, name)?;
+            let stage = dsp_array(group, name)?
+                .get_mut(*stage_idx)
+                .ok_or_else(|| no_such_dsp_stage_index(name, *stage_idx))?;
+            let mut arr = ArrayOfTables::new();
+            for b in bands {
+                let mut bt = Table::new();
+                bt["freq_hz"] = value(b.freq_hz as f64);
+                bt["gain_db"] = value(b.gain_db as f64);
+                bt["q"] = value(b.q as f64);
+                arr.push(bt);
+            }
+            // Full replace, not a mutate-in-place -- immune to a prior
+            // inline-array shape, unlike SetEqBand's field-level writes.
+            stage["bands"] = Item::ArrayOfTables(arr);
         }
         ConfigEdit::SetLimiterCeiling(name, ceiling_db) => {
             let group = find_group_table(doc, name)?;
@@ -511,6 +539,7 @@ follow_master = true
                 ConfigEdit::SetEqBand(
                     "Game".into(),
                     0,
+                    0,
                     EqBandSpec {
                         freq_hz: 500.0,
                         gain_db: -2.0,
@@ -567,6 +596,7 @@ follow_master = true
         let result = store.apply(&[ConfigEdit::SetEqBand(
             "Game".into(),
             0,
+            0,
             EqBandSpec {
                 freq_hz: 200.0,
                 gain_db: 0.0,
@@ -574,6 +604,70 @@ follow_master = true
             },
         )]);
         assert!(matches!(result, Err(StoreError::Validation(_))));
+    }
+
+    #[test]
+    fn set_eq_band_targets_the_named_stage_not_the_first() {
+        // Regression for decision 13: SetEqBand used to resolve its stage by
+        // first-type-match ("eq"), so a second EQ stage's edit silently
+        // retuned the first one instead.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let first = DspSpec::Eq { bands: vec![EqBandSpec { freq_hz: 100.0, gain_db: 1.0, q: 1.0 }] };
+        let second = DspSpec::Eq { bands: vec![EqBandSpec { freq_hz: 200.0, gain_db: 2.0, q: 1.0 }] };
+        store
+            .apply(&[
+                ConfigEdit::AddDspStage("Game".into(), first),
+                ConfigEdit::AddDspStage("Game".into(), second),
+            ])
+            .unwrap();
+
+        let snapshot = store
+            .apply(&[ConfigEdit::SetEqBand(
+                "Game".into(),
+                1,
+                0,
+                EqBandSpec { freq_hz: 9000.0, gain_db: 9.0, q: 2.0 },
+            )])
+            .unwrap();
+
+        match (&snapshot.groups[0].dsp[0].spec, &snapshot.groups[0].dsp[1].spec) {
+            (DspSpec::Eq { bands: first_bands }, DspSpec::Eq { bands: second_bands }) => {
+                assert_eq!(first_bands[0].freq_hz, 100.0, "the first EQ stage must be untouched");
+                assert_eq!(second_bands[0].freq_hz, 9000.0, "the second EQ stage must receive the edit");
+            }
+            other => panic!("expected two Eq stages, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_eq_bands_round_trips_through_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        store
+            .apply(&[ConfigEdit::AddDspStage(
+                "Game".into(),
+                DspSpec::Eq { bands: vec![EqBandSpec { freq_hz: 1000.0, gain_db: 0.0, q: 0.7 }] },
+            )])
+            .unwrap();
+
+        let new_bands = vec![
+            EqBandSpec { freq_hz: 100.0, gain_db: 3.0, q: 1.0 },
+            EqBandSpec { freq_hz: 1000.0, gain_db: -3.0, q: 1.0 },
+            EqBandSpec { freq_hz: 8000.0, gain_db: 2.0, q: 1.0 },
+        ];
+        let snapshot = store.apply(&[ConfigEdit::SetEqBands("Game".into(), 0, new_bands.clone())]).unwrap();
+
+        match &snapshot.groups[0].dsp[0].spec {
+            DspSpec::Eq { bands } => assert_eq!(bands, &new_bands),
+            other => panic!("expected an Eq stage, got {other:?}"),
+        }
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("# master volume"), "comment must survive an edit");
     }
 
     const BASE_TWO_GROUPS: &str = r#"
@@ -702,6 +796,7 @@ bands = [{ freq_hz = 200.0, gain_db = 3.0, q = 0.7 }]
         let mut store = ConfigStore::open(&path).unwrap();
         let result = store.apply(&[ConfigEdit::SetEqBand(
             "Game".into(),
+            0,
             0,
             EqBandSpec {
                 freq_hz: 500.0,
