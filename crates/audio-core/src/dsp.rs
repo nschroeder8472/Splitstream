@@ -58,8 +58,21 @@ pub enum DspSpec {
     Limiter { ceiling_db: f32 },
 }
 
-pub(crate) fn db_to_linear(db: f32) -> f32 {
+/// Linear amplitude factor for a level in decibels: `10^(db/20)`.
+pub fn db_to_linear(db: f32) -> f32 {
     10f32.powf(db / 20.0)
+}
+
+/// Level in decibels for a linear amplitude factor -- the exact inverse of
+/// [`db_to_linear`]. Zero (and any non-positive input) is `NEG_INFINITY`:
+/// true silence has no finite dB value. Callers needing a finite floor clamp
+/// on their own side.
+pub fn linear_to_db(linear: f32) -> f32 {
+    if linear <= 0.0 {
+        f32::NEG_INFINITY
+    } else {
+        20.0 * linear.log10()
+    }
 }
 
 fn validate_eq_band(band: &EqBandSpec, sample_rate: u32) -> Result<(), DomainError> {
@@ -487,6 +500,21 @@ mod tests {
             stage.process(&mut last, fmt);
         }
         last
+    }
+
+    #[test]
+    fn linear_to_db_inverts_db_to_linear_across_the_fader_range() {
+        for db in [-60.0f32, -20.0, -6.0, -0.1, 0.0, 3.0, 6.0] {
+            let linear = db_to_linear(db);
+            let back = linear_to_db(linear);
+            assert!((back - db).abs() < 1e-3, "db_to_linear({db}) -> {linear}, linear_to_db(..) -> {back}");
+        }
+    }
+
+    #[test]
+    fn linear_to_db_of_silence_is_negative_infinity() {
+        assert_eq!(linear_to_db(0.0), f32::NEG_INFINITY);
+        assert_eq!(linear_to_db(-1.0), f32::NEG_INFINITY);
     }
 
     #[test]
