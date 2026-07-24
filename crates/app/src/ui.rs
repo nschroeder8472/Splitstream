@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use audio_core::{DspSpec, EqBandSpec, Gain, GroupId, MeterLevel, OutputId};
+use audio_core::{db_to_linear, linear_to_db, DspSpec, EqBandSpec, Gain, GroupId, MeterLevel, OutputId};
 use control::ConfigEdit;
 use engine::ports::Endpoint;
 use engine::{DuckSpecConfig, GroupConfig, MatchRule, RoutingReader, SessionInfo, StatsReader};
@@ -489,12 +489,8 @@ impl SettingsApp {
             ui.vertical_centered(|ui| {
                 ui.strong("Master Volume");
 
-                let mut master = snapshot.master.value();
-                ui.spacing_mut().slider_width = height;
-                if ui.add(egui::Slider::new(&mut master, 0.0..=1.0).vertical()).changed() {
-                    if let Ok(gain) = Gain::new(master) {
-                        self.send(ShellAction::EditParams(vec![ConfigEdit::SetMaster(gain)]));
-                    }
+                if let Some(g) = fader(ui, snapshot.master, "master", height) {
+                    self.send(ShellAction::EditParams(vec![ConfigEdit::SetMaster(g)]));
                 }
 
                 if speaker_mute_button(ui, snapshot.muted) {
@@ -569,12 +565,8 @@ impl SettingsApp {
                 // Fader + its post-fader level meter + M/S toggles
                 // (per-group-mute-solo.md), side by side (level-meters.md).
                 ui.horizontal(|ui| {
-                    let mut gain = group.gain.value();
-                    ui.spacing_mut().slider_width = fader_height;
-                    if ui.add(egui::Slider::new(&mut gain, 0.0..=1.0).vertical()).changed() {
-                        if let Ok(g) = Gain::new(gain) {
-                            self.send(ShellAction::EditParams(vec![ConfigEdit::SetGroupGain(name.clone(), g)]));
-                        }
+                    if let Some(g) = fader(ui, group.gain, &name, fader_height) {
+                        self.send(ShellAction::EditParams(vec![ConfigEdit::SetGroupGain(name.clone(), g)]));
                     }
                     let dt = ui.input(|i| i.stable_dt);
                     let level = peak_for(group_peak, id);
@@ -911,6 +903,90 @@ fn peak_db_label(level: MeterLevel) -> String {
 /// rather than nothing.
 fn peak_for(peaks: &[(GroupId, MeterLevel)], id: GroupId) -> MeterLevel {
     peaks.iter().find(|(g, _)| *g == id).map(|(_, m)| *m).unwrap_or(MeterLevel::SILENT)
+}
+
+/// Bottom of fader travel (db-faders.md). Matches [`METER_FLOOR_DB`], so the
+/// fader and the level meter beside it share one scale.
+const FADER_MIN_DB: f32 = -60.0;
+/// Top of fader travel -- the last 6 dB is boost above unity (decision 2).
+const FADER_MAX_DB: f32 = 6.0;
+
+/// Fader position (dB) -> `Gain`. At or below [`FADER_MIN_DB`] the result is
+/// `Gain::SILENT`, not −60 dB (decision 3): pulling a fader down means off,
+/// not quiet. The input range guarantees a finite non-negative linear value,
+/// so `Gain::new` cannot fail here.
+fn fader_db_to_gain(db: f32) -> Gain {
+    if db <= FADER_MIN_DB {
+        Gain::SILENT
+    } else {
+        Gain::new(db_to_linear(db)).expect("db_to_linear is finite and non-negative")
+    }
+}
+
+/// `Gain` -> fader position (dB). `Gain::SILENT` maps to `NEG_INFINITY`, which
+/// the slider clamps to the bottom of travel while the readout shows `-inf dB`.
+/// Deliberately *not* clamped to the fader range here: an out-of-range
+/// existing value (e.g. a hand-written `gain = 4.0`, +12 dB) must reach the
+/// slider unclamped so `SliderClamping::Edits` can display it truthfully
+/// instead of silently squashing it on mere render (db-faders.md decision 10).
+fn gain_to_fader_db(gain: Gain) -> f32 {
+    linear_to_db(gain.value())
+}
+
+/// Value-box text for a dB reading -- one decimal, explicit sign for boost,
+/// `-inf dB` at silence.
+fn format_fader_db(db: f64) -> String {
+    if db <= FADER_MIN_DB as f64 {
+        "-inf dB".to_string()
+    } else if db > 0.0 {
+        format!("+{db:.1} dB")
+    } else {
+        format!("{db:.1} dB")
+    }
+}
+
+/// Parses typed dB back to a number. Accepts `-6`, `-6.0`, `+3`, `0`, an
+/// optional `dB`/`db` suffix, and `-inf`/`-∞`. `None` on anything else, which
+/// egui treats as "keep the previous value".
+fn parse_fader_db(text: &str) -> Option<f64> {
+    let trimmed = text.trim();
+    let without_suffix = trimmed
+        .strip_suffix("dB")
+        .or_else(|| trimmed.strip_suffix("db"))
+        .unwrap_or(trimmed)
+        .trim();
+    match without_suffix {
+        "-inf" | "-∞" => Some(f64::from(FADER_MIN_DB)),
+        other => other.parse::<f64>().ok(),
+    }
+}
+
+/// One fader: dB-scaled vertical slider, editable dB value box, and
+/// double-click-to-unity. `Some` only when this frame changed the value.
+/// `id_salt` distinguishes the reset overlay per fader (group name, or
+/// "master"); `length` is the slider's long axis. Shared by `master_column`
+/// and `group_column` so the two cannot drift apart in scale, floor, or
+/// rounding (db-faders.md decision 8).
+fn fader(ui: &mut egui::Ui, gain: Gain, id_salt: &str, length: f32) -> Option<Gain> {
+    let mut db = gain_to_fader_db(gain);
+    ui.spacing_mut().slider_width = length;
+    let response = ui.add(
+        egui::Slider::new(&mut db, FADER_MIN_DB..=FADER_MAX_DB)
+            .vertical()
+            .clamping(egui::SliderClamping::Edits)
+            .custom_formatter(|v, _| format_fader_db(v))
+            .custom_parser(parse_fader_db)
+            .drag_value_speed(0.1),
+    );
+
+    let reset = ui.interact(response.rect, ui.id().with(("fader-reset", id_salt)), egui::Sense::click());
+    if reset.double_clicked() {
+        return Some(Gain::UNITY);
+    }
+    if response.changed() {
+        return Some(fader_db_to_gain(db));
+    }
+    None
 }
 
 /// Paints a peak meter into an already-allocated `rect` (level-meters.md):
@@ -1451,6 +1527,73 @@ mod tests {
         let level = MeterLevel { peak: 0.5, clipped: true };
         let peaks = vec![(GroupId(0), level)];
         assert_eq!(peak_for(&peaks, GroupId(0)), level);
+    }
+
+    #[test]
+    fn unity_gain_is_zero_db() {
+        assert!((gain_to_fader_db(Gain::UNITY) - 0.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_bottom_of_travel_maps_to_true_silence() {
+        assert_eq!(fader_db_to_gain(FADER_MIN_DB), Gain::SILENT);
+        assert_eq!(fader_db_to_gain(FADER_MIN_DB - 10.0), Gain::SILENT);
+    }
+
+    #[test]
+    fn boost_maps_above_zero_db() {
+        let gain = fader_db_to_gain(FADER_MAX_DB);
+        assert!((gain.value() - 1.995).abs() < 1e-2, "got {}", gain.value());
+    }
+
+    #[test]
+    fn gain_round_trips_through_the_fader_mapping() {
+        for db in [-40.0f32, -6.0, -0.5, 3.0, 6.0] {
+            let gain = fader_db_to_gain(db);
+            let back = gain_to_fader_db(gain);
+            assert!((back - db).abs() < 1e-2, "db {db} -> gain {} -> {back}", gain.value());
+        }
+    }
+
+    #[test]
+    fn silence_formats_as_minus_inf() {
+        assert_eq!(format_fader_db(FADER_MIN_DB as f64), "-inf dB");
+        assert_eq!(format_fader_db((FADER_MIN_DB - 5.0) as f64), "-inf dB");
+    }
+
+    #[test]
+    fn format_fader_db_shows_one_decimal_and_signs_boost() {
+        assert_eq!(format_fader_db(-6.0), "-6.0 dB");
+        assert_eq!(format_fader_db(0.0), "0.0 dB");
+        assert_eq!(format_fader_db(3.5), "+3.5 dB");
+    }
+
+    #[test]
+    fn parse_fader_db_accepts_signed_suffixed_and_infinite_forms() {
+        assert_eq!(parse_fader_db("-6"), Some(-6.0));
+        assert_eq!(parse_fader_db("-6.0"), Some(-6.0));
+        assert_eq!(parse_fader_db("+3"), Some(3.0));
+        assert_eq!(parse_fader_db("0"), Some(0.0));
+        assert_eq!(parse_fader_db("3 dB"), Some(3.0));
+        assert_eq!(parse_fader_db("-inf"), Some(FADER_MIN_DB as f64));
+        assert_eq!(parse_fader_db("-∞"), Some(FADER_MIN_DB as f64));
+    }
+
+    #[test]
+    fn parse_fader_db_rejects_garbage() {
+        assert_eq!(parse_fader_db("loud"), None);
+        assert_eq!(parse_fader_db(""), None);
+    }
+
+    #[test]
+    fn gain_to_fader_db_does_not_clamp_an_out_of_range_existing_value() {
+        // Regression for db-faders.md decision 10/15: a hand-written
+        // `gain = 4.0` (+12 dB, above FADER_MAX_DB) must reach the slider as
+        // the true +12 dB, not pre-clamped to +6 dB -- otherwise
+        // `SliderClamping::Edits` has nothing left to preserve.
+        let over_range = Gain::new(4.0).unwrap();
+        let db = gain_to_fader_db(over_range);
+        assert!(db > FADER_MAX_DB, "expected an unclamped value above {FADER_MAX_DB}, got {db}");
     }
 
     #[test]

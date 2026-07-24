@@ -2,7 +2,7 @@
 feature: db-faders
 requirement_doc: null
 created: 2026-07-22
-status: approved
+status: complete
 note: >
   Roadmap Priority 4 (.lattice/ux-gap-roadmap.md). dB-scaled fader travel,
   dB readout + numeric entry, unity reset. No requirement spec — roadmap is
@@ -321,6 +321,9 @@ Both lose their `if let Ok(g) = Gain::new(v)`: the conversion now returns a
 | 11 | 2026-07-22 | **Double-click's two stray rail clicks are accepted, not suppressed.** | egui's slider jumps its handle to a clicked rail position, so a reset emits two spurious position edits before the unity edit lands last and wins. Same class and volume as the per-frame edits an ordinary drag already produces, and the final state is correct. Rejected: reordering the overlay ahead of the slider or gating the slider on double-click state (real complexity for a transient no-op). |
 | 12 | 2026-07-22 | **`step_by` is left unset; `drag_value_speed(0.1)` provides the precision capability 7 asked for.** | `step_by`'s own doc (slider.rs:305) warns that a stepped value which is out of range under clamping becomes unchangeable — precisely flow F's hand-written `gain = 4.0` case, which decision 10 deliberately preserves. Dropping the step avoids the interaction; with dB units the default drag feel is already even, and 0.1 dB per point on the value box covers fine adjustment. |
 | 13 | 2026-07-22 | **Design approved at Level 4. Status set to `approved` — ready for implementation.** | All four level sections persisted; no open questions. |
+| 14 | 2026-07-23 | **Implementation complete, inside-out (audio-core -> app::ui).** `db_to_linear` promoted `pub`, `linear_to_db` added; `FADER_MIN_DB`/`FADER_MAX_DB`, `fader_db_to_gain`, `gain_to_fader_db`, `format_fader_db`, `parse_fader_db`, and the shared `fader()` widget all match the L4 contract exactly. Both call sites converted, `if let Ok(Gain::new(v))` swallow removed. All 10 planned test contracts present. Full workspace suite green (audio-core 97, control 50, engine 96, app 61) and `cargo clippy --workspace --all-targets` clean. Only `crates/audio-core/src/dsp.rs`, `lib.rs`, `crates/app/src/ui.rs` touched — no engine/control edge, matching the L2 table exactly. | Verified against the real diff before closing, not assumed from the blueprint. |
+| 15 | 2026-07-23 | **Self-caught deviation, fixed same session: `gain_to_fader_db` must NOT clamp to the fader range.** First draft clamped the dB value before handing it to the slider, which silently defeats decision 10 — `SliderClamping::Edits` only skips re-clamping the *existing* value at entry (verified by reading `add_contents` at slider.rs:950-966: `self.set_value(old_value)` only runs when `clamping == Always`), so a pre-clamped input makes the clamping mode moot and a hand-written `gain = 4.0` (+12 dB) would silently display `+6.0 dB` even without clamping-on-render firing a write. Fixed: `gain_to_fader_db` now returns `linear_to_db(gain.value())` raw (including `NEG_INFINITY` and any out-of-range value); confirmed safe via `normalized_from_value`'s explicit `value <= min`/`value >= max` guards (slider.rs:1116-1119), which handle non-finite input without NaN. | Caught during Step 3 post-gen verification against the L4 contract text itself, not by a failing test — none of the 10 planned test contracts exercise this path since it needs a live egui frame to observe. |
+| 16 | 2026-07-23 | **Correction to decision 10's stated mechanism, found during `/review` by empirically reproducing it against the pinned egui 0.35.0, not by re-reading the source.** `response.changed()` does **not** fire from mere render under `SliderClamping::Always`, contrary to decision 10's claim — `Slider::get_value()` (slider.rs:598-605) itself applies the `Always` clamp on *every* read, so the "old_value" baseline read at entry is already clamped and agrees with the post-render read; no divergence, no `mark_changed()`. Confirmed via a direct single-frame repro using `egui::__run_test_ui` with `.clamping(Always)` and an out-of-range starting value: the bound value was silently mutated (12.0 -> 6.0, proving `Always` does corrupt the value in place) but `response.changed()` stayed `false` throughout. The actual risk `SliderClamping::Edits` guards against is therefore **silent value/display corruption on render**, not a "changed()-branch overwrites config" write path — `fader()` never writes anything unless `response.changed()` is true, so that specific write-path danger was never live in this implementation regardless of clamping mode. `.clamping(Edits)` is still correct and required (for display truth), just not for the reason originally logged. Test contract updated accordingly: dropped the (non-discriminating) live-frame `__run_test_ui` test in favor of a pure `gain_to_fader_db_does_not_clamp_an_out_of_range_existing_value` test, which is both simpler and actually fails if the decision-15 bug recurs. | A blueprint's stated mechanism for *why* a fix is needed can be wrong even when the fix itself (the required call) is right — verify library behavior empirically before trusting a design doc's description of it, especially across a library-source reading done at design time vs. implementation time. |
 
 ## Open Questions
 
@@ -373,3 +376,17 @@ is already click-to-edit. The real gaps are the unit, the taper and the reset.
 time rather than design time: `Sense::drag()` on the slider makes
 `double_clicked()` permanently dead (decision 6), and `SliderClamping::Always`
 silently rewrites an out-of-range stored gain on mere render (decision 10).
+
+**A third egui behaviour caught during implementation, not design** (decision
+15): `SliderClamping::Edits` only helps if the *unclamped* value reaches the
+widget — a defensive clamp one layer up in application code silently
+reproduces the exact bug decision 10 exists to prevent, just outside the
+widget instead of inside it.
+
+## Key Files
+
+| Path | Role |
+|---|---|
+| crates/audio-core/src/dsp.rs | `db_to_linear` (now `pub`); new `linear_to_db` |
+| crates/audio-core/src/lib.rs | re-exports both |
+| crates/app/src/ui.rs | `FADER_MIN_DB`/`FADER_MAX_DB`; `fader_db_to_gain`/`gain_to_fader_db`/`format_fader_db`/`parse_fader_db`; shared `fader()` widget; `master_column`/`group_column` call sites |
