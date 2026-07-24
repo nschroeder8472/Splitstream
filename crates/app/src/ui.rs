@@ -55,7 +55,10 @@ const MAX_FADER_HEIGHT: f32 = 400.0;
 /// subtracted from the row's available height before clamping fader length.
 /// Tuned by eye, not exact; egui sizes the surrounding widgets by their own
 /// content regardless, this only informs how much length the fader claims.
-const COLUMN_CHROME_HEIGHT: f32 = 160.0;
+/// Bumped for the page-level search box (session-search-and-guidance.md
+/// decision 6) — it renders above the column row, so its height eats into
+/// the same `available.y` this constant is subtracted from.
+const COLUMN_CHROME_HEIGHT: f32 = 190.0;
 
 /// Fixed on-screen size for the custom-painted speaker icon — the icon
 /// itself doesn't need to scale with the responsive column/fader sizing,
@@ -97,6 +100,10 @@ struct GroupColumnCtx<'a> {
     /// frame in `ui()` from `ui.available_size()`, shared by every column.
     width: f32,
     fader_height: f32,
+    /// This frame's session search filter (session-search-and-guidance.md) —
+    /// a clone of `SettingsApp.search`, threaded through rather than borrowed,
+    /// so it doesn't hold `self` borrowed across the `&mut self` column calls.
+    query: &'a str,
 }
 
 /// Read-only data `master_column` needs besides `self`/`ui` — bundled once the
@@ -116,6 +123,9 @@ struct MasterColumnCtx<'a> {
     output_names: &'a [(OutputId, String)],
     width: f32,
     height: f32,
+    /// This frame's session search filter (session-search-and-guidance.md) —
+    /// see `GroupColumnCtx.query` for why it's threaded, not borrowed.
+    query: &'a str,
 }
 
 /// One frame's owned copy of everything the render pass reads out of the
@@ -214,6 +224,10 @@ pub struct SettingsApp {
     /// Last `UiState.rebuild_generation` this UI has reacted to — a jump
     /// clears `soloed` (decision 8).
     seen_generation: u64,
+    /// Session chip search filter (session-search-and-guidance.md) — free
+    /// text needs draft state, same reasoning as `GroupDraft.match_rules`.
+    /// Never persisted; transient UI state only.
+    search: String,
 }
 
 impl SettingsApp {
@@ -236,6 +250,7 @@ impl SettingsApp {
             show_new_group_panel: false,
             soloed: HashSet::new(),
             seen_generation: 0,
+            search: String::new(),
         }
     }
 
@@ -355,6 +370,15 @@ impl eframe::App for SettingsApp {
 
                 ui.heading("Splitstream");
 
+                // Search filters every chip zone at once (decision 4: box
+                // only appears once something exists to search). Cloned once
+                // rather than borrowed, so `self.search` isn't held across
+                // the `&mut self` column calls below.
+                if !all_sessions.is_empty() {
+                    search_box(ui, &mut self.search);
+                }
+                let query = self.search.clone();
+
                 // Responsive sizing (responsive-ui-refinement L4/L3 flow A) —
                 // recomputed fresh every frame from the space actually
                 // available, no cached layout state.
@@ -371,6 +395,7 @@ impl eframe::App for SettingsApp {
                     group_peak: &stats.group_peak,
                     width,
                     fader_height: height,
+                    query: &query,
                 };
                 egui::ScrollArea::horizontal().show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -381,6 +406,7 @@ impl eframe::App for SettingsApp {
                             output_peak: &stats.output_peak,
                             output_names: &stats.output_names,
                             width,
+                            query: &query,
                             height,
                         };
                         self.master_column(ui, &master_ctx);
@@ -483,7 +509,8 @@ impl SettingsApp {
     /// footer, not a separate strip). Dropping a chip here unassigns it
     /// (drag-assign target `None`).
     fn master_column(&mut self, ui: &mut egui::Ui, ctx: &MasterColumnCtx) {
-        let MasterColumnCtx { snapshot, routes, all_sessions, output_peak, output_names, width, height } = *ctx;
+        let MasterColumnCtx { snapshot, routes, all_sessions, output_peak, output_names, width, height, query } =
+            *ctx;
         ui.group(|ui| {
             ui.set_width(width);
             ui.vertical_centered(|ui| {
@@ -518,8 +545,20 @@ impl SettingsApp {
 
                 ui.label("Routed Apps");
                 let unassigned = unassigned_sessions(all_sessions, routes);
-                if let Some(pid) = session_drop_zone(ui, &unassigned) {
-                    self.handle_drop(pid, None, all_sessions, &snapshot.groups);
+                let zone_ctx = ChipZoneCtx {
+                    sessions: &unassigned,
+                    query,
+                    zone: ZoneKind::Unassigned,
+                    current_group: None,
+                    groups: &snapshot.groups,
+                    any_sessions: !all_sessions.is_empty(),
+                };
+                match session_drop_zone(ui, &zone_ctx) {
+                    Some(ChipAction::Dropped(pid)) => self.handle_drop(pid, None, all_sessions, &snapshot.groups),
+                    Some(ChipAction::Assign { pid, target }) => {
+                        self.handle_drop(pid, target.as_deref(), all_sessions, &snapshot.groups)
+                    }
+                    None => {}
                 }
             });
         });
@@ -531,7 +570,8 @@ impl SettingsApp {
     /// to `ctx.fader_height`, "Routed Apps" footer as a drop zone
     /// (mixer-ui-redesign L2/L3).
     fn group_column(&mut self, ui: &mut egui::Ui, group: &GroupConfig, id: GroupId, ctx: &GroupColumnCtx) {
-        let GroupColumnCtx { routes, all_sessions, all_groups, devices, group_peak, width, fader_height } = *ctx;
+        let GroupColumnCtx { routes, all_sessions, all_groups, devices, group_peak, width, fader_height, query } =
+            *ctx;
         let name = group.name.clone();
 
         // Solo scope is global (decision 3): `self.soloed` is the one set for
@@ -596,8 +636,20 @@ impl SettingsApp {
 
                 ui.label("Routed Apps");
                 let sessions = routed_sessions(routes, id);
-                if let Some(pid) = session_drop_zone(ui, &sessions) {
-                    self.handle_drop(pid, Some(&name), all_sessions, all_groups);
+                let zone_ctx = ChipZoneCtx {
+                    sessions: &sessions,
+                    query,
+                    zone: ZoneKind::Group,
+                    current_group: Some(&name),
+                    groups: all_groups,
+                    any_sessions: !all_sessions.is_empty(),
+                };
+                match session_drop_zone(ui, &zone_ctx) {
+                    Some(ChipAction::Dropped(pid)) => self.handle_drop(pid, Some(&name), all_sessions, all_groups),
+                    Some(ChipAction::Assign { pid, target }) => {
+                        self.handle_drop(pid, target.as_deref(), all_sessions, all_groups)
+                    }
+                    None => {}
                 }
             });
         });
@@ -1181,24 +1233,132 @@ fn default_duck_trigger(groups: &[GroupConfig], exclude: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Draggable chip per session plus a drop-accepting frame around them —
-/// shared by the master (unassigned pool) and every group column (routed
-/// apps). Returns the dropped session's pid, if a chip was released here
-/// this frame.
-fn session_drop_zone(ui: &mut egui::Ui, sessions: &[SessionInfo]) -> Option<u32> {
-    let frame = egui::Frame::group(ui.style());
-    let (_, dropped) = ui.dnd_drop_zone::<DragSession, ()>(frame, |ui| {
-        if sessions.is_empty() {
-            ui.weak("(none)");
+/// What a chip's context menu produced.
+enum AssignChoice {
+    To(String),
+    Unassign,
+}
+
+/// What a chip zone produced this frame. Both variants funnel into
+/// `handle_drop` at the call site (decision 7) — the two gestures physically
+/// cannot produce different edits.
+enum ChipAction {
+    /// A chip was released on this zone — target is the zone's own identity.
+    Dropped(u32),
+    /// A menu choice on a chip — target is explicit and may be any group.
+    Assign { pid: u32, target: Option<String> },
+}
+
+/// Read-only data a chip zone needs to filter, choose its empty state, and
+/// build the assign menu (session-search-and-guidance.md).
+#[derive(Clone, Copy)]
+struct ChipZoneCtx<'a> {
+    sessions: &'a [SessionInfo],
+    query: &'a str,
+    zone: ZoneKind,
+    /// The group this zone belongs to; `None` for the master (unassigned) pool.
+    current_group: Option<&'a str>,
+    /// Every configured group, for the assign menu.
+    groups: &'a [GroupConfig],
+    /// Whether any session exists anywhere — drives `NothingPlaying`.
+    any_sessions: bool,
+}
+
+/// Free-text filter plus clear button; `true` when the query changed this
+/// frame. Esc also clears. Caller renders this only when at least one session
+/// exists (decision 4) — with nothing playing, a search box is furniture.
+fn search_box(ui: &mut egui::Ui, query: &mut String) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        let response = ui.add(
+            egui::TextEdit::singleline(query)
+                .id(egui::Id::new("session-search"))
+                .hint_text("Search apps…"),
+        );
+        if response.changed() {
+            changed = true;
         }
-        for session in sessions {
-            let id = egui::Id::new(("session-chip", session.pid));
-            ui.dnd_drag_source(id, DragSession(session.pid), |ui| {
-                ui.label(chip_label(session));
-            });
+        // `has_focus()` reads false here, not true: egui's `Memory::begin_frame`
+        // clears focus globally on an unclaimed Escape *before* this widget
+        // renders (memory/mod.rs), so the focus loss and the Escape keypress
+        // land in the same frame. `lost_focus()` is the one that's true on
+        // exactly that frame -- confirmed empirically, not assumed.
+        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            query.clear();
+            changed = true;
+        }
+        if !query.is_empty() && ui.button("✕").clicked() {
+            query.clear();
+            changed = true;
         }
     });
-    dropped.map(|payload| payload.0)
+    changed
+}
+
+/// The chip's own click-sensing interaction (decision 3): `dnd_drag_source`'s
+/// response senses drag only, and `Response::context_menu` opens on
+/// `secondary_clicked()`, which needs click sense — the same dead-gesture
+/// trap as the fader's `double_clicked()` in db-faders.md, in a different
+/// widget. Built on `rect`, never on the drag-source response itself.
+fn chip_context_menu(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    id: egui::Id,
+    groups: &[GroupConfig],
+    current_group: Option<&str>,
+) -> Option<AssignChoice> {
+    let menu = ui.interact(rect, id.with("menu"), egui::Sense::click());
+    let mut choice = None;
+    menu.context_menu(|ui| {
+        for g in groups {
+            if Some(g.name.as_str()) == current_group {
+                ui.label(format!("{} (current)", g.name));
+            } else if ui.button(&g.name).clicked() {
+                choice = Some(AssignChoice::To(g.name.clone()));
+            }
+        }
+        if current_group.is_some() && ui.button("Unassign").clicked() {
+            choice = Some(AssignChoice::Unassign);
+        }
+    });
+    choice
+}
+
+/// Renders a chip zone: filters `ctx.sessions` against `ctx.query`, shows the
+/// matching empty state when nothing remains, and returns whichever gesture —
+/// drop or menu assign — fired this frame (decision 7: both collapse onto the
+/// same `handle_drop` at the call site, so they cannot diverge).
+fn session_drop_zone(ui: &mut egui::Ui, ctx: &ChipZoneCtx) -> Option<ChipAction> {
+    let zone_had_chips = !ctx.sessions.is_empty();
+    let shown: Vec<&SessionInfo> = ctx.sessions.iter().filter(|s| session_matches(s, ctx.query)).collect();
+
+    let frame = egui::Frame::group(ui.style());
+    let mut action = None;
+    let (_, dropped) = ui.dnd_drop_zone::<DragSession, ()>(frame, |ui| {
+        if shown.is_empty() {
+            let reason = empty_reason(ctx.zone, ctx.any_sessions, zone_had_chips, !ctx.query.is_empty());
+            ui.weak(empty_message(reason, ctx.query));
+        }
+        for session in &shown {
+            let id = egui::Id::new(("session-chip", session.pid));
+            let response = ui
+                .dnd_drag_source(id, DragSession(session.pid), |ui| {
+                    ui.label(chip_label(session));
+                })
+                .response;
+            if let Some(choice) = chip_context_menu(ui, response.rect, id, ctx.groups, ctx.current_group) {
+                let target = match choice {
+                    AssignChoice::To(name) => Some(name),
+                    AssignChoice::Unassign => None,
+                };
+                action = Some(ChipAction::Assign { pid: session.pid, target });
+            }
+        }
+    });
+    if let Some(payload) = dropped {
+        return Some(ChipAction::Dropped(payload.0));
+    }
+    action
 }
 
 /// Pure — every session currently routed to `group`, sorted by chip label
@@ -1244,6 +1404,61 @@ fn chip_label(session: &SessionInfo) -> String {
         return file_name;
     }
     session.pid.to_string()
+}
+
+/// Which chip zone this is (session-search-and-guidance.md) — decides which
+/// empty state applies when the zone's displayed list is empty.
+#[derive(Clone, Copy, PartialEq)]
+enum ZoneKind {
+    Unassigned,
+    Group,
+}
+
+/// Why a chip zone is showing nothing.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum EmptyReason {
+    NothingPlaying,
+    AllRouted,
+    GroupEmpty,
+    NoMatches,
+}
+
+/// Pure. Called only when the zone's *displayed* list is empty, so it always
+/// has an answer. `zone_had_chips` is pre-filter occupancy — it is what
+/// separates "the search hid everything" from "this zone was always empty"
+/// (decision 8): without it, a group that was already empty would blame the
+/// search for an emptiness it did not cause.
+fn empty_reason(zone: ZoneKind, any_sessions: bool, zone_had_chips: bool, searching: bool) -> EmptyReason {
+    if !any_sessions {
+        EmptyReason::NothingPlaying
+    } else if searching && zone_had_chips {
+        EmptyReason::NoMatches
+    } else if zone == ZoneKind::Unassigned {
+        EmptyReason::AllRouted
+    } else {
+        EmptyReason::GroupEmpty
+    }
+}
+
+/// Text for an empty zone. `query` is only read for `NoMatches`.
+fn empty_message(reason: EmptyReason, query: &str) -> String {
+    match reason {
+        EmptyReason::NothingPlaying => "No apps are playing audio.".to_string(),
+        EmptyReason::AllRouted => "All apps are routed.".to_string(),
+        EmptyReason::GroupEmpty => "Drag an app here, or right-click an app to assign it.".to_string(),
+        EmptyReason::NoMatches => format!("No apps match \"{query}\"."),
+    }
+}
+
+/// Pure. Case-insensitive substring over the chip label *and* the process
+/// file name (capability 2) — so `chrome` finds a chip labelled either
+/// `Google Chrome` or `chrome.exe`. An empty query matches everything.
+fn session_matches(session: &SessionInfo, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let query = query.to_lowercase();
+    chip_label(session).to_lowercase().contains(&query) || session_file_name(session).to_lowercase().contains(&query)
 }
 
 /// Pure — resolves a drag-drop onto `target` (`Some(group name)` = assign,
@@ -1484,6 +1699,102 @@ mod tests {
             display_name: String::new(),
         };
         assert_eq!(chip_label(&s), "4242");
+    }
+
+    #[test]
+    fn nothing_playing_beats_every_other_empty_reason() {
+        assert_eq!(
+            empty_reason(ZoneKind::Group, false, true, true),
+            EmptyReason::NothingPlaying
+        );
+    }
+
+    #[test]
+    fn an_empty_master_pool_with_sessions_reads_as_all_routed() {
+        assert_eq!(
+            empty_reason(ZoneKind::Unassigned, true, false, false),
+            EmptyReason::AllRouted
+        );
+    }
+
+    #[test]
+    fn an_empty_group_teaches_the_gesture() {
+        assert_eq!(empty_reason(ZoneKind::Group, true, false, false), EmptyReason::GroupEmpty);
+    }
+
+    #[test]
+    fn a_zone_filtered_to_nothing_reports_no_matches() {
+        assert_eq!(empty_reason(ZoneKind::Group, true, true, true), EmptyReason::NoMatches);
+    }
+
+    #[test]
+    fn a_group_that_was_already_empty_does_not_blame_the_search() {
+        // The zone_had_chips distinction (decision 8) -- the one case that is
+        // easy to get wrong: a group with nothing routed must still teach the
+        // gesture while a search is active, not claim the search hid anything.
+        assert_eq!(empty_reason(ZoneKind::Group, true, false, true), EmptyReason::GroupEmpty);
+    }
+
+    #[test]
+    fn session_matches_finds_the_display_label() {
+        let mut s = session(1, "unrelated.exe");
+        s.display_name = "Google Chrome".into();
+        assert!(session_matches(&s, "chrome"));
+    }
+
+    #[test]
+    fn session_matches_finds_the_exe_file_name() {
+        let s = session(1, "chrome.exe");
+        assert!(session_matches(&s, "chrome"));
+    }
+
+    #[test]
+    fn session_matches_ignores_case() {
+        let s = session(1, "Chrome.exe");
+        assert!(session_matches(&s, "CHROME"));
+    }
+
+    #[test]
+    fn an_empty_query_matches_every_session() {
+        let s = session(1, "anything.exe");
+        assert!(session_matches(&s, ""));
+    }
+
+    #[test]
+    fn escape_clears_a_focused_search_box() {
+        // Regression: egui's Memory::begin_frame clears focus globally on an
+        // unclaimed Escape *before* the widget renders (memory/mod.rs), so
+        // `response.has_focus()` reads false on the very frame Escape fires --
+        // a check against it would be silently dead code. `lost_focus()` is
+        // the one that's true on that frame; confirmed empirically against
+        // the pinned egui 0.35.0, not assumed from the docs.
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::empty());
+        let mut query = String::from("chrome");
+        let id = egui::Id::new("session-search");
+
+        let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                search_box(ui, &mut query);
+                ui.memory_mut(|m| m.request_focus(id));
+            });
+        });
+
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run_ui(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                search_box(ui, &mut query);
+            });
+        });
+
+        assert_eq!(query, "", "Escape must clear the search box on the frame focus is lost");
     }
 
     #[test]

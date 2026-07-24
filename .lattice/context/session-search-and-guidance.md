@@ -2,7 +2,7 @@
 feature: session-search-and-guidance
 requirement_doc: null
 created: 2026-07-22
-status: approved
+status: complete
 note: >
   Roadmap Priority 12 (.lattice/ux-gap-roadmap.md). Search/filter across the
   session chip zones, meaningful empty states, and a right-click assign menu
@@ -100,6 +100,8 @@ searching anything other than session chips (devices, groups).
 | 7 | 2026-07-22 | **`session_drop_zone` returns a `ChipAction` enum and both variants funnel into the existing `handle_drop`.** | Capability 6 is a non-divergence guarantee between the drag gesture and the menu; routing both through one method makes it structural rather than a convention two call sites have to keep. |
 | 8 | 2026-07-22 | **`empty_reason` takes `zone_had_chips`, not just the post-filter count.** | Without it, a group that was already empty would display "No apps match" whenever a search was active — blaming the filter for an emptiness it did not cause. The distinction only exists because decision 1 made search global. |
 | 9 | 2026-07-22 | **Design approved at Level 4. Status set to `approved` — ready for implementation.** | All four level sections persisted; no open questions. |
+| 11 | 2026-07-23 | **Found and fixed by `/review`: capability 3's Escape-to-clear was dead code.** `search_box` checked `response.has_focus() && escape_pressed`, but egui's `Memory::begin_frame` clears focus globally on an unclaimed Escape *before* the widget renders that frame (memory/mod.rs:583) — confirmed with a two-frame `egui::Context` repro, not assumed. Fixed to `response.lost_focus()`; added `escape_clears_a_focused_search_box`, verified discriminating against the bug (fails on `has_focus()`, passes on `lost_focus()`). Also removed a stale doc comment (the old `session_drop_zone(sessions) -> Option<u32>` description) left orphaned above `enum AssignChoice`. | Third occurrence of the same root class in three sessions — see the operational learning. The click-button clear path was never affected, only the keyboard Escape path. |
+| 10 | 2026-07-23 | **Implementation complete**, layer-by-layer (pure functions -> view types/widgets -> call-site wiring). All 9 planned test contracts present; no widget-level tests added, matching the established precedent (db-faders/level-meters) of testing the pure split, not the egui wiring. `COLUMN_CHROME_HEIGHT` bumped 160.0 -> 190.0 per decision 6's anticipated consequence. Full workspace suite green (314 tests) and `cargo clippy --workspace --all-targets` clean. Single file touched (`crates/app/src/ui.rs`), matching the L2 table's "nothing outside app::ui changes" exactly — no scope creep. | Verified against the real diff (`git diff --stat`) before closing, not assumed from the blueprint. Not visually verified in a live running window — drag/right-click interaction confirmed by reading the pinned egui 0.35.0 source (`context_menu`, `secondary_clicked`, `dnd_drag_source`'s returned rect) and by the existing `fader()` reset overlay precedent using the identical `ui.interact(rect, ..., Sense::click())` idiom, not by launching the binary. |
 
 ## Design: Level 2 -- Components
 
@@ -367,3 +369,9 @@ enough (decision 2: a right-click menu ships too); box placement (decision 6).
 opened, because `dnd_drag_source`'s response senses drag and `context_menu`
 needs click (decision 3). Second instance of this exact shape in two design
 sessions.
+
+## Key Files
+
+| Path | Role |
+|---|---|
+| crates/app/src/ui.rs | `ZoneKind`, `EmptyReason`, `empty_reason`, `empty_message`, `session_matches` (pure); `AssignChoice`, `ChipAction`, `ChipZoneCtx`, `search_box`, `chip_context_menu`, rewritten `session_drop_zone`; `SettingsApp.search`; `MasterColumnCtx.query`/`GroupColumnCtx.query`; `COLUMN_CHROME_HEIGHT` bump |
