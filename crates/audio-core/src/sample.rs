@@ -204,6 +204,10 @@ pub struct GroupSpec {
     /// `Render::build` falls back to the plain channel matrix automatically
     /// when this group's output isn't stereo.
     pub spatial: bool,
+    /// Persisted per-group mute (per-group-mute-solo.md). Deliberately no
+    /// `solo` counterpart: solo is session-only, so every rebuild starts each
+    /// group unsoloed -- the absence of the field *is* the guarantee.
+    pub mute: bool,
 }
 
 #[derive(Debug, Clone)]

@@ -73,6 +73,8 @@ struct RawGroup {
     duck: Option<RawDuck>,
     #[serde(default)]
     spatial: bool,
+    #[serde(default)]
+    muted: bool,
 }
 
 /// TOML shape for `[[group.dsp]]` (spec §11.3). `bypassed` has no place on
@@ -271,6 +273,7 @@ pub(crate) fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
                 dsp,
                 duck,
                 spatial: g.spatial,
+                muted: g.muted,
             })
         })
         .collect::<Result<Vec<_>, ConfigError>>()?;
@@ -382,6 +385,9 @@ pub fn diff(old: &ConfigSnapshot, new: &ConfigSnapshot) -> ConfigDelta {
         }
         if o.follow_master != n.follow_master {
             params.push(MixerCommand::SetFollowMaster(id, n.follow_master));
+        }
+        if o.muted != n.muted {
+            params.push(MixerCommand::SetGroupMute(id, n.muted));
         }
         if o.match_rules != n.match_rules {
             rules_changed = true;
@@ -531,6 +537,7 @@ mod tests {
             dsp: Vec::new(),
             duck: None,
             spatial: false,
+            muted: false,
         }
     }
 
@@ -687,6 +694,28 @@ mod tests {
         assert!(delta.rules.is_none());
         assert_eq!(delta.params.len(), 1);
         assert!(matches!(delta.params[0], MixerCommand::SetGroupGain(GroupId(0), _)));
+    }
+
+    #[test]
+    fn a_changed_group_muted_diffs_as_a_param_not_structural() {
+        let a = ConfigSnapshot {
+            schema_version: 2,
+            master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
+            groups: vec![group("Game", "Out", 1.0, true)],
+        };
+        let mut b = a.clone();
+        b.groups[0].muted = true;
+
+        let delta = diff(&a, &b);
+        assert!(!delta.structural);
+        assert!(delta.rules.is_none());
+        assert_eq!(delta.params.len(), 1);
+        assert!(matches!(
+            delta.params[0],
+            MixerCommand::SetGroupMute(GroupId(0), true)
+        ));
     }
 
     #[test]

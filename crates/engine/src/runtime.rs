@@ -1776,6 +1776,7 @@ mod tests {
                 dsp: Vec::new(),
                 duck: None,
                 spatial: false,
+                muted: false,
             }],
         }
     }
@@ -2359,6 +2360,7 @@ mod tests {
                 dsp: Vec::new(),
                 duck: None,
                 spatial: false,
+                mute: false,
             }],
             outputs: vec![audio_core::OutputSpec { id: OutputId(0), format: mono(48_000) }],
         };
@@ -2389,6 +2391,7 @@ mod tests {
                 dsp: Vec::new(),
                 duck: None,
                 spatial: false,
+                mute: false,
             }],
             outputs: vec![audio_core::OutputSpec { id: OutputId(0), format: mono(48_000) }],
         };

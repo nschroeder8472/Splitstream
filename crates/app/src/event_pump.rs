@@ -45,6 +45,10 @@ pub struct UiState {
     /// per-frame way `routes`/`routing_degraded` already are (polled from
     /// `RoutingReader` inside `ui.rs`'s `fn ui()`, not via `EventPump`).
     pub all_sessions: Vec<SessionInfo>,
+    /// Bumped by the dispatcher on every mixer rebuild so the settings window
+    /// can drop its session-only solo set (per-group-mute-solo.md decision
+    /// 8). The UI must not infer this from snapshot diffs.
+    pub rebuild_generation: u64,
 }
 
 pub struct PumpHandle {
@@ -104,6 +108,7 @@ mod tests {
             available_devices: vec![],
             default_output_name: None,
             all_sessions: vec![],
+            rebuild_generation: 0,
         }))
     }
 

@@ -2,7 +2,7 @@
 feature: per-group-mute-solo
 requirement_doc: null
 created: 2026-07-22
-status: approved
+status: complete
 note: >
   Roadmap Priority 3 (.lattice/ux-gap-roadmap.md). Per-strip mute + solo — the
   standard mixer control Splitstream lacks (only global master mute exists).
@@ -384,6 +384,7 @@ Keeps the struct off the `too_many_arguments` line it was extracted to dodge.
 | 9 | 2026-07-22 | **Soloing a parked group is accepted as a no-op in v1** (flow F) — no UI disabling, no parked-state plumbing into `UiState`. | A parked group has no `GroupState`, so `SetGroupSolo` lands nowhere, `solo_active` stays false, and the UI shows S lit while nothing else is silenced. Accepted because the parked group is *already* silent (its device is gone), so the only wrong part of the user's experience is that other groups keep playing. Rejected: exposing parked names in `UiState` to disable the button (new cross-layer plumbing for a transient degraded state). Revisit if drift-and-recovery episodes turn out to be common in practice. |
 
 | 10 | 2026-07-22 | **Design approved at Level 4. Status set to `approved` — ready for implementation.** | All four level sections persisted; no open questions remain. |
+| 11 | 2026-07-23 | **Implementation complete, inside-out (audio-core → engine → control → app → UI).** All 9 planned test contracts present, plus one symmetric bonus (`an_unchanged_rebuild_generation_leaves_the_solo_set_alone`, pure-helper coverage of the no-op branch). Full workspace suite green (audio-core 95, control 50, engine 96, app 49) and `cargo clippy --workspace --all-targets` clean. No deviation from the L2 component list or L4 contracts — every touched file matches the Design Summary's layer table exactly. Status → complete. | Verified against the real diff before closing, not assumed from the blueprint. |
 
 ## Open Questions
 
@@ -431,3 +432,17 @@ happened (decision 8: shell-published generation counter, not `Epoch`, not
 snapshot diffing).
 
 **Known accepted gap** — soloing a parked group is a no-op (flow F, decision 9).
+
+## Key Files
+
+| Path | Role |
+|---|---|
+| .lattice/ux-gap-roadmap.md | Origin (Priority 3) |
+| crates/audio-core/src/sample.rs | `GroupSpec.mute` |
+| crates/audio-core/src/mixer.rs | `GroupState.{mute, solo}`; `MixerCommand::{SetGroupMute, SetGroupSolo}`; `silenced` fn; `Mixer::solo_active`; `mix_tick` phase 1 env-publish + phase 3 skip |
+| crates/engine/src/graph.rs | `GroupConfig.muted`; `resolve` maps it to `GroupSpec.mute` |
+| crates/control/src/config.rs | `RawGroup.muted`; diff param arm |
+| crates/control/src/store.rs | `ConfigEdit::SetGroupMute`; `toml_edit` write + `group_table` writer |
+| crates/app/src/main.rs | `ShellAction::SetSolo`; `Dispatcher::apply_solo`; `Dispatcher.rebuild_generation`; `edits_to_mixer_commands` arm |
+| crates/app/src/event_pump.rs | `UiState.rebuild_generation` |
+| crates/app/src/ui.rs | `SettingsApp.{soloed, seen_generation}`; `clear_solo_on_rebuild`; `toggle_button`; M/S in `group_column` with dimming |
