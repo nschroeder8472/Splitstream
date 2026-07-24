@@ -220,9 +220,9 @@ impl Dispatcher {
         let affected: Vec<&str> = edits
             .iter()
             .filter_map(|e| match e {
-                ConfigEdit::AddDspStage(name, _) | ConfigEdit::RemoveDspStage(name, _) => {
-                    Some(name.as_str())
-                }
+                ConfigEdit::AddDspStage(name, _)
+                | ConfigEdit::RemoveDspStage(name, _)
+                | ConfigEdit::SetEqBands(name, ..) => Some(name.as_str()),
                 _ => None,
             })
             .collect();
@@ -320,16 +320,11 @@ fn edits_to_mixer_commands(edits: &[ConfigEdit], current: &ConfigSnapshot) -> Ve
             ConfigEdit::SetGroupMute(name, muted) => {
                 control::group_id_for(current, name).map(|id| MixerCommand::SetGroupMute(id, *muted))
             }
-            ConfigEdit::SetEqBand(name, band, spec) => {
-                let group = current.groups.iter().find(|g| &g.name == name)?;
+            ConfigEdit::SetEqBand(name, stage, band, spec) => {
                 let id = control::group_id_for(current, name)?;
-                let stage = group
-                    .dsp
-                    .iter()
-                    .position(|s| matches!(s.spec, audio_core::DspSpec::Eq { .. }))?;
                 Some(MixerCommand::SetDspParam {
                     group: id,
-                    stage,
+                    stage: *stage,
                     param: audio_core::DspParam::EqBand { band: *band, spec: *spec },
                 })
             }
@@ -370,6 +365,7 @@ fn edits_to_mixer_commands(edits: &[ConfigEdit], current: &ConfigSnapshot) -> Ve
             | ConfigEdit::RemoveGroup(..)
             | ConfigEdit::RemoveDspStage(..)
             | ConfigEdit::AddDspStage(..)
+            | ConfigEdit::SetEqBands(..)
             | ConfigEdit::SetRules(..)
             | ConfigEdit::SetSpatial(..)
             | ConfigEdit::SetAutostart(..) => None,
@@ -623,7 +619,7 @@ fn run_startup_and_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use audio_core::{Gain, GroupId, MixerCommand};
+    use audio_core::{EqBandSpec, Gain, GroupId, MixerCommand};
     use engine::GroupConfig;
 
     fn snapshot_with_group(name: &str) -> ConfigSnapshot {
@@ -732,5 +728,38 @@ mod tests {
 
         assert_eq!(commands.len(), 1);
         assert!(matches!(commands[0], MixerCommand::SetGroupMute(GroupId(0), true)));
+    }
+
+    #[test]
+    fn edits_to_mixer_commands_maps_set_eq_band_using_its_own_stage_index() {
+        // Regression for graphical-eq.md decision 13: the mapping must use
+        // the edit's own stage index directly, not search the group's DSP
+        // chain for the first Eq-shaped stage (which would silently target
+        // the wrong stage under a second Eq stage).
+        let snapshot = snapshot_with_group("Game");
+        let spec = EqBandSpec { freq_hz: 1000.0, gain_db: 3.0, q: 1.0 };
+        let edits = vec![ConfigEdit::SetEqBand("Game".into(), 1, 0, spec)];
+
+        let commands = edits_to_mixer_commands(&edits, &snapshot);
+
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0],
+            MixerCommand::SetDspParam { group: GroupId(0), stage: 1, param: audio_core::DspParam::EqBand { band: 0, spec: s } }
+            if s.freq_hz == 1000.0
+        ));
+    }
+
+    #[test]
+    fn set_eq_bands_is_a_chain_edit_not_a_param() {
+        // SetEqBands never has a MixerCommand equivalent -- it always rebuilds
+        // the stage via EditDspChains/apply_dsp_chains, even when unchanged
+        // in band count (decision 12).
+        let snapshot = snapshot_with_group("Game");
+        let edits = vec![ConfigEdit::SetEqBands("Game".into(), 0, vec![])];
+
+        let commands = edits_to_mixer_commands(&edits, &snapshot);
+
+        assert!(commands.is_empty());
     }
 }

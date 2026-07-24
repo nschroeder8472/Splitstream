@@ -200,6 +200,38 @@ impl Biquad {
     }
 }
 
+/// Combined magnitude response of a peaking-biquad cascade, in dB, at
+/// `freq_hz`. A cascade's magnitudes multiply, so their dB values sum.
+/// Built directly on [`Biquad::set_coeffs_peaking`] -- the same coefficient
+/// constructor the audio path uses, not a second derivation of the RBJ math
+/// -- so the drawn curve can never diverge from what the filter actually
+/// applies (graphical-eq.md decision 10).
+pub fn eq_response_db(bands: &[EqBandSpec], freq_hz: f32, sample_rate: u32) -> f32 {
+    let w = 2.0 * std::f64::consts::PI * f64::from(freq_hz) / f64::from(sample_rate);
+    let (sin_w, cos_w) = w.sin_cos();
+    // z^-1 = e^{-jw}; z^-2 = (z^-1)^2, via complex multiplication.
+    let (z1_re, z1_im) = (cos_w, -sin_w);
+    let z2_re = z1_re * z1_re - z1_im * z1_im;
+    let z2_im = 2.0 * z1_re * z1_im;
+
+    let mut total_db = 0.0f64;
+    for band in bands {
+        let mut bq = Biquad::identity();
+        bq.set_coeffs_peaking(band.freq_hz, band.gain_db, band.q, sample_rate);
+        let (b0, b1, b2) = (f64::from(bq.b0), f64::from(bq.b1), f64::from(bq.b2));
+        let (a1, a2) = (f64::from(bq.a1), f64::from(bq.a2));
+
+        let num_re = b0 + b1 * z1_re + b2 * z2_re;
+        let num_im = b1 * z1_im + b2 * z2_im;
+        let den_re = 1.0 + a1 * z1_re + a2 * z2_re;
+        let den_im = a1 * z1_im + a2 * z2_im;
+
+        let mag_sq = (num_re * num_re + num_im * num_im) / (den_re * den_re + den_im * den_im);
+        total_db += 10.0 * mag_sq.log10(); // 20*log10(sqrt(mag_sq))
+    }
+    total_db as f32
+}
+
 struct EqBand {
     freq: Smoothed,
     gain_db: Smoothed,
@@ -515,6 +547,85 @@ mod tests {
     fn linear_to_db_of_silence_is_negative_infinity() {
         assert_eq!(linear_to_db(0.0), f32::NEG_INFINITY);
         assert_eq!(linear_to_db(-1.0), f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn eq_response_matches_the_biquad_transfer_function() {
+        // Independent check: run a real Biquad on an actual sine wave at a
+        // frequency *off* the band's own center (2500 Hz vs a 1000 Hz band),
+        // measure its settled output amplitude, and compare against
+        // eq_response_db's prediction at that same frequency. This is the
+        // test decision 10 exists for.
+        let band = EqBandSpec { freq_hz: 1000.0, gain_db: 6.0, q: 1.0 };
+        let sample_rate = 48_000u32;
+        let probe_freq = 2500.0f32;
+
+        let mut bq = Biquad::identity();
+        bq.set_coeffs_peaking(band.freq_hz, band.gain_db, band.q, sample_rate);
+
+        let total_samples = 4000;
+        let warmup = 3000;
+        let mut peak = 0.0f32;
+        for i in 0..total_samples {
+            let t = i as f32 / sample_rate as f32;
+            let x = (2.0 * std::f32::consts::PI * probe_freq * t).sin();
+            let y = bq.process(x);
+            if i >= warmup {
+                peak = peak.max(y.abs());
+            }
+        }
+        let measured_db = 20.0 * peak.log10();
+        let predicted_db = eq_response_db(&[band], probe_freq, sample_rate);
+
+        assert!(
+            (measured_db - predicted_db).abs() < 0.3,
+            "measured {measured_db} dB from a real filtered sine, predicted {predicted_db} dB from eq_response_db"
+        );
+    }
+
+    #[test]
+    fn response_at_the_center_frequency_equals_the_band_gain() {
+        let band = EqBandSpec { freq_hz: 1000.0, gain_db: 9.0, q: 0.7 };
+        for rate in [44_100, 48_000, 96_000, 128_000] {
+            let db = eq_response_db(&[band], band.freq_hz, rate);
+            assert!((db - band.gain_db).abs() < 1e-2, "rate {rate}: expected {}, got {db}", band.gain_db);
+        }
+    }
+
+    #[test]
+    fn a_cascade_sums_its_bands_in_db() {
+        let a = EqBandSpec { freq_hz: 200.0, gain_db: 4.0, q: 1.0 };
+        let b = EqBandSpec { freq_hz: 5000.0, gain_db: -3.0, q: 1.0 };
+        let probe = 1200.0;
+        let rate = 48_000;
+
+        let combined = eq_response_db(&[a, b], probe, rate);
+        let separate_sum = eq_response_db(&[a], probe, rate) + eq_response_db(&[b], probe, rate);
+
+        assert!((combined - separate_sum).abs() < 1e-3, "combined {combined} vs summed {separate_sum}");
+    }
+
+    #[test]
+    fn an_empty_band_list_is_flat() {
+        assert_eq!(eq_response_db(&[], 1000.0, 48_000), 0.0);
+    }
+
+    #[test]
+    fn the_same_band_is_wider_at_a_higher_sample_rate() {
+        // Pins graphical-eq.md decision 14: a treble band's skirt is visibly
+        // narrower when drawn at an assumed rate lower than the group's real
+        // one -- the same band must read closer to full gain at 128 kHz than
+        // at 48 kHz, at a fixed frequency in its skirt.
+        let band = EqBandSpec { freq_hz: 15_000.0, gain_db: 6.0, q: 1.0 };
+        let probe_freq = 18_000.0;
+
+        let response_48k = eq_response_db(&[band], probe_freq, 48_000);
+        let response_128k = eq_response_db(&[band], probe_freq, 128_000);
+
+        assert!(
+            response_128k > response_48k + 1.0,
+            "expected the higher sample rate to read closer to full gain, got 48k={response_48k} 128k={response_128k}"
+        );
     }
 
     #[test]

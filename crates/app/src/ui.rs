@@ -231,6 +231,10 @@ pub struct SettingsApp {
     search: String,
     /// Path-keyed session chip icon cache (app-icons.md).
     icons: IconCache,
+    /// Which band the graphical EQ's numeric fields edit (graphical-eq.md
+    /// capability 4) — group name, stage index, band index. `None` when no
+    /// handle is selected on any stage.
+    selected_band: Option<(String, usize, usize)>,
 }
 
 impl SettingsApp {
@@ -255,6 +259,7 @@ impl SettingsApp {
             seen_generation: 0,
             search: String::new(),
             icons: IconCache::new(),
+            selected_band: None,
         }
     }
 
@@ -450,7 +455,14 @@ impl eframe::App for SettingsApp {
             Screen::GroupSettings(name) => {
                 // `screen_is_stale` above already guarantees this exists.
                 if let Some(group) = snapshot.groups.iter().find(|g| g.name == name) {
-                    self.group_settings_page(ui, group, &snapshot.groups);
+                    // The EQ curve needs the group's real sample rate
+                    // (graphical-eq.md decision 14) — a treble bell drawn at
+                    // an assumed 48 kHz is visibly wrong on a higher-rate
+                    // device. Falls back only while the engine is stopped.
+                    let rate = control::group_id_for(&snapshot, &name)
+                        .and_then(|id| stats.group_rates.iter().find(|(g, _)| *g == id).map(|(_, r)| *r))
+                        .unwrap_or(EQ_FALLBACK_RATE);
+                    self.group_settings_page(ui, group, &snapshot.groups, rate);
                 }
             }
         });
@@ -684,7 +696,7 @@ impl SettingsApp {
     /// remove-group — same content, now a full-width page reached via the
     /// column's gear icon (L3 flow B) instead of an inline expand. Back
     /// button returns to the mixer (L3 flow C).
-    fn group_settings_page(&mut self, ui: &mut egui::Ui, group: &GroupConfig, all_groups: &[GroupConfig]) {
+    fn group_settings_page(&mut self, ui: &mut egui::Ui, group: &GroupConfig, all_groups: &[GroupConfig], rate: u32) {
         let name = group.name.clone();
 
         ui.horizontal(|ui| {
@@ -719,7 +731,7 @@ impl SettingsApp {
             draft.match_rules = rules_draft;
         }
 
-        self.dsp_controls(ui, group);
+        self.dsp_controls(ui, group, rate);
         self.duck_controls(ui, group, all_groups);
 
         if ui.button("Remove group").clicked() {
@@ -730,37 +742,20 @@ impl SettingsApp {
         }
     }
 
-    /// Per-group DSP chain: one row per configured stage (live param
-    /// sliders + bypass + remove), plus add-stage buttons. EQ stages start
-    /// with a single band on creation — a new band's params, once added,
-    /// can only be retuned via `SetEqBand`, not created independently (no
-    /// `AddEqBand` edit exists; matches the contract's edit set as written).
-    fn dsp_controls(&self, ui: &mut egui::Ui, group: &GroupConfig) {
+    /// Per-group DSP chain: one row per configured stage (bypass + remove),
+    /// plus add-stage buttons. An `Eq` stage's row is followed by its full
+    /// graphical curve editor (graphical-eq.md) — draggable handles, presets,
+    /// numeric fields for the selected band.
+    fn dsp_controls(&mut self, ui: &mut egui::Ui, group: &GroupConfig, rate: u32) {
         let name = group.name.clone();
         ui.collapsing("DSP", |ui| {
             for (stage_idx, stage) in group.dsp.iter().enumerate() {
+                let mut eq_bands: Option<&[EqBandSpec]> = None;
                 ui.horizontal(|ui| {
                     match &stage.spec {
                         DspSpec::Eq { bands } => {
                             ui.label(format!("EQ #{stage_idx}"));
-                            if let Some(band) = bands.first() {
-                                let mut freq = band.freq_hz;
-                                let mut gain_db = band.gain_db;
-                                let mut q = band.q;
-                                let mut changed = false;
-                                changed |= ui
-                                    .add(egui::Slider::new(&mut freq, 20.0..=20_000.0).logarithmic(true).text("Hz"))
-                                    .changed();
-                                changed |= ui.add(egui::Slider::new(&mut gain_db, -24.0..=24.0).text("dB")).changed();
-                                changed |= ui.add(egui::Slider::new(&mut q, 0.1..=10.0).text("Q")).changed();
-                                if changed {
-                                    self.send(ShellAction::EditParams(vec![ConfigEdit::SetEqBand(
-                                        name.clone(),
-                                        0,
-                                        EqBandSpec { freq_hz: freq, gain_db, q },
-                                    )]));
-                                }
-                            }
+                            eq_bands = Some(bands.as_slice());
                         }
                         DspSpec::Limiter { ceiling_db } => {
                             ui.label(format!("Limiter #{stage_idx}"));
@@ -789,6 +784,52 @@ impl SettingsApp {
                         )]));
                     }
                 });
+
+                if let Some(bands) = eq_bands {
+                    let mut sel = match &self.selected_band {
+                        Some((g, s, b)) if g == &name && *s == stage_idx => Some(*b),
+                        _ => None,
+                    };
+                    let edit = eq_editor(ui, bands, rate, &mut sel, EQ_PLOT_HEIGHT);
+                    self.selected_band = sel.map(|b| (name.clone(), stage_idx, b));
+
+                    match edit {
+                        Some(EqEdit::Retune { band, spec }) => {
+                            self.send(ShellAction::EditParams(vec![ConfigEdit::SetEqBand(
+                                name.clone(),
+                                stage_idx,
+                                band,
+                                spec,
+                            )]));
+                        }
+                        Some(EqEdit::Replace(new_bands)) => {
+                            self.send(ShellAction::EditDspChains(vec![ConfigEdit::SetEqBands(
+                                name.clone(),
+                                stage_idx,
+                                new_bands,
+                            )]));
+                        }
+                        None => {}
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.label("Presets:");
+                        for (label, preset) in [
+                            ("Flat", EqPreset::Flat),
+                            ("Bass Boost", EqPreset::BassBoost),
+                            ("Vocal", EqPreset::Vocal),
+                            ("Treble", EqPreset::Treble),
+                        ] {
+                            if ui.button(label).clicked() {
+                                self.send(ShellAction::EditDspChains(vec![ConfigEdit::SetEqBands(
+                                    name.clone(),
+                                    stage_idx,
+                                    preset_bands(preset),
+                                )]));
+                            }
+                        }
+                    });
+                }
             }
 
             ui.horizontal(|ui| {
@@ -1237,6 +1278,197 @@ fn tile_color(label: &str) -> egui::Color32 {
     let hash = label.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(u32::from(b)));
     let hue = (hash % 360) as f32 / 360.0;
     egui::ecolor::Hsva::new(hue, 0.45, 0.55, 1.0).into()
+}
+
+/// Graphical multi-band EQ editor (graphical-eq.md).
+const EQ_MAX_BANDS: usize = 8;
+const EQ_MIN_FREQ_HZ: f32 = 20.0;
+const EQ_MAX_FREQ_HZ: f32 = 20_000.0;
+const EQ_GAIN_LIMIT_DB: f32 = 24.0;
+/// Only used while the engine is stopped and `group_rates` is empty.
+const EQ_FALLBACK_RATE: u32 = 48_000;
+const EQ_PLOT_HEIGHT: f32 = 160.0;
+/// How close (in points) the pointer must land to a handle to hit it.
+const EQ_HANDLE_HIT_RADIUS: f32 = 10.0;
+const EQ_HANDLE_PAINT_RADIUS: f32 = 5.0;
+/// dB gained/lost per unit of scroll (decision 6: Q by scroll).
+const EQ_SCROLL_Q_SENSITIVITY: f32 = 0.02;
+const EQ_CURVE_SAMPLES: usize = 128;
+
+/// Log-frequency axis: pixel x -> Hz and back. Exact inverses of each other.
+fn freq_to_x(freq_hz: f32, rect: egui::Rect) -> f32 {
+    let t = (freq_hz.max(EQ_MIN_FREQ_HZ).ln() - EQ_MIN_FREQ_HZ.ln()) / (EQ_MAX_FREQ_HZ.ln() - EQ_MIN_FREQ_HZ.ln());
+    rect.left() + t * rect.width()
+}
+
+fn x_to_freq(x: f32, rect: egui::Rect) -> f32 {
+    let t = ((x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+    (EQ_MIN_FREQ_HZ.ln() + t * (EQ_MAX_FREQ_HZ.ln() - EQ_MIN_FREQ_HZ.ln())).exp()
+}
+
+/// Linear dB axis over `-EQ_GAIN_LIMIT_DB..=EQ_GAIN_LIMIT_DB`: pixel y and
+/// back. Top of the rect is +gain, bottom is -gain. Exact inverses.
+fn db_to_y(db: f32, rect: egui::Rect) -> f32 {
+    let t = (db.clamp(-EQ_GAIN_LIMIT_DB, EQ_GAIN_LIMIT_DB) + EQ_GAIN_LIMIT_DB) / (2.0 * EQ_GAIN_LIMIT_DB);
+    rect.bottom() - t * rect.height()
+}
+
+fn y_to_db(y: f32, rect: egui::Rect) -> f32 {
+    let t = ((rect.bottom() - y) / rect.height()).clamp(0.0, 1.0);
+    t * 2.0 * EQ_GAIN_LIMIT_DB - EQ_GAIN_LIMIT_DB
+}
+
+/// Built-in preset curves (capability 5) — UI-authored, not domain concepts.
+#[derive(Clone, Copy, PartialEq)]
+enum EqPreset {
+    Flat,
+    BassBoost,
+    Vocal,
+    Treble,
+}
+
+/// The band list a preset replaces the stage's current one with.
+fn preset_bands(preset: EqPreset) -> Vec<EqBandSpec> {
+    match preset {
+        EqPreset::Flat => vec![],
+        EqPreset::BassBoost => vec![
+            EqBandSpec { freq_hz: 80.0, gain_db: 6.0, q: 0.8 },
+            EqBandSpec { freq_hz: 250.0, gain_db: 2.0, q: 1.0 },
+        ],
+        EqPreset::Vocal => vec![
+            EqBandSpec { freq_hz: 250.0, gain_db: -2.0, q: 1.0 },
+            EqBandSpec { freq_hz: 3000.0, gain_db: 4.0, q: 1.0 },
+            EqBandSpec { freq_hz: 8000.0, gain_db: 2.0, q: 0.8 },
+        ],
+        EqPreset::Treble => vec![
+            EqBandSpec { freq_hz: 8000.0, gain_db: 5.0, q: 0.7 },
+            EqBandSpec { freq_hz: 12_000.0, gain_db: 3.0, q: 0.7 },
+        ],
+    }
+}
+
+/// What the editor produced this frame — the two variants map onto the two
+/// engine paths, so the fast/structural split is made at the type level
+/// rather than remembered at each call site.
+enum EqEdit {
+    /// One band retuned -> `SetEqBand` -> `EditParams`.
+    Retune { band: usize, spec: EqBandSpec },
+    /// Band list replaced -> `SetEqBands` -> `EditDspChains`.
+    Replace(Vec<EqBandSpec>),
+}
+
+/// The band (if any) whose handle sits under `point`, nearest first.
+fn hit_test_handle(bands: &[EqBandSpec], point: egui::Pos2, rect: egui::Rect) -> Option<usize> {
+    bands
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (i, egui::pos2(freq_to_x(b.freq_hz, rect), db_to_y(b.gain_db, rect)).distance(point)))
+        .filter(|(_, dist)| *dist <= EQ_HANDLE_HIT_RADIUS)
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(i, _)| i)
+}
+
+/// Curve, handles, drag/scroll, click-to-add, right-click-to-remove, and
+/// numeric fields for the selected band. `selected` is this stage's selected
+/// band index, read and written in place (decision 11: one editor per
+/// stage). Returns `Some` only on the frame an edit actually happened.
+fn eq_editor(
+    ui: &mut egui::Ui,
+    bands: &[EqBandSpec],
+    rate: u32,
+    selected: &mut Option<usize>,
+    height: f32,
+) -> Option<EqEdit> {
+    let mut edit = None;
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click_and_drag());
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+    painter.hline(rect.x_range(), db_to_y(0.0, rect), ui.visuals().widgets.noninteractive.bg_stroke);
+
+    let curve: Vec<egui::Pos2> = (0..=EQ_CURVE_SAMPLES)
+        .map(|i| {
+            let x = rect.left() + rect.width() * (i as f32 / EQ_CURVE_SAMPLES as f32);
+            let db = audio_core::eq_response_db(bands, x_to_freq(x, rect), rate);
+            egui::pos2(x, db_to_y(db, rect))
+        })
+        .collect();
+    painter.add(egui::Shape::line(curve, egui::Stroke::new(2.0, ui.visuals().hyperlink_color)));
+
+    for (i, band) in bands.iter().enumerate() {
+        let pos = egui::pos2(freq_to_x(band.freq_hz, rect), db_to_y(band.gain_db, rect));
+        let color = if *selected == Some(i) { ui.visuals().selection.bg_fill } else { ui.visuals().text_color() };
+        painter.circle_filled(pos, EQ_HANDLE_PAINT_RADIUS, color);
+    }
+
+    // The gesture's origin (fixed for the whole press/drag), falling back to
+    // the current hover position for a plain scroll with no button down.
+    let origin = ui.input(|i| i.pointer.press_origin()).or_else(|| response.hover_pos());
+    let hit_idx = origin.and_then(|p| hit_test_handle(bands, p, rect));
+
+    let primary_drag_started = response.drag_started_by(egui::PointerButton::Primary);
+    if (primary_drag_started || response.clicked() || response.secondary_clicked()) && hit_idx.is_some() {
+        *selected = hit_idx;
+    }
+
+    // `dragged()` alone is button-agnostic (fires for a secondary-button drag
+    // too); a right-drag on a handle must fall through to the remove branch
+    // below, not retune by position.
+    if response.dragged_by(egui::PointerButton::Primary) {
+        if let Some(idx) = *selected {
+            if let (Some(pos), Some(old)) = (response.interact_pointer_pos(), bands.get(idx)) {
+                let freq = x_to_freq(pos.x, rect).clamp(EQ_MIN_FREQ_HZ, EQ_MAX_FREQ_HZ);
+                let gain = y_to_db(pos.y, rect).clamp(-EQ_GAIN_LIMIT_DB, EQ_GAIN_LIMIT_DB);
+                edit = Some(EqEdit::Retune { band: idx, spec: EqBandSpec { freq_hz: freq, gain_db: gain, q: old.q } });
+            }
+        }
+    } else if response.secondary_clicked() {
+        if let Some(idx) = hit_idx {
+            let mut new_bands = bands.to_vec();
+            new_bands.remove(idx);
+            *selected = None;
+            edit = Some(EqEdit::Replace(new_bands));
+        }
+    } else if response.clicked() && hit_idx.is_none() && bands.len() < EQ_MAX_BANDS {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let freq = x_to_freq(pos.x, rect).clamp(EQ_MIN_FREQ_HZ, EQ_MAX_FREQ_HZ);
+            let gain = y_to_db(pos.y, rect).clamp(-EQ_GAIN_LIMIT_DB, EQ_GAIN_LIMIT_DB);
+            let mut new_bands = bands.to_vec();
+            new_bands.push(EqBandSpec { freq_hz: freq, gain_db: gain, q: 1.0 });
+            *selected = Some(new_bands.len() - 1);
+            edit = Some(EqEdit::Replace(new_bands));
+        }
+    }
+
+    if let Some(idx) = hit_idx {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll.abs() > f32::EPSILON {
+            if let Some(old) = bands.get(idx) {
+                let q = (old.q + scroll * EQ_SCROLL_Q_SENSITIVITY).clamp(0.1, 10.0);
+                edit = Some(EqEdit::Retune { band: idx, spec: EqBandSpec { q, ..*old } });
+            }
+        }
+    }
+
+    if let Some(band) = selected.and_then(|idx| bands.get(idx).map(|b| (idx, *b))) {
+        let (idx, mut spec) = band;
+        ui.horizontal(|ui| {
+            let mut changed = false;
+            changed |= ui
+                .add(egui::DragValue::new(&mut spec.freq_hz).range(EQ_MIN_FREQ_HZ..=EQ_MAX_FREQ_HZ).suffix(" Hz"))
+                .changed();
+            changed |= ui
+                .add(egui::DragValue::new(&mut spec.gain_db).range(-EQ_GAIN_LIMIT_DB..=EQ_GAIN_LIMIT_DB).suffix(" dB"))
+                .changed();
+            changed |= ui.add(egui::DragValue::new(&mut spec.q).range(0.1..=10.0).suffix(" Q")).changed();
+            if changed {
+                edit = Some(EqEdit::Retune { band: idx, spec });
+            }
+        });
+    }
+
+    edit
 }
 
 /// Reusable device picker — replaces `text_edit_singleline` at every call
@@ -1909,6 +2141,70 @@ mod tests {
     #[test]
     fn tile_color_differs_across_distinct_labels() {
         assert_ne!(tile_color("Google Chrome"), tile_color("Discord"));
+    }
+
+    #[test]
+    fn freq_to_x_round_trips_through_x_to_freq() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 100.0));
+        for freq in [20.0f32, 100.0, 1000.0, 5000.0, 20_000.0] {
+            let x = freq_to_x(freq, rect);
+            let back = x_to_freq(x, rect);
+            assert!((back - freq).abs() / freq < 1e-3, "freq {freq} -> x {x} -> {back}");
+        }
+    }
+
+    #[test]
+    fn db_to_y_round_trips_through_y_to_db() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 100.0));
+        for db in [-24.0f32, -6.0, 0.0, 6.0, 24.0] {
+            let y = db_to_y(db, rect);
+            let back = y_to_db(y, rect);
+            assert!((back - db).abs() < 1e-2, "db {db} -> y {y} -> {back}");
+        }
+    }
+
+    #[test]
+    fn the_axis_midpoint_is_the_geometric_mean_frequency() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 100.0));
+        let mid_x = rect.left() + rect.width() / 2.0;
+        let expected = (EQ_MIN_FREQ_HZ * EQ_MAX_FREQ_HZ).sqrt();
+        assert!((x_to_freq(mid_x, rect) - expected).abs() / expected < 1e-3);
+    }
+
+    #[test]
+    fn no_preset_exceeds_the_band_limit() {
+        for preset in [EqPreset::Flat, EqPreset::BassBoost, EqPreset::Vocal, EqPreset::Treble] {
+            assert!(preset_bands(preset).len() <= EQ_MAX_BANDS);
+        }
+    }
+
+    #[test]
+    fn hit_test_handle_finds_a_handle_at_its_exact_position() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 100.0));
+        let bands = vec![EqBandSpec { freq_hz: 1000.0, gain_db: 0.0, q: 1.0 }];
+        let pos = egui::pos2(freq_to_x(1000.0, rect), db_to_y(0.0, rect));
+        assert_eq!(hit_test_handle(&bands, pos, rect), Some(0));
+    }
+
+    #[test]
+    fn hit_test_handle_returns_none_when_nothing_is_close_enough() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 100.0));
+        let bands = vec![EqBandSpec { freq_hz: 1000.0, gain_db: 0.0, q: 1.0 }];
+        let far_corner = rect.left_top();
+        assert_eq!(hit_test_handle(&bands, far_corner, rect), None);
+    }
+
+    #[test]
+    fn hit_test_handle_picks_the_closer_of_two_handles_both_within_radius() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 100.0));
+        let near = egui::pos2(freq_to_x(1000.0, rect), db_to_y(0.0, rect));
+        let far = egui::pos2(near.x + EQ_HANDLE_HIT_RADIUS * 0.9, near.y);
+        let far_freq = x_to_freq(far.x, rect);
+        let bands =
+            vec![EqBandSpec { freq_hz: far_freq, gain_db: 0.0, q: 1.0 }, EqBandSpec { freq_hz: 1000.0, gain_db: 0.0, q: 1.0 }];
+        // A point right on top of band 1 (index 1); band 0 sits just within
+        // hit radius too, so this only passes if the *nearer* one wins.
+        assert_eq!(hit_test_handle(&bands, near, rect), Some(1));
     }
 
     #[test]

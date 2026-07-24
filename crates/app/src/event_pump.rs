@@ -102,6 +102,7 @@ mod tests {
                 group_peak: vec![],
                 output_peak: vec![],
                 output_names: vec![],
+                group_rates: vec![],
             },
             routing_degraded: false,
             first_run: false,
