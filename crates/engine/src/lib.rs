@@ -8,7 +8,7 @@ pub mod runtime;
 pub use clock::{DriftConfig, DriftController, FillSample};
 pub use graph::{
     AppConfig, ConfigSnapshot, DspStageConfig, DuckSpecConfig, GraphPlan, GroupConfig,
-    HotkeyChord, HotkeyMap,
+    HotkeyChord, HotkeyMap, ProfileConfig, ProfileGroupConfig,
 };
 pub use routing::{start_routing, RoutingHandle, RoutingReader};
 pub use rules::{match_session, GlobPattern, GroupRules, MatchRule, SessionInfo};

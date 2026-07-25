@@ -6,6 +6,7 @@
 //! purpose: the icon must stay resident whether or not the settings window
 //! is open (app-shell.md L1 §1 vs §2 are independent capabilities).
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
@@ -13,10 +14,10 @@ use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::platform::windows::EventLoopBuilderExtWindows;
-use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, Submenu};
 use tray_icon::{Icon, TrayIconBuilder};
 
-use engine::EngineEvent;
+use engine::{EngineEvent, ProfileConfig};
 
 use crate::ShellAction;
 
@@ -37,7 +38,11 @@ impl TrayHandle {
     }
 }
 
-pub fn spawn_tray(actions: Sender<ShellAction>, notices: Receiver<EngineEvent>) -> TrayHandle {
+pub fn spawn_tray(
+    actions: Sender<ShellAction>,
+    notices: Receiver<EngineEvent>,
+    profiles: Vec<ProfileConfig>,
+) -> TrayHandle {
     // The `EventLoop` ties itself to the OS message queue of whichever
     // thread builds it, so it's built *inside* the spawned thread, not moved
     // in from outside. Its `EventLoopProxy` (Send + Clone, made for exactly
@@ -51,7 +56,7 @@ pub fn spawn_tray(actions: Sender<ShellAction>, notices: Receiver<EngineEvent>) 
         if proxy_tx.send(event_loop.create_proxy()).is_err() {
             return; // caller gave up waiting
         }
-        run_tray(&mut event_loop, actions);
+        run_tray(&mut event_loop, actions, profiles);
     });
 
     let proxy = proxy_rx
@@ -88,28 +93,42 @@ struct MenuIds {
     mute: MenuId,
     settings: MenuId,
     quit: MenuId,
+    /// Profile submenu items (profiles.md capability 9) — id to profile
+    /// name, empty when the config defines no profiles (no submenu built
+    /// at all in that case, same "purely additive" behavior as elsewhere).
+    profiles: HashMap<MenuId, String>,
 }
 
-fn build_menu() -> (Menu, MenuIds) {
+fn build_menu(profiles: &[ProfileConfig]) -> (Menu, MenuIds) {
     let mute_item = MenuItem::new("Mute", true, None);
     let settings_item = MenuItem::new("Settings", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
 
-    let ids = MenuIds {
+    let mut ids = MenuIds {
         mute: mute_item.id().clone(),
         settings: settings_item.id().clone(),
         quit: quit_item.id().clone(),
+        profiles: HashMap::new(),
     };
 
     let menu = Menu::new();
     let _ = menu.append(&mute_item);
+    if !profiles.is_empty() {
+        let submenu = Submenu::new("Profiles", true);
+        for profile in profiles {
+            let item = MenuItem::new(&profile.name, true, None);
+            ids.profiles.insert(item.id().clone(), profile.name.clone());
+            let _ = submenu.append(&item);
+        }
+        let _ = menu.append(&submenu);
+    }
     let _ = menu.append(&settings_item);
     let _ = menu.append(&quit_item);
     (menu, ids)
 }
 
-fn run_tray(event_loop: &mut EventLoop<TrayCommand>, actions: Sender<ShellAction>) {
-    let (menu, ids) = build_menu();
+fn run_tray(event_loop: &mut EventLoop<TrayCommand>, actions: Sender<ShellAction>, profiles: Vec<ProfileConfig>) {
+    let (menu, ids) = build_menu(&profiles);
 
     let mut tray_icon = Some(
         TrayIconBuilder::new()
@@ -133,6 +152,8 @@ fn run_tray(event_loop: &mut EventLoop<TrayCommand>, actions: Sender<ShellAction
             } else if menu_event.id == ids.quit {
                 let _ = actions.send(ShellAction::Quit);
                 *control_flow = ControlFlow::Exit;
+            } else if let Some(name) = ids.profiles.get(&menu_event.id) {
+                let _ = actions.send(ShellAction::ApplyProfile(name.clone()));
             }
         }
 

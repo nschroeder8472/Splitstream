@@ -15,7 +15,7 @@ use serde::Deserialize;
 use audio_core::{DspSpec, DuckSpec, EqBandSpec, Gain, GroupId, MixerCommand};
 use engine::{
     AppConfig, ConfigSnapshot, DspStageConfig, DuckSpecConfig, GroupConfig, GroupRules,
-    HotkeyChord, HotkeyMap, MatchRule,
+    HotkeyChord, HotkeyMap, MatchRule, ProfileConfig, ProfileGroupConfig,
 };
 
 pub const SUPPORTED_SCHEMA_VERSION: u32 = 2;
@@ -43,12 +43,17 @@ struct RawConfig {
     app: RawAppConfig,
     #[serde(default)]
     hotkeys: RawHotkeys,
+    /// `[[profile]]` tables (profiles.md) — purely additive, no schema bump.
+    #[serde(default)]
+    profile: Vec<RawProfile>,
 }
 
 #[derive(Deserialize, Default)]
 struct RawAppConfig {
     #[serde(default)]
     autostart: bool,
+    #[serde(default)]
+    active_profile: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -111,12 +116,60 @@ struct RawDuck {
     release_ms: f32,
 }
 
+/// A `[[profile]]` table (profiles.md) — a named, partial snapshot of
+/// per-group state. `group` entries are a subset of the live groups by
+/// design (L1 capability 11): a name absent from the config is skipped on
+/// apply, not an error, so no whole-snapshot validation runs over these the
+/// way [`validate_duck_config`] does for live groups.
+#[derive(Deserialize)]
+struct RawProfile {
+    name: String,
+    #[serde(default)]
+    hotkey: Option<String>,
+    #[serde(default = "default_gain")]
+    master: f32,
+    #[serde(default)]
+    muted: bool,
+    #[serde(default)]
+    group: Vec<RawProfileGroup>,
+}
+
+/// A `[[profile.group]]` table — same shape as [`RawGroup`] minus
+/// `match_rules` (decision 8: match rules stay shared, not per-profile).
+#[derive(Deserialize)]
+struct RawProfileGroup {
+    name: String,
+    output_device: String,
+    #[serde(default = "default_gain")]
+    gain: f32,
+    #[serde(default)]
+    follow_master: bool,
+    #[serde(default)]
+    dsp: Vec<RawDspStage>,
+    #[serde(default)]
+    duck: Option<RawDuck>,
+    #[serde(default)]
+    spatial: bool,
+    #[serde(default)]
+    muted: bool,
+}
+
 fn current_schema_version() -> u32 {
     SUPPORTED_SCHEMA_VERSION
 }
 
 fn default_gain() -> f32 {
     1.0
+}
+
+fn convert_duck(d: RawDuck) -> DuckSpecConfig {
+    DuckSpecConfig {
+        trigger: d.trigger,
+        amount_db: d.amount_db,
+        threshold_db: d.threshold_db,
+        attack_ms: d.attack_ms,
+        release_ms: d.release_ms,
+    }
 }
 
 fn convert_dsp_stage(raw: RawDspStage) -> Result<DspStageConfig, ConfigError> {
@@ -257,13 +310,7 @@ pub(crate) fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
                 .into_iter()
                 .map(convert_dsp_stage)
                 .collect::<Result<Vec<_>, ConfigError>>()?;
-            let duck = g.duck.map(|d| DuckSpecConfig {
-                trigger: d.trigger,
-                amount_db: d.amount_db,
-                threshold_db: d.threshold_db,
-                attack_ms: d.attack_ms,
-                release_ms: d.release_ms,
-            });
+            let duck = g.duck.map(convert_duck);
             Ok(GroupConfig {
                 name: g.name,
                 output_device: g.output_device,
@@ -287,6 +334,12 @@ pub(crate) fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
         .transpose()
         .map_err(ConfigError::Invalid)?;
 
+    let profiles = raw
+        .profile
+        .into_iter()
+        .map(convert_profile)
+        .collect::<Result<Vec<_>, ConfigError>>()?;
+
     Ok(ConfigSnapshot {
         schema_version: raw.schema_version,
         master,
@@ -295,7 +348,50 @@ pub(crate) fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
         app: AppConfig {
             autostart: raw.app.autostart,
             hotkeys: HotkeyMap { mute_master },
+            active_profile: raw.app.active_profile,
         },
+        profiles,
+    })
+}
+
+fn convert_profile(raw: RawProfile) -> Result<ProfileConfig, ConfigError> {
+    let master = Gain::new(raw.master).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    let hotkey = raw
+        .hotkey
+        .as_deref()
+        .map(HotkeyChord::parse)
+        .transpose()
+        .map_err(ConfigError::Invalid)?;
+    let groups = raw
+        .group
+        .into_iter()
+        .map(|g| {
+            let gain = Gain::new(g.gain).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+            let dsp = g
+                .dsp
+                .into_iter()
+                .map(convert_dsp_stage)
+                .collect::<Result<Vec<_>, ConfigError>>()?;
+            let duck = g.duck.map(convert_duck);
+            Ok(ProfileGroupConfig {
+                name: g.name,
+                output_device: g.output_device,
+                gain,
+                follow_master: g.follow_master,
+                dsp,
+                duck,
+                spatial: g.spatial,
+                muted: g.muted,
+            })
+        })
+        .collect::<Result<Vec<_>, ConfigError>>()?;
+
+    Ok(ProfileConfig {
+        name: raw.name,
+        hotkey,
+        master,
+        muted: raw.muted,
+        groups,
     })
 }
 
@@ -588,6 +684,52 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_profile_with_a_group_and_active_profile() {
+        let toml = r#"
+            schema_version = 2
+            master = 1.0
+
+            [app]
+            active_profile = "Gaming"
+
+            [[profile]]
+            name = "Gaming"
+            hotkey = "Ctrl+Alt+1"
+            master = 0.8
+            muted = false
+
+              [[profile.group]]
+              name = "Game"
+              gain = 1.0
+              follow_master = true
+              output_device = "Headphones"
+              spatial = true
+        "#;
+        let snapshot = parse(toml).unwrap();
+        assert_eq!(snapshot.app.active_profile, Some("Gaming".to_string()));
+        assert_eq!(snapshot.profiles.len(), 1);
+        let p = &snapshot.profiles[0];
+        assert_eq!(p.name, "Gaming");
+        assert_eq!(p.master, Gain::new(0.8).unwrap());
+        assert!(!p.muted);
+        assert_eq!(
+            p.hotkey,
+            Some(HotkeyChord { ctrl: true, alt: true, shift: false, key: '1' })
+        );
+        assert_eq!(p.groups.len(), 1);
+        assert_eq!(p.groups[0].output_device, "Headphones");
+        assert!(p.groups[0].spatial);
+    }
+
+    #[test]
+    fn a_config_with_no_profiles_behaves_byte_for_byte_as_today() {
+        let toml = "schema_version = 2\nmaster = 1.0\n";
+        let snapshot = parse(toml).unwrap();
+        assert!(snapshot.profiles.is_empty());
+        assert_eq!(snapshot.app.active_profile, None);
+    }
+
+    #[test]
     fn missing_muted_app_and_hotkeys_default_to_unset() {
         let toml = "schema_version = 2\nmaster = 1.0\n";
         let snapshot = parse(toml).unwrap();
@@ -661,6 +803,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group("Game", "Out", 1.0, true)],
         };
         let b = ConfigSnapshot {
@@ -668,6 +811,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group("Game", "Out", 1.0, true)],
         };
         assert!(diff(&a, &b).is_unchanged());
@@ -680,6 +824,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group("Game", "Out", 1.0, true)],
         };
         let b = ConfigSnapshot {
@@ -687,6 +832,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group("Game", "Out", 0.5, true)],
         };
         let delta = diff(&a, &b);
@@ -703,6 +849,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group("Game", "Out", 1.0, true)],
         };
         let mut b = a.clone();
@@ -725,6 +872,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group("Game", "Out", 1.0, true)],
         };
         let b = ConfigSnapshot {
@@ -732,6 +880,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group("Music", "Out", 1.0, true)],
         };
         let delta = diff(&a, &b);
@@ -747,6 +896,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group("Game", "Speakers", 1.0, true)],
         };
         let b = ConfigSnapshot {
@@ -754,6 +904,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group("Game", "Headphones", 1.0, true)],
         };
         assert!(diff(&a, &b).structural);
@@ -766,6 +917,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group_with_rules("Game", "Out", 1.0, true, &[])],
         };
         let b = ConfigSnapshot {
@@ -773,6 +925,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group_with_rules("Game", "Out", 1.0, true, &["game.exe"])],
         };
         let delta = diff(&a, &b);
@@ -794,6 +947,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group_with_rules("Game", "Out", 1.0, true, &[])],
         };
         let b = ConfigSnapshot {
@@ -801,6 +955,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group_with_rules("Game", "Out", 0.5, true, &["game.exe"])],
         };
         let delta = diff(&a, &b);
@@ -817,6 +972,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![
                 group_with_rules("Game", "Out", 1.0, true, &["game.exe"]),
                 group_with_rules("Music", "Out", 1.0, true, &["music*.exe"]),
@@ -968,6 +1124,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group_with_dsp("Game", "Out", vec![])],
         };
         let b = ConfigSnapshot {
@@ -975,6 +1132,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group_with_dsp(
                 "Game",
                 "Out",
@@ -1003,6 +1161,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group_with_dsp("Game", "Out", vec![stage(false)])],
         };
         let b = ConfigSnapshot {
@@ -1010,6 +1169,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group_with_dsp("Game", "Out", vec![stage(true)])],
         };
         let delta = diff(&a, &b);
@@ -1028,6 +1188,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![
                 group("Voice", "Out", 1.0, true),
                 group("Music", "Out", 1.0, true),
@@ -1058,6 +1219,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group("Game", "Out", 1.0, true)],
         };
         let mut b = a.clone();
@@ -1078,6 +1240,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![group("Game", "Out", 1.0, true)],
         };
         let b = a.clone();

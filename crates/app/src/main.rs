@@ -59,6 +59,13 @@ pub enum ShellAction {
     /// an `EditParams` variant: `apply_params` always follows the mixer
     /// command with `store.apply`, and solo must never reach TOML.
     SetSolo(String, bool),
+    /// Switch to (or revert to) a named profile — same flow from tray,
+    /// hotkey or window (profiles.md L3 flow A/D). Not an `EditParams`/
+    /// `EditStructure`/etc. variant: the edit batch a profile switch
+    /// produces is mixed, so `Dispatcher::apply_profile_action` partitions
+    /// it by `edit_path` itself rather than the call site pre-choosing one
+    /// of the four fixed paths.
+    ApplyProfile(String),
     ShowSettings,
     Quit,
 }
@@ -283,6 +290,83 @@ impl Dispatcher {
         }
     }
 
+    /// Flow A/D: applies (or reverts to) a named profile. Partitions the
+    /// resulting batch by `edit_path` (profiles.md decision 12) rather than
+    /// calling `apply_structural`/`apply_params`/etc. directly — each of
+    /// those does its own `store.apply`, and a profile batch must write the
+    /// store exactly once. A `Structural` edit (only `SetGroupOutput` can
+    /// appear here — profiles never add/remove groups) always rebuilds,
+    /// which subsumes any `DspChain`/`Spatial` edits in the same batch too
+    /// (`rebuild` reads the whole new snapshot fresh); only when nothing in
+    /// the batch is structural do the narrower off-RT swap paths run
+    /// instead, so a gain-only profile never rebuilds.
+    fn apply_profile_action(&mut self, name: &str) {
+        let mut edits = control::profiles::apply_profile(&self.current, name);
+        edits.push(ConfigEdit::SetActiveProfile(Some(name.to_string())));
+
+        let structural = edits.iter().any(|e| control::edit_path(e) == control::EditPath::Structural);
+
+        match self.store.apply(&edits) {
+            Ok(new_snapshot) => {
+                if structural {
+                    if let Err(e) = self.handle.rebuild(&new_snapshot) {
+                        eprintln!("rebuild failed: {e:?}");
+                    }
+                    self.rebuild_generation += 1;
+                    self.routing.update_rules(group_rules(&new_snapshot));
+                } else {
+                    let commands = edits_to_mixer_commands(&edits, &self.current);
+                    if !commands.is_empty() {
+                        if let Err(e) = self.handle.apply_params(commands) {
+                            eprintln!("apply_params failed: {e:?}");
+                        }
+                    }
+
+                    let dsp_chains: Vec<(audio_core::GroupId, Vec<audio_core::DspSpec>)> = edits
+                        .iter()
+                        .filter_map(|e| match e {
+                            ConfigEdit::SetDspChain(group_name, _) => {
+                                let id = control::group_id_for(&new_snapshot, group_name)?;
+                                let dsp = new_snapshot
+                                    .groups
+                                    .iter()
+                                    .find(|g| &g.name == group_name)?
+                                    .dsp
+                                    .iter()
+                                    .map(|s| s.spec.clone())
+                                    .collect();
+                                Some((id, dsp))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if !dsp_chains.is_empty() {
+                        if let Err(e) = self.handle.apply_dsp_chains(dsp_chains) {
+                            eprintln!("apply_dsp_chains failed: {e:?}");
+                        }
+                    }
+
+                    let spatial_changes: Vec<(audio_core::GroupId, bool)> = edits
+                        .iter()
+                        .filter_map(|e| match e {
+                            ConfigEdit::SetSpatial(group_name, on) => {
+                                control::group_id_for(&new_snapshot, group_name).map(|id| (id, *on))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if !spatial_changes.is_empty() {
+                        if let Err(e) = self.handle.apply_spatial(&spatial_changes) {
+                            eprintln!("apply_spatial failed: {e:?}");
+                        }
+                    }
+                }
+                self.set_current(new_snapshot);
+            }
+            Err(e) => eprintln!("profile apply rejected: {e:?}"),
+        }
+    }
+
     fn handle_action(&mut self, action: ShellAction) -> Outcome {
         match action {
             ShellAction::EditParams(edits) => self.apply_params(&edits),
@@ -294,6 +378,7 @@ impl Dispatcher {
                 self.apply_params(&[ConfigEdit::SetMuted(muted)]);
             }
             ShellAction::SetSolo(name, on) => self.apply_solo(&name, on),
+            ShellAction::ApplyProfile(name) => self.apply_profile_action(&name),
             ShellAction::ShowSettings => self.focus_window(),
             ShellAction::Quit => return Outcome::Quit,
         }
@@ -368,7 +453,11 @@ fn edits_to_mixer_commands(edits: &[ConfigEdit], current: &ConfigSnapshot) -> Ve
             | ConfigEdit::SetEqBands(..)
             | ConfigEdit::SetRules(..)
             | ConfigEdit::SetSpatial(..)
-            | ConfigEdit::SetAutostart(..) => None,
+            | ConfigEdit::SetAutostart(..)
+            | ConfigEdit::SetDspChain(..)
+            | ConfigEdit::SetProfile(..)
+            | ConfigEdit::RemoveProfile(..)
+            | ConfigEdit::SetActiveProfile(..) => None,
         })
         .collect()
 }
@@ -544,8 +633,8 @@ fn run_startup_and_dispatch(
     let (actions_tx, actions_rx) = mpsc::channel::<ShellAction>();
     let (tray_events_tx, tray_events_rx) = mpsc::channel::<EngineEvent>();
     let pump = EventPump::spawn(unified_rx, tray_events_tx, Arc::clone(&ui_state));
-    let tray_handle = tray::spawn_tray(actions_tx.clone(), tray_events_rx);
-    let hotkey_handle = hotkeys::spawn_hotkeys(&snapshot.app.hotkeys, actions_tx.clone()).unwrap_or_else(|e| {
+    let tray_handle = tray::spawn_tray(actions_tx.clone(), tray_events_rx, snapshot.profiles.clone());
+    let hotkey_handle = hotkeys::spawn_hotkeys(&snapshot.app.hotkeys, &snapshot.profiles, actions_tx.clone()).unwrap_or_else(|e| {
         eprintln!("hotkey registration failed (non-fatal): {e:?}");
         hotkeys::HotkeyHandle::idle()
     });
@@ -639,6 +728,7 @@ mod tests {
                 muted: false,
             }],
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
         }
     }
 
@@ -650,6 +740,7 @@ mod tests {
             muted: false,
             groups: vec![],
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
         };
         assert!(needs_onboarding(&snapshot));
     }
@@ -703,6 +794,29 @@ mod tests {
         // MixerCommand — same reason AddDspStage/RemoveDspStage aren't here.
         let snapshot = snapshot_with_group("Game");
         let edits = vec![ConfigEdit::SetSpatial("Game".into(), true)];
+
+        assert!(edits_to_mixer_commands(&edits, &snapshot).is_empty());
+    }
+
+    #[test]
+    fn profile_and_dsp_chain_edits_have_no_mixer_command_equivalent() {
+        // Both funnel through their own off-RT swap paths in
+        // apply_profile_action (SetDspChain -> apply_dsp_chains) or a plain
+        // store write with no engine call at all (SetProfile/RemoveProfile/
+        // SetActiveProfile) -- neither has a MixerCommand equivalent.
+        let snapshot = snapshot_with_group("Game");
+        let edits = vec![
+            ConfigEdit::SetDspChain("Game".into(), vec![]),
+            ConfigEdit::SetProfile(engine::ProfileConfig {
+                name: "Gaming".into(),
+                hotkey: None,
+                master: Gain::UNITY,
+                muted: false,
+                groups: vec![],
+            }),
+            ConfigEdit::RemoveProfile("Gaming".into()),
+            ConfigEdit::SetActiveProfile(None),
+        ];
 
         assert!(edits_to_mixer_commands(&edits, &snapshot).is_empty());
     }

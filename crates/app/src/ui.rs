@@ -29,7 +29,7 @@ use eframe::egui;
 use audio_core::{db_to_linear, linear_to_db, DspSpec, EqBandSpec, Gain, GroupId, MeterLevel, OutputId};
 use control::ConfigEdit;
 use engine::ports::Endpoint;
-use engine::{DuckSpecConfig, GroupConfig, MatchRule, RoutingReader, SessionInfo, StatsReader};
+use engine::{DuckSpecConfig, GroupConfig, MatchRule, ProfileConfig, RoutingReader, SessionInfo, StatsReader};
 
 use crate::event_pump::UiState;
 use crate::icons::IconCache;
@@ -267,6 +267,45 @@ impl SettingsApp {
         let _ = self.actions.send(action);
     }
 
+    /// Maps a [`ProfileCommand`] onto `ShellAction`s (profiles.md L3 flows
+    /// A-E). Apply/Revert both funnel through `ShellAction::ApplyProfile`
+    /// (flow D: revert is flow A against the active profile, not a separate
+    /// path). Save/SaveAs/Delete build their edit batch here with
+    /// `control::profiles::capture_profile` (pure) and send it as
+    /// `EditParams` — every one of `SetProfile`/`RemoveProfile`/
+    /// `SetActiveProfile` classifies as `EditPath::Param` (store write only,
+    /// no engine call), matching `Dispatcher::apply_params`'s path exactly.
+    fn handle_profile_command(&self, command: ProfileCommand, snapshot: &engine::ConfigSnapshot) {
+        match command {
+            ProfileCommand::Apply(name) => self.send(ShellAction::ApplyProfile(name)),
+            ProfileCommand::Revert => {
+                if let Some(active) = &snapshot.app.active_profile {
+                    self.send(ShellAction::ApplyProfile(active.clone()));
+                }
+            }
+            ProfileCommand::Save => {
+                if let Some(active) = &snapshot.app.active_profile {
+                    let captured = control::profiles::capture_profile(snapshot, active);
+                    self.send(ShellAction::EditParams(vec![ConfigEdit::SetProfile(captured)]));
+                }
+            }
+            ProfileCommand::SaveAs(name) => {
+                let captured = control::profiles::capture_profile(snapshot, &name);
+                self.send(ShellAction::EditParams(vec![
+                    ConfigEdit::SetProfile(captured),
+                    ConfigEdit::SetActiveProfile(Some(name)),
+                ]));
+            }
+            ProfileCommand::Delete(name) => {
+                let mut edits = vec![ConfigEdit::RemoveProfile(name.clone())];
+                if snapshot.app.active_profile.as_deref() == Some(name.as_str()) {
+                    edits.push(ConfigEdit::SetActiveProfile(None));
+                }
+                self.send(ShellAction::EditParams(edits));
+            }
+        }
+    }
+
     fn draft_for(&mut self, group: &GroupConfig) -> &mut GroupDraft {
         self.drafts.entry(group.name.clone()).or_insert_with(|| GroupDraft {
             match_rules: group.match_rules.join(", "),
@@ -392,6 +431,19 @@ impl eframe::App for SettingsApp {
                 }
 
                 ui.heading("Splitstream");
+
+                // Profile bar (profiles.md) — always reachable (even with
+                // zero profiles configured) so "save current state as a new
+                // profile" has an entry point; a config with no profiles
+                // otherwise behaves byte-for-byte as today (capability 1).
+                let active = snapshot.app.active_profile.as_deref();
+                let modified = active
+                    .map(|name| control::profiles::profile_is_modified(&snapshot, name))
+                    .unwrap_or(false);
+                if let Some(command) = profile_bar(ui, &snapshot.profiles, active, modified) {
+                    self.handle_profile_command(command, &snapshot);
+                }
+                ui.separator();
 
                 // Search filters every chip zone at once (decision 4: box
                 // only appears once something exists to search). Cloned once
@@ -1615,6 +1667,80 @@ fn search_box(ui: &mut egui::Ui, query: &mut String) -> bool {
         }
     });
     changed
+}
+
+/// User intent out of [`profile_bar`] (profiles.md L4 contract) — mapped to
+/// `ShellAction`s by [`SettingsApp::handle_profile_command`], never applied
+/// directly (this module only ever sends `ShellAction`s).
+enum ProfileCommand {
+    Apply(String),
+    Save,
+    SaveAs(String),
+    Revert,
+    Delete(String),
+}
+
+/// Explicit-save profile switcher (profiles.md capabilities 4-8): a button
+/// per profile, save/revert/delete acting on whichever one is active, and a
+/// "save as" field for creating a new one. Free function, not a
+/// `SettingsApp` method (L4 contract) — its only draft state (the in-progress
+/// "save as" name) is a discrete commit-on-click/Enter field, so it lives in
+/// egui's own per-widget memory (same reasoning as `GroupDraft` vs. the
+/// dropdown-backed fields: only in-progress *typing* needs protecting).
+fn profile_bar(
+    ui: &mut egui::Ui,
+    profiles: &[ProfileConfig],
+    active: Option<&str>,
+    modified: bool,
+) -> Option<ProfileCommand> {
+    let mut command = None;
+
+    ui.horizontal(|ui| {
+        ui.label("Profile:");
+        for profile in profiles {
+            let is_active = active == Some(profile.name.as_str());
+            let label = if is_active && modified {
+                format!("{}*", profile.name)
+            } else {
+                profile.name.clone()
+            };
+            if ui.selectable_label(is_active, label).clicked() && !is_active {
+                command = Some(ProfileCommand::Apply(profile.name.clone()));
+            }
+        }
+
+        if let Some(name) = active {
+            ui.separator();
+            if ui.add_enabled(modified, egui::Button::new("Save")).clicked() {
+                command = Some(ProfileCommand::Save);
+            }
+            if ui.add_enabled(modified, egui::Button::new("Revert")).clicked() {
+                command = Some(ProfileCommand::Revert);
+            }
+            if ui.button("Delete").clicked() {
+                command = Some(ProfileCommand::Delete(name.to_string()));
+            }
+        }
+
+        ui.separator();
+        let draft_id = ui.id().with("profile_save_as_draft");
+        let mut draft = ui.data_mut(|d| d.get_temp::<String>(draft_id).unwrap_or_default());
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut draft)
+                .id(egui::Id::new("profile-save-as"))
+                .hint_text("New profile name…")
+                .desired_width(120.0),
+        );
+        let confirmed_by_enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let confirmed_by_button = ui.button("Save As").clicked();
+        if (confirmed_by_enter || confirmed_by_button) && !draft.trim().is_empty() {
+            command = Some(ProfileCommand::SaveAs(draft.trim().to_string()));
+            draft.clear();
+        }
+        ui.data_mut(|d| d.insert_temp(draft_id, draft));
+    });
+
+    command
 }
 
 /// The chip's own click-sensing interaction (decision 3): `dnd_drag_source`'s

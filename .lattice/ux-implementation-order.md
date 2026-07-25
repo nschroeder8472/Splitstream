@@ -13,8 +13,12 @@ note: >
 
 # UX Roadmap — Implementation Order
 
-Eight blueprints in `.lattice/context/`, all `status: approved`, none
-implemented. This is the order to build them in and the reasoning behind it.
+Eight blueprints in `.lattice/context/`. This is the order to build them in
+and the reasoning behind it. Status as of 2026-07-24: items 1-6
+(per-group-mute-solo, db-faders, session-search-and-guidance, app-icons,
+graphical-eq, profiles) are `status: complete`; items 7-8
+(external-controls, visual-identity) remain `status: approved`, not yet
+implemented.
 
 Three forces set the order:
 

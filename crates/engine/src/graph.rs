@@ -22,6 +22,41 @@ pub struct ConfigSnapshot {
     pub muted: bool,
     pub groups: Vec<GroupConfig>,
     pub app: AppConfig,
+    /// Named snapshots of per-group state (profiles.md). Purely additive —
+    /// a config with no `[[profile]]` tables behaves byte-for-byte as today.
+    pub profiles: Vec<ProfileConfig>,
+}
+
+/// A named snapshot of per-group state (profiles.md) — gain, mute,
+/// follow_master, output_device, dsp, duck, spatial, keyed by group name.
+/// Value object: compared and copied wholesale, never mutated in place.
+/// Does **not** capture the group *set* — switching can never create or
+/// delete a group (L1 capability 2) — nor `match_rules` (decision 8).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileConfig {
+    pub name: String,
+    /// Optional global hotkey applying this profile (L1 capability 10).
+    pub hotkey: Option<HotkeyChord>,
+    pub master: Gain,
+    pub muted: bool,
+    /// Per-group values keyed by name. A group absent here is left untouched
+    /// on apply; an entry naming a missing group is skipped (L1 capability 11).
+    pub groups: Vec<ProfileGroupConfig>,
+}
+
+/// One group's captured state within a [`ProfileConfig`]. `match_rules` is
+/// deliberately absent (decision 8) — which apps belong to which group stays
+/// shared across profiles.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileGroupConfig {
+    pub name: String,
+    pub gain: Gain,
+    pub follow_master: bool,
+    pub output_device: String,
+    pub dsp: Vec<DspStageConfig>,
+    pub duck: Option<DuckSpecConfig>,
+    pub spatial: bool,
+    pub muted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,6 +111,10 @@ pub struct DuckSpecConfig {
 pub struct AppConfig {
     pub autostart: bool,
     pub hotkeys: HotkeyMap,
+    /// Name of the currently-active profile (profiles.md decision 5).
+    /// Restart returns to the same profile; `None` means no profile is
+    /// active (also the state after the active one is deleted, L3 flow H).
+    pub active_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -123,6 +162,23 @@ impl HotkeyChord {
             return Err(format!("hotkey chord {s:?} needs at least one modifier"));
         }
         Ok(HotkeyChord { ctrl, alt, shift, key })
+    }
+}
+
+impl std::fmt::Display for HotkeyChord {
+    /// Inverse of [`HotkeyChord::parse`] — `"Ctrl+Alt+M"` — so a chord can
+    /// round-trip through config writes (profiles.md) and UI display alike.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.ctrl {
+            write!(f, "Ctrl+")?;
+        }
+        if self.alt {
+            write!(f, "Alt+")?;
+        }
+        if self.shift {
+            write!(f, "Shift+")?;
+        }
+        write!(f, "{}", self.key)
     }
 }
 
@@ -335,11 +391,19 @@ mod tests {
     }
 
     #[test]
+    fn hotkey_chord_display_round_trips_through_parse() {
+        let chord = HotkeyChord::parse("ctrl+alt+1").unwrap();
+        assert_eq!(chord.to_string(), "Ctrl+Alt+1");
+        assert_eq!(HotkeyChord::parse(&chord.to_string()).unwrap(), chord);
+    }
+
+    #[test]
     fn resolves_group_to_its_output_id() {
         let snapshot = ConfigSnapshot {
             schema_version: 2,
             muted: false,
             app: AppConfig::default(),
+            profiles: Vec::new(),
             master: Gain::UNITY,
             groups: vec![group("Game", "Speakers")],
         };
@@ -360,6 +424,7 @@ mod tests {
             schema_version: 2,
             muted: false,
             app: AppConfig::default(),
+            profiles: Vec::new(),
             master: Gain::UNITY,
             groups: vec![group("Music", "Speakers"), group("Game", "Headphones")],
         };
@@ -375,6 +440,7 @@ mod tests {
             schema_version: 2,
             muted: false,
             app: AppConfig::default(),
+            profiles: Vec::new(),
             master: Gain::UNITY,
             groups: vec![group("Game", "Speakers")],
         };
@@ -388,6 +454,7 @@ mod tests {
             schema_version: 2,
             muted: false,
             app: AppConfig::default(),
+            profiles: Vec::new(),
             master: Gain::UNITY,
             groups: vec![
                 group("Game", "Speakers"),
@@ -412,6 +479,7 @@ mod tests {
             schema_version: 2,
             muted: false,
             app: AppConfig::default(),
+            profiles: Vec::new(),
             master: Gain::UNITY,
             groups: vec![group("Game", "Nonexistent")],
         };
@@ -427,6 +495,7 @@ mod tests {
             schema_version: 2,
             muted: false,
             app: AppConfig::default(),
+            profiles: Vec::new(),
             master: Gain::UNITY,
             groups: vec![group("Game", "Nonexistent")],
         };
@@ -443,6 +512,7 @@ mod tests {
             schema_version: 2,
             muted: false,
             app: AppConfig::default(),
+            profiles: Vec::new(),
             master: Gain::UNITY,
             groups: vec![
                 group("Parked", "Speakers"),
@@ -464,6 +534,7 @@ mod tests {
             schema_version: 2,
             muted: false,
             app: AppConfig::default(),
+            profiles: Vec::new(),
             master: Gain::UNITY,
             groups: vec![
                 group("Voice", "Speakers"),
@@ -490,6 +561,7 @@ mod tests {
             schema_version: 2,
             muted: false,
             app: AppConfig::default(),
+            profiles: Vec::new(),
             master: Gain::UNITY,
             groups: vec![GroupConfig {
                 duck: Some(DuckSpecConfig {

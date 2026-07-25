@@ -1851,6 +1851,7 @@ mod tests {
             master: Gain::UNITY,
             muted: false,
             app: graph::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![graph::GroupConfig {
                 name: "Game".into(),
                 output_device: "Speakers".into(),
