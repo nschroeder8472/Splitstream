@@ -126,6 +126,35 @@ pub struct AppConfig {
     /// volume (external-controls.md capability 1) — `"master"` or a group
     /// name; `None` (the default) means unbound, behaving exactly as today.
     pub volume_bind: Option<String>,
+    /// Theme mode (visual-identity.md capability 2).
+    pub theme: ThemeChoice,
+    /// Brand accent preset (visual-identity.md capability 5).
+    pub accent: AccentChoice,
+}
+
+/// Theme mode (visual-identity.md decision 1). `System` follows the OS
+/// light/dark preference live, not just at startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeChoice {
+    Dark,
+    Light,
+    #[default]
+    System,
+}
+
+/// Brand accent preset (visual-identity.md decision 2) — a config type, not
+/// an `app` type, per decision 10: `ConfigEdit` lives in `control`, which
+/// must never depend on `app`, so the persisted choice has to live where
+/// `HotkeyChord` does. `app::theme::accent` maps a choice to its actual
+/// dark/light `Color32` pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AccentChoice {
+    #[default]
+    Brand,
+    Teal,
+    Amber,
+    Violet,
+    Slate,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

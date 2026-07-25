@@ -8,8 +8,8 @@ pub mod volume_bind;
 
 pub use clock::{DriftConfig, DriftController, FillSample};
 pub use graph::{
-    AppConfig, ConfigSnapshot, DspStageConfig, DuckSpecConfig, GraphPlan, GroupConfig,
-    HotkeyChord, HotkeyKey, HotkeyMap, ProfileConfig, ProfileGroupConfig,
+    AccentChoice, AppConfig, ConfigSnapshot, DspStageConfig, DuckSpecConfig, GraphPlan, GroupConfig,
+    HotkeyChord, HotkeyKey, HotkeyMap, ProfileConfig, ProfileGroupConfig, ThemeChoice,
 };
 pub use routing::{start_routing, RoutingHandle, RoutingReader};
 pub use rules::{match_session, GlobPattern, GroupRules, MatchRule, SessionInfo};

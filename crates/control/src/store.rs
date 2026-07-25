@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 use toml_edit::{value, Array, ArrayOfTables, DocumentMut, Item, Table};
 
 use audio_core::{DspSpec, EqBandSpec, Gain, GroupId};
-use engine::{ConfigSnapshot, DspStageConfig, DuckSpecConfig, GroupConfig, ProfileConfig, ProfileGroupConfig};
+use engine::{
+    AccentChoice, ConfigSnapshot, DspStageConfig, DuckSpecConfig, GroupConfig, ProfileConfig,
+    ProfileGroupConfig, ThemeChoice,
+};
 
 use crate::config::{parse, ConfigError};
 
@@ -70,6 +73,14 @@ pub enum ConfigEdit {
     RemoveProfile(String),
     /// `[app] active_profile` — `None` clears the key (profiles.md decision 5).
     SetActiveProfile(Option<String>),
+    /// `[app] theme` (visual-identity.md capability 2) — rides the plain
+    /// `EditParams` path like `SetAutostart`; the UI reacts by comparing the
+    /// new snapshot against what it last installed (decision 2/Flow B), no
+    /// mixer command involved.
+    SetTheme(ThemeChoice),
+    /// `[app] accent` (visual-identity.md capability 5) — same shape as
+    /// [`ConfigEdit::SetTheme`].
+    SetAccent(AccentChoice),
 }
 
 /// Which apply path an edit requires (profiles.md decision 12 — revises the
@@ -105,7 +116,9 @@ pub fn edit_path(edit: &ConfigEdit) -> EditPath {
         | ConfigEdit::SetAutostart(..)
         | ConfigEdit::SetProfile(..)
         | ConfigEdit::RemoveProfile(..)
-        | ConfigEdit::SetActiveProfile(..) => EditPath::Param,
+        | ConfigEdit::SetActiveProfile(..)
+        | ConfigEdit::SetTheme(..)
+        | ConfigEdit::SetAccent(..) => EditPath::Param,
         ConfigEdit::SetGroupOutput(..) | ConfigEdit::AddGroup(..) | ConfigEdit::RemoveGroup(..) => {
             EditPath::Structural
         }
@@ -277,10 +290,7 @@ fn apply_edit(doc: &mut DocumentMut, edit: &ConfigEdit) -> Result<(), StoreError
             find_group_table(doc, name)?["spatial"] = value(*on);
         }
         ConfigEdit::SetAutostart(on) => {
-            let app = doc["app"]
-                .or_insert(Item::Table(Table::new()))
-                .as_table_mut()
-                .ok_or_else(malformed_app_shape)?;
+            let app = app_table(doc)?;
             app["autostart"] = value(*on);
         }
         ConfigEdit::SetDuck(name, duck) => {
@@ -333,10 +343,7 @@ fn apply_edit(doc: &mut DocumentMut, edit: &ConfigEdit) -> Result<(), StoreError
             profiles.remove(index);
         }
         ConfigEdit::SetActiveProfile(name) => {
-            let app = doc["app"]
-                .or_insert(Item::Table(Table::new()))
-                .as_table_mut()
-                .ok_or_else(malformed_app_shape)?;
+            let app = app_table(doc)?;
             match name {
                 Some(n) => app["active_profile"] = value(n.as_str()),
                 None => {
@@ -344,8 +351,45 @@ fn apply_edit(doc: &mut DocumentMut, edit: &ConfigEdit) -> Result<(), StoreError
                 }
             }
         }
+        ConfigEdit::SetTheme(theme) => {
+            app_table(doc)?["theme"] = value(theme_str(*theme));
+        }
+        ConfigEdit::SetAccent(accent) => {
+            app_table(doc)?["accent"] = value(accent_str(*accent));
+        }
     }
     Ok(())
+}
+
+/// The `[app]` table, inserting an empty one if absent. Shared by every
+/// `[app]`-scoped edit (`SetAutostart`, `SetActiveProfile`, `SetTheme`,
+/// `SetAccent`) — previously each redid this lookup inline.
+fn app_table(doc: &mut DocumentMut) -> Result<&mut Table, StoreError> {
+    doc["app"]
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(malformed_app_shape)
+}
+
+/// Inverse of `control::config::parse_theme` — kept next to the write path
+/// it serves, same as `dsp_stage_table` sits beside `convert_dsp_stage`.
+fn theme_str(theme: ThemeChoice) -> &'static str {
+    match theme {
+        ThemeChoice::Dark => "dark",
+        ThemeChoice::Light => "light",
+        ThemeChoice::System => "system",
+    }
+}
+
+/// Inverse of `control::config::parse_accent`.
+fn accent_str(accent: AccentChoice) -> &'static str {
+    match accent {
+        AccentChoice::Brand => "brand",
+        AccentChoice::Teal => "teal",
+        AccentChoice::Amber => "amber",
+        AccentChoice::Violet => "violet",
+        AccentChoice::Slate => "slate",
+    }
 }
 
 fn groups_array(doc: &mut DocumentMut) -> &mut ArrayOfTables {
@@ -916,6 +960,39 @@ output_device = "Speakers"
     }
 
     #[test]
+    fn set_theme_and_accent_round_trip_against_an_existing_app_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(
+            dir.path(),
+            "schema_version = 2\nmaster = 1.0\n\n[app]\nautostart = false\n",
+        );
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let snapshot = store.apply(&[ConfigEdit::SetTheme(ThemeChoice::Dark)]).unwrap();
+        assert_eq!(snapshot.app.theme, ThemeChoice::Dark);
+
+        let snapshot = store.apply(&[ConfigEdit::SetAccent(AccentChoice::Violet)]).unwrap();
+        assert_eq!(snapshot.app.accent, AccentChoice::Violet);
+        // Setting the accent must not disturb the theme set just before it.
+        assert_eq!(snapshot.app.theme, ThemeChoice::Dark);
+
+        let on_disk = fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("theme = \"dark\""));
+        assert!(on_disk.contains("accent = \"violet\""));
+    }
+
+    #[test]
+    fn set_theme_creates_the_app_table_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let snapshot = store.apply(&[ConfigEdit::SetTheme(ThemeChoice::Light)]).unwrap();
+
+        assert_eq!(snapshot.app.theme, ThemeChoice::Light);
+    }
+
+    #[test]
     fn set_duck_then_clear_duck_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_file(dir.path(), BASE_TWO_GROUPS);
@@ -1159,6 +1236,8 @@ dsp = [{ type = "limiter", ceiling_db = -1.0 }]
             ConfigEdit::SetProfile(sample_profile("Gaming")),
             ConfigEdit::RemoveProfile("g".into()),
             ConfigEdit::SetActiveProfile(None),
+            ConfigEdit::SetTheme(ThemeChoice::Dark),
+            ConfigEdit::SetAccent(AccentChoice::Teal),
         ];
         for edit in &param {
             assert_eq!(edit_path(edit), EditPath::Param);

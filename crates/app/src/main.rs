@@ -15,6 +15,7 @@ mod icons;
 mod lifecycle;
 mod logging;
 mod paths;
+mod theme;
 mod tray;
 mod ui;
 
@@ -24,10 +25,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use eframe::egui;
+
 use control::{group_rules, ConfigEdit, ConfigStore};
 use engine::ports::{AudioSystem, SessionPort, VolumeEvent};
 use engine::{
-    start_volume_bind, CaptureControl, ConfigSnapshot, EngineEvent, EngineHandle, MirrorAction,
+    start_volume_bind, AccentChoice, CaptureControl, ConfigSnapshot, EngineEvent, EngineHandle, MirrorAction,
     RoutingHandle, VolumeBindHandle,
 };
 use win_audio::WasapiSystem;
@@ -105,6 +108,8 @@ fn needs_onboarding(snapshot: &ConfigSnapshot) -> bool {
 
 const VOLUME_STEP_DB: f32 = 3.0;
 const PUSH_TO_MUTE_MAX_HOLD: Duration = Duration::from_secs(30);
+/// Windows tray icons render at 16x16 (visual-identity.md decision 10).
+const TRAY_ICON_SIZE: u32 = 16;
 
 /// Clamped 3 dB stepping (decision 6), shared by every volume hotkey.
 /// Reuses the fader's own dB<->`Gain` mapping and range (`ui::FADER_MIN_DB`/
@@ -281,6 +286,13 @@ struct Dispatcher {
     /// When the current hold was armed — `None` while not held. Checked
     /// every dispatcher tick against `PUSH_TO_MUTE_MAX_HOLD` (capability 15).
     push_to_mute_armed_at: Option<Instant>,
+    /// `(accent, surface theme)` last pushed to the tray icon (visual-identity.md
+    /// decision 9/Flow G) — `refresh_tray_icon` compares against this every
+    /// dispatcher tick, so a native icon re-render only happens on an actual
+    /// change, not on every 50ms poll. `None` before the first tick, so a
+    /// startup render always happens even if the resolved value would
+    /// otherwise equal a `Default`.
+    last_tray_icon: Option<(AccentChoice, egui::Theme)>,
 }
 
 enum Outcome {
@@ -488,6 +500,32 @@ impl Dispatcher {
             .is_some_and(|armed_at| armed_at.elapsed() >= PUSH_TO_MUTE_MAX_HOLD);
         if expired {
             self.apply_push_to_mute_event(HoldEvent::Expired);
+        }
+    }
+
+    /// visual-identity.md decision 9/Flow G: the tray mark follows the
+    /// *system* theme (independent of the app's own theme preference, since
+    /// the taskbar has its own), which only `shared_ctx` can answer — the
+    /// tray thread has no window of its own to ask. Called every dispatcher
+    /// tick (cheap: one lock plus a tuple comparison), but only renders and
+    /// pushes a new icon when the resolved `(accent, theme)` actually
+    /// changed, the same call-frequency-vs-cost check as `set_current`'s
+    /// tray-rebuild guard. Falls back to `Theme::Dark` before the eframe
+    /// window's first frame populates `shared_ctx` — matches egui's own
+    /// `fallback_theme` default, corrected the moment the real value is known.
+    fn refresh_tray_icon(&mut self) {
+        let surface_theme = self
+            .shared_ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|ctx| ctx.system_theme())
+            .unwrap_or(egui::Theme::Dark);
+        let wanted = (self.current.app.accent, surface_theme);
+        if self.last_tray_icon != Some(wanted) {
+            let rgba = theme::brand_icon_rgba(TRAY_ICON_SIZE, theme::accent(wanted.0), wanted.1);
+            self.tray_handle.set_icon(rgba, TRAY_ICON_SIZE);
+            self.last_tray_icon = Some(wanted);
         }
     }
 
@@ -850,7 +888,9 @@ fn edits_to_mixer_commands(edits: &[ConfigEdit], current: &ConfigSnapshot) -> Ve
             | ConfigEdit::SetDspChain(..)
             | ConfigEdit::SetProfile(..)
             | ConfigEdit::RemoveProfile(..)
-            | ConfigEdit::SetActiveProfile(..) => None,
+            | ConfigEdit::SetActiveProfile(..)
+            | ConfigEdit::SetTheme(..)
+            | ConfigEdit::SetAccent(..) => None,
         })
         .collect()
 }
@@ -922,6 +962,16 @@ fn main() {
         return;
     };
 
+    // Read before `handoff.ui_state` moves into `SettingsApp::new` below —
+    // visual-identity.md capability 11: applied inside the `CreationContext`
+    // closure, before the first frame, so there's no flash of default egui
+    // styling on launch. `ui::SettingsApp::ui`'s own Flow B compare-and-react
+    // handles every change after this one.
+    let (initial_theme, initial_accent) = {
+        let state = handoff.ui_state.lock().unwrap();
+        (state.snapshot.app.theme, state.snapshot.app.accent)
+    };
+
     // eframe owns the main thread (required on Windows/macOS); the window
     // closing sets `should_quit` so the dispatcher thread runs the real
     // shutdown sequence and exits the process.
@@ -935,6 +985,7 @@ fn main() {
         "Splitstream",
         eframe::NativeOptions::default(),
         Box::new(move |cc| {
+            theme::install(&cc.egui_ctx, initial_theme, initial_accent);
             *shared_ctx.lock().unwrap() = Some(cc.egui_ctx.clone());
             Ok(Box::new(app))
         }),
@@ -1040,7 +1091,19 @@ fn run_startup_and_dispatch(
 
     let (tray_events_tx, tray_events_rx) = mpsc::channel::<EngineEvent>();
     let pump = EventPump::spawn(unified_rx, tray_events_tx, Arc::clone(&ui_state));
-    let tray_handle = tray::spawn_tray(actions_tx.clone(), tray_events_rx, build_tray_model(&snapshot));
+    // No `egui::Context` exists yet at this point in startup (eframe hasn't
+    // run on the main thread), so the real system theme is unknowable —
+    // `Theme::Dark` matches egui's own `fallback_theme` default and gets
+    // corrected by the dispatcher's first `refresh_tray_icon` tick once
+    // `shared_ctx` is populated (visual-identity.md decision 9).
+    let initial_icon = theme::brand_icon_rgba(TRAY_ICON_SIZE, theme::accent(snapshot.app.accent), egui::Theme::Dark);
+    let tray_handle = tray::spawn_tray(
+        actions_tx.clone(),
+        tray_events_rx,
+        build_tray_model(&snapshot),
+        initial_icon,
+        TRAY_ICON_SIZE,
+    );
     let hotkey_bindings = build_hotkey_bindings(&snapshot);
     let hotkey_handle = hotkeys::spawn_hotkeys(&hotkey_bindings, actions_tx.clone()).unwrap_or_else(|e| {
         eprintln!("hotkey registration failed (non-fatal): {e:?}");
@@ -1085,6 +1148,7 @@ fn run_startup_and_dispatch(
         default_output_name,
         push_to_mute_state: HoldState::default(),
         push_to_mute_armed_at: None,
+        last_tray_icon: None,
     };
     // Establishes the bind's initial suspended state (flow A's "Windows
     // wins" bind-time adopt fires here if `[app] volume_bind` already names
@@ -1109,6 +1173,7 @@ fn run_startup_and_dispatch(
             dispatcher.handle_endpoint_volume_changed(event);
         }
         dispatcher.check_push_to_mute_expiry();
+        dispatcher.refresh_tray_icon();
         dispatcher.ui.lock().unwrap().stats = dispatcher.handle.stats();
     }
 

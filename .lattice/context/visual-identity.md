@@ -2,7 +2,7 @@
 feature: visual-identity
 requirement_doc: null
 created: 2026-07-23
-status: approved
+status: complete
 note: >
   Roadmap Priority 11 (.lattice/ux-gap-roadmap.md). Dark/light/system themes,
   a brand accent with a small preset set, a deliberate style pass, and a real
@@ -301,6 +301,61 @@ accent = "brand"    # brand | teal | amber | violet | slate
 ## Open Questions
 
 *(none -- every judgment call raised during design was resolved and logged)*
+
+## Implementation Notes (2026-07-24)
+
+**Key files.** `crates/engine/src/graph.rs` (`ThemeChoice`, `AccentChoice`,
+two `AppConfig` fields) · `crates/control/src/config.rs` (`parse_theme`/
+`parse_accent`) · `crates/control/src/store.rs` (`ConfigEdit::SetTheme`/
+`SetAccent`, `theme_str`/`accent_str`) · `crates/app/src/theme.rs` (new —
+`Accent`, `Semantic`, `accent`, `semantic`, `visuals`, `style`, `install`,
+`brand_icon_rgba`) · `crates/app/src/ui.rs` (`appearance_picker`, Flow B's
+compare-and-react, the two semantic-color call sites, `paint_meter`/
+`meter_color`) · `crates/app/src/main.rs` (`CreationContext` install call,
+`Dispatcher::refresh_tray_icon`) · `crates/app/src/tray.rs`
+(`TrayCommand::SetIcon`, `TrayHandle::set_icon`).
+
+**Deviations from Level 4, all forced by the real egui 0.35 API (verified
+against the local registry source, not from the contract text):**
+
+1. **No single `set_style` call exists.** The contract's `install` pseudocode
+   named one; the real API is `set_visuals_of` (per-theme, replaces
+   `Style.visuals` wholesale) plus `all_styles_mut` (applies one mutation to
+   both `dark_style`/`light_style`). `install` therefore calls
+   `set_visuals_of` first for both themes, then `all_styles_mut` copies only
+   `style()`'s specific fields (spacing, corner radius, stroke width) onto
+   each already-colour-installed `Style` — never replaces `.visuals`
+   wholesale a second time, which would have discarded the accent colours
+   just installed.
+2. **`visuals()` extends `egui::Visuals::dark()`/`light()`** rather than
+   hand-authoring every widget-state colour from scratch, overriding only
+   the four accent-linked surfaces capability 4 names (selection, focus-ring
+   stroke, active-toggle bg, hyperlink). Decision 4 already scoped this
+   feature to palette/accent/radius/spacing with no per-widget overrides;
+   rebuilding all ~30 `WidgetVisuals` colours per theme would have been
+   restyling far beyond that.
+3. **`widgets.active.fg_stroke` is a fixed per-theme constant** (near-black
+   on dark-variant accents, white on light-variant accents), not computed via
+   `contrast_ratio` at runtime — decision 8 keeps that function test-only.
+   Verified by eye against all five presets' actual RGB values rather than
+   guessed.
+
+**Tray refresh mechanism (decision 9/Flow G), not spelled out in Level 4:**
+the three named triggers (startup, menu rebuild, "opportunistic while
+settings window is open") collapsed into **one** mechanism —
+`Dispatcher::refresh_tray_icon`, called every existing 50ms tick, comparing
+`(current.app.accent, shared_ctx.system_theme())` against a cached
+`last_tray_icon` and only re-rendering+pushing on an actual change. Startup
+itself can't call `system_theme()` (`spawn_tray` runs before the eframe
+window exists), so the very first icon build falls back to `Theme::Dark`
+(matching egui's own `fallback_theme` default) and gets corrected on the
+next tick once `shared_ctx` populates.
+
+**Test contracts:** all 8 named in Level 4 pass, plus store/config round-trip
+tests for the two new `ConfigEdit` variants and the `edit_path` exhaustive
+classifier.
+
+Status: complete.
 
 ## Design Summary
 

@@ -50,6 +50,11 @@ enum TrayCommand {
     Quit,
     Notice(String),
     Rebuild(TrayModel),
+    /// A freshly-rendered brand mark (visual-identity.md decision 9/Flow G) —
+    /// `size` x `size` straight-alpha RGBA8, same shape `theme::brand_icon_rgba`
+    /// returns. Separate from `Rebuild`: the icon and the menu change on
+    /// different triggers (accent/system-theme vs. group/profile/mute state).
+    SetIcon(Vec<u8>, u32),
 }
 
 pub struct TrayHandle {
@@ -70,9 +75,21 @@ impl TrayHandle {
     pub fn rebuild(&self, model: TrayModel) {
         let _ = self.proxy.send_event(TrayCommand::Rebuild(model));
     }
+
+    /// Pushes a freshly-rendered brand mark (decision 9/Flow G). Best-effort,
+    /// same as [`Self::rebuild`].
+    pub fn set_icon(&self, rgba: Vec<u8>, size: u32) {
+        let _ = self.proxy.send_event(TrayCommand::SetIcon(rgba, size));
+    }
 }
 
-pub fn spawn_tray(actions: Sender<ShellAction>, notices: Receiver<EngineEvent>, initial: TrayModel) -> TrayHandle {
+pub fn spawn_tray(
+    actions: Sender<ShellAction>,
+    notices: Receiver<EngineEvent>,
+    initial: TrayModel,
+    initial_icon_rgba: Vec<u8>,
+    initial_icon_size: u32,
+) -> TrayHandle {
     // The `EventLoop` ties itself to the OS message queue of whichever
     // thread builds it, so it's built *inside* the spawned thread, not moved
     // in from outside. Its `EventLoopProxy` (Send + Clone, made for exactly
@@ -86,7 +103,7 @@ pub fn spawn_tray(actions: Sender<ShellAction>, notices: Receiver<EngineEvent>, 
         if proxy_tx.send(event_loop.create_proxy()).is_err() {
             return; // caller gave up waiting
         }
-        run_tray(&mut event_loop, actions, initial);
+        run_tray(&mut event_loop, actions, initial, initial_icon_rgba, initial_icon_size);
     });
 
     let proxy = proxy_rx
@@ -182,14 +199,22 @@ fn build_menu(model: &TrayModel) -> (Menu, MenuIds) {
     (menu, ids)
 }
 
-fn run_tray(event_loop: &mut EventLoop<TrayCommand>, actions: Sender<ShellAction>, initial: TrayModel) {
+fn run_tray(
+    event_loop: &mut EventLoop<TrayCommand>,
+    actions: Sender<ShellAction>,
+    initial: TrayModel,
+    initial_icon_rgba: Vec<u8>,
+    initial_icon_size: u32,
+) {
     let (menu, mut ids) = build_menu(&initial);
 
+    let initial_icon = Icon::from_rgba(initial_icon_rgba, initial_icon_size, initial_icon_size)
+        .unwrap_or_else(|_| placeholder_icon());
     let mut tray_icon = Some(
         TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("Splitstream")
-            .with_icon(placeholder_icon())
+            .with_icon(initial_icon)
             .build()
             .expect("tray icon creation failed"),
     );
@@ -228,6 +253,13 @@ fn run_tray(event_loop: &mut EventLoop<TrayCommand>, actions: Sender<ShellAction
                         icon.set_menu(Some(Box::new(menu)));
                     }
                     ids = new_ids;
+                }
+                TrayCommand::SetIcon(rgba, size) => {
+                    if let Some(icon) = &tray_icon {
+                        if let Ok(ic) = Icon::from_rgba(rgba, size, size) {
+                            let _ = icon.set_icon(Some(ic));
+                        }
+                    }
                 }
             }
         }
