@@ -14,8 +14,8 @@ use serde::Deserialize;
 
 use audio_core::{DspSpec, DuckSpec, EqBandSpec, Gain, GroupId, MixerCommand};
 use engine::{
-    AppConfig, ConfigSnapshot, DspStageConfig, DuckSpecConfig, GroupConfig, GroupRules,
-    HotkeyChord, HotkeyMap, MatchRule, ProfileConfig, ProfileGroupConfig,
+    AccentChoice, AppConfig, ConfigSnapshot, DspStageConfig, DuckSpecConfig, GroupConfig, GroupRules,
+    HotkeyChord, HotkeyMap, MatchRule, ProfileConfig, ProfileGroupConfig, ThemeChoice,
 };
 
 pub const SUPPORTED_SCHEMA_VERSION: u32 = 2;
@@ -56,6 +56,10 @@ struct RawAppConfig {
     active_profile: Option<String>,
     #[serde(default)]
     volume_bind: Option<String>,
+    #[serde(default)]
+    theme: Option<String>,
+    #[serde(default)]
+    accent: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -178,6 +182,36 @@ fn default_gain() -> f32 {
 
 fn parse_hotkey(raw: Option<String>) -> Result<Option<HotkeyChord>, ConfigError> {
     raw.as_deref().map(HotkeyChord::parse).transpose().map_err(ConfigError::Invalid)
+}
+
+/// `None` (key absent) resolves to [`ThemeChoice::default`], matching every
+/// other optional scalar in `[app]`; a *present but unrecognised* string is
+/// `ConfigError::Invalid`, same shape as [`parse_hotkey`].
+fn parse_theme(raw: Option<String>) -> Result<ThemeChoice, ConfigError> {
+    match raw.as_deref() {
+        None => Ok(ThemeChoice::default()),
+        Some("dark") => Ok(ThemeChoice::Dark),
+        Some("light") => Ok(ThemeChoice::Light),
+        Some("system") => Ok(ThemeChoice::System),
+        Some(other) => Err(ConfigError::Invalid(format!(
+            "unrecognised theme {other:?} (expected \"dark\", \"light\", or \"system\")"
+        ))),
+    }
+}
+
+/// See [`parse_theme`] — same default-on-absent, error-on-unrecognised shape.
+fn parse_accent(raw: Option<String>) -> Result<AccentChoice, ConfigError> {
+    match raw.as_deref() {
+        None => Ok(AccentChoice::default()),
+        Some("brand") => Ok(AccentChoice::Brand),
+        Some("teal") => Ok(AccentChoice::Teal),
+        Some("amber") => Ok(AccentChoice::Amber),
+        Some("violet") => Ok(AccentChoice::Violet),
+        Some("slate") => Ok(AccentChoice::Slate),
+        Some(other) => Err(ConfigError::Invalid(format!(
+            "unrecognised accent {other:?} (expected \"brand\", \"teal\", \"amber\", \"violet\", or \"slate\")"
+        ))),
+    }
 }
 
 fn convert_duck(d: RawDuck) -> DuckSpecConfig {
@@ -368,6 +402,8 @@ pub(crate) fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
             hotkeys: HotkeyMap { mute_master, push_to_mute, master_volume_up, master_volume_down },
             active_profile: raw.app.active_profile,
             volume_bind: raw.app.volume_bind,
+            theme: parse_theme(raw.app.theme)?,
+            accent: parse_accent(raw.app.accent)?,
         },
         profiles,
     })
@@ -754,6 +790,56 @@ mod tests {
             group.hotkey_volume_down,
             Some(HotkeyChord { ctrl: true, shift: true, alt: false, key: HotkeyKey::Down })
         );
+    }
+
+    #[test]
+    fn theme_and_accent_round_trip_through_toml() {
+        let toml = r#"
+            schema_version = 2
+            master = 1.0
+
+            [app]
+            theme = "light"
+            accent = "teal"
+        "#;
+        let snapshot = parse(toml).unwrap();
+        assert_eq!(snapshot.app.theme, engine::ThemeChoice::Light);
+        assert_eq!(snapshot.app.accent, engine::AccentChoice::Teal);
+    }
+
+    #[test]
+    fn an_absent_theme_or_accent_defaults_to_system_and_brand() {
+        let toml = r#"
+            schema_version = 2
+            master = 1.0
+        "#;
+        let snapshot = parse(toml).unwrap();
+        assert_eq!(snapshot.app.theme, engine::ThemeChoice::System);
+        assert_eq!(snapshot.app.accent, engine::AccentChoice::Brand);
+    }
+
+    #[test]
+    fn an_unrecognised_theme_value_is_a_validation_error() {
+        let toml = r#"
+            schema_version = 2
+            master = 1.0
+
+            [app]
+            theme = "purple"
+        "#;
+        assert!(matches!(parse(toml), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn an_unrecognised_accent_value_is_a_validation_error() {
+        let toml = r#"
+            schema_version = 2
+            master = 1.0
+
+            [app]
+            accent = "chartreuse"
+        "#;
+        assert!(matches!(parse(toml), Err(ConfigError::Invalid(_))));
     }
 
     #[test]

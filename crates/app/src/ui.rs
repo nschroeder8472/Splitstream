@@ -29,10 +29,14 @@ use eframe::egui;
 use audio_core::{db_to_linear, linear_to_db, DspSpec, EqBandSpec, Gain, GroupId, MeterLevel, OutputId};
 use control::ConfigEdit;
 use engine::ports::Endpoint;
-use engine::{DuckSpecConfig, GroupConfig, MatchRule, ProfileConfig, RoutingReader, SessionInfo, StatsReader};
+use engine::{
+    AccentChoice, DuckSpecConfig, GroupConfig, MatchRule, ProfileConfig, RoutingReader, SessionInfo, StatsReader,
+    ThemeChoice,
+};
 
 use crate::event_pump::UiState;
 use crate::icons::IconCache;
+use crate::theme;
 use crate::ShellAction;
 
 /// Drag payload: a session's pid. `Any + Send + Sync` (egui dnd requirement) —
@@ -235,6 +239,12 @@ pub struct SettingsApp {
     /// capability 4) — group name, stage index, band index. `None` when no
     /// handle is selected on any stage.
     selected_band: Option<(String, usize, usize)>,
+    /// The `(theme, accent)` last passed to `theme::install` (visual-identity.md
+    /// Flow B) — compared against the live snapshot each frame so a config-file
+    /// hand-edit or a picker change both re-install without a dedicated event.
+    /// `None` before the first frame, guaranteeing an install happens even if
+    /// the config's values equal the `Default`s.
+    last_theme_install: Option<(ThemeChoice, AccentChoice)>,
 }
 
 impl SettingsApp {
@@ -260,6 +270,7 @@ impl SettingsApp {
             search: String::new(),
             icons: IconCache::new(),
             selected_band: None,
+            last_theme_install: None,
         }
     }
 
@@ -402,6 +413,17 @@ impl eframe::App for SettingsApp {
         } = self.take_frame();
         clear_solo_on_rebuild(&mut self.soloed, &mut self.seen_generation, rebuild_generation);
 
+        // Flow B: install whenever the snapshot's theme/accent differs from
+        // what's currently installed — covers both a picker edit round-tripping
+        // through the store and an external config hand-edit, with no
+        // dedicated event needed (the same compare-and-react shape the rest of
+        // this module already uses for routes/sessions).
+        let wanted_theme = (snapshot.app.theme, snapshot.app.accent);
+        if self.last_theme_install != Some(wanted_theme) {
+            theme::install(ui.ctx(), wanted_theme.0, wanted_theme.1);
+            self.last_theme_install = Some(wanted_theme);
+        }
+
         if first_run {
             egui::CentralPanel::default().show(ui, |ui| {
                 self.onboarding_panel(ui, &available_devices, default_output_name.as_deref());
@@ -423,8 +445,9 @@ impl eframe::App for SettingsApp {
         egui::CentralPanel::default().show(ui, |ui| match self.screen.clone() {
             Screen::Mixer => {
                 if degraded {
+                    let sem = theme::semantic(egui::Theme::from_dark_mode(ui.visuals().dark_mode));
                     ui.colored_label(
-                        egui::Color32::from_rgb(220, 80, 40),
+                        sem.warning,
                         "Routing degraded — some app auto-routing may not work.",
                     );
                     ui.separator();
@@ -442,6 +465,18 @@ impl eframe::App for SettingsApp {
                     .unwrap_or(false);
                 if let Some(command) = profile_bar(ui, &snapshot.profiles, active, modified) {
                     self.handle_profile_command(command, &snapshot);
+                }
+
+                let (new_theme, new_accent) = appearance_picker(ui, snapshot.app.theme, snapshot.app.accent);
+                let mut appearance_edits = Vec::new();
+                if let Some(t) = new_theme {
+                    appearance_edits.push(ConfigEdit::SetTheme(t));
+                }
+                if let Some(a) = new_accent {
+                    appearance_edits.push(ConfigEdit::SetAccent(a));
+                }
+                if !appearance_edits.is_empty() {
+                    self.send(ShellAction::EditParams(appearance_edits));
                 }
                 ui.separator();
 
@@ -558,8 +593,9 @@ impl SettingsApp {
 
         ui.label("Which device should apps play through?");
         if devices.is_empty() {
+            let sem = theme::semantic(egui::Theme::from_dark_mode(ui.visuals().dark_mode));
             ui.colored_label(
-                egui::Color32::from_rgb(220, 80, 40),
+                sem.warning,
                 "No render devices detected. Plug one in, then reopen this window.",
             );
         } else {
@@ -1028,10 +1064,6 @@ const METER_REPAINT_ACTIVE_MS: u64 = 16;
 /// immediately rather than looking frozen.
 const METER_REPAINT_IDLE_MS: u64 = 250;
 
-const METER_GREEN: egui::Color32 = egui::Color32::from_rgb(60, 180, 90);
-const METER_AMBER: egui::Color32 = egui::Color32::from_rgb(220, 170, 40);
-const METER_RED: egui::Color32 = egui::Color32::from_rgb(220, 70, 45);
-
 /// Per-meter peak-hold marker state (level-meters.md) — UI-only, no domain
 /// footprint. `value` is the held bar fraction (0..1); it snaps up to a new
 /// peak and decays in frame time. `Default` = rest at the floor.
@@ -1052,13 +1084,13 @@ fn meter_fraction(peak: f32) -> f32 {
 
 /// Fill color by how hot the bar is — green normal, amber approaching, red near
 /// full scale. Pure.
-fn meter_color(fraction: f32) -> egui::Color32 {
+fn meter_color(fraction: f32, sem: theme::Semantic) -> egui::Color32 {
     if fraction > 0.9 {
-        METER_RED
+        sem.meter_clip
     } else if fraction > 0.75 {
-        METER_AMBER
+        sem.meter_hot
     } else {
-        METER_GREEN
+        sem.meter_ok
     }
 }
 
@@ -1201,6 +1233,8 @@ fn paint_meter(
     dt: f32,
     vertical: bool,
 ) {
+    let sem = theme::semantic(egui::Theme::from_dark_mode(ui.visuals().dark_mode));
+
     let painter = ui.painter();
     painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
 
@@ -1215,7 +1249,7 @@ fn paint_meter(
             let fill_right = rect.min.x + rect.width() * fraction;
             egui::Rect::from_min_max(rect.min, egui::pos2(fill_right, rect.max.y))
         };
-        painter.rect_filled(fill, 2.0, meter_color(fraction));
+        painter.rect_filled(fill, 2.0, meter_color(fraction, sem));
     }
 
     if hold.value > 0.0 {
@@ -1236,7 +1270,7 @@ fn paint_meter(
         } else {
             egui::Rect::from_min_max(egui::pos2(rect.max.x - 3.0, rect.min.y), rect.max)
         };
-        painter.rect_filled(cap, 1.0, METER_RED);
+        painter.rect_filled(cap, 1.0, sem.meter_clip);
     }
 
     response.on_hover_text(peak_db_label(level));
@@ -1582,6 +1616,70 @@ fn output_device_combo(ui: &mut egui::Ui, id_source: &str, current: &mut String,
             }
         });
     changed
+}
+
+/// Theme + accent pickers (visual-identity.md capability 2/5, component 8).
+/// Discrete-selection widgets, so no draft state (operational learnings
+/// 2026-07-21) — each reads the live snapshot value fresh every frame, same
+/// as `output_device_combo`. Returns the newly-picked value per field, `None`
+/// when that field's dropdown wasn't touched this frame.
+fn appearance_picker(
+    ui: &mut egui::Ui,
+    theme: ThemeChoice,
+    accent: AccentChoice,
+) -> (Option<ThemeChoice>, Option<AccentChoice>) {
+    let mut new_theme = None;
+    let mut new_accent = None;
+    ui.horizontal(|ui| {
+        ui.label("Theme:");
+        let mut current = theme;
+        egui::ComboBox::from_id_salt("appearance-theme")
+            .selected_text(theme_choice_label(current))
+            .show_ui(ui, |ui| {
+                for choice in [ThemeChoice::System, ThemeChoice::Dark, ThemeChoice::Light] {
+                    if ui.selectable_value(&mut current, choice, theme_choice_label(choice)).changed() {
+                        new_theme = Some(current);
+                    }
+                }
+            });
+
+        ui.label("Accent:");
+        let mut current = accent;
+        egui::ComboBox::from_id_salt("appearance-accent")
+            .selected_text(accent_choice_label(current))
+            .show_ui(ui, |ui| {
+                for choice in [
+                    AccentChoice::Brand,
+                    AccentChoice::Teal,
+                    AccentChoice::Amber,
+                    AccentChoice::Violet,
+                    AccentChoice::Slate,
+                ] {
+                    if ui.selectable_value(&mut current, choice, accent_choice_label(choice)).changed() {
+                        new_accent = Some(current);
+                    }
+                }
+            });
+    });
+    (new_theme, new_accent)
+}
+
+fn theme_choice_label(theme: ThemeChoice) -> &'static str {
+    match theme {
+        ThemeChoice::Dark => "Dark",
+        ThemeChoice::Light => "Light",
+        ThemeChoice::System => "System",
+    }
+}
+
+fn accent_choice_label(accent: AccentChoice) -> &'static str {
+    match accent {
+        AccentChoice::Brand => "Brand",
+        AccentChoice::Teal => "Teal",
+        AccentChoice::Amber => "Amber",
+        AccentChoice::Violet => "Violet",
+        AccentChoice::Slate => "Slate",
+    }
 }
 
 /// Reusable duck-trigger picker — other group names, `exclude` omits the
