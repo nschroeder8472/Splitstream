@@ -54,12 +54,20 @@ struct RawAppConfig {
     autostart: bool,
     #[serde(default)]
     active_profile: Option<String>,
+    #[serde(default)]
+    volume_bind: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
 struct RawHotkeys {
     #[serde(default)]
     mute_master: Option<String>,
+    #[serde(default)]
+    push_to_mute: Option<String>,
+    #[serde(default)]
+    master_volume_up: Option<String>,
+    #[serde(default)]
+    master_volume_down: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -80,6 +88,12 @@ struct RawGroup {
     spatial: bool,
     #[serde(default)]
     muted: bool,
+    #[serde(default)]
+    hotkey_mute: Option<String>,
+    #[serde(default)]
+    hotkey_volume_up: Option<String>,
+    #[serde(default)]
+    hotkey_volume_down: Option<String>,
 }
 
 /// TOML shape for `[[group.dsp]]` (spec §11.3). `bypassed` has no place on
@@ -160,6 +174,10 @@ fn current_schema_version() -> u32 {
 
 fn default_gain() -> f32 {
     1.0
+}
+
+fn parse_hotkey(raw: Option<String>) -> Result<Option<HotkeyChord>, ConfigError> {
+    raw.as_deref().map(HotkeyChord::parse).transpose().map_err(ConfigError::Invalid)
 }
 
 fn convert_duck(d: RawDuck) -> DuckSpecConfig {
@@ -321,18 +339,18 @@ pub(crate) fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
                 duck,
                 spatial: g.spatial,
                 muted: g.muted,
+                hotkey_mute: parse_hotkey(g.hotkey_mute)?,
+                hotkey_volume_up: parse_hotkey(g.hotkey_volume_up)?,
+                hotkey_volume_down: parse_hotkey(g.hotkey_volume_down)?,
             })
         })
         .collect::<Result<Vec<_>, ConfigError>>()?;
     validate_duck_config(&groups)?;
 
-    let mute_master = raw
-        .hotkeys
-        .mute_master
-        .as_deref()
-        .map(HotkeyChord::parse)
-        .transpose()
-        .map_err(ConfigError::Invalid)?;
+    let mute_master = parse_hotkey(raw.hotkeys.mute_master)?;
+    let push_to_mute = parse_hotkey(raw.hotkeys.push_to_mute)?;
+    let master_volume_up = parse_hotkey(raw.hotkeys.master_volume_up)?;
+    let master_volume_down = parse_hotkey(raw.hotkeys.master_volume_down)?;
 
     let profiles = raw
         .profile
@@ -347,8 +365,9 @@ pub(crate) fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
         groups,
         app: AppConfig {
             autostart: raw.app.autostart,
-            hotkeys: HotkeyMap { mute_master },
+            hotkeys: HotkeyMap { mute_master, push_to_mute, master_volume_up, master_volume_down },
             active_profile: raw.app.active_profile,
+            volume_bind: raw.app.volume_bind,
         },
         profiles,
     })
@@ -622,6 +641,7 @@ fn debounce_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine::HotkeyKey;
 
     fn group(name: &str, output: &str, gain: f32, follow_master: bool) -> GroupConfig {
         GroupConfig {
@@ -634,6 +654,9 @@ mod tests {
             duck: None,
             spatial: false,
             muted: false,
+            hotkey_mute: None,
+            hotkey_volume_up: None,
+            hotkey_volume_down: None,
         }
     }
 
@@ -678,9 +701,80 @@ mod tests {
                 ctrl: true,
                 alt: true,
                 shift: false,
-                key: 'M',
+                key: HotkeyKey::Char('M'),
             })
         );
+    }
+
+    #[test]
+    fn volume_bind_and_per_group_hotkeys_round_trip_through_toml() {
+        let toml = r#"
+            schema_version = 2
+            master = 1.0
+
+            [app]
+            volume_bind = "Game"
+
+            [hotkeys]
+            push_to_mute = "Ctrl+Alt+Space"
+            master_volume_up = "Ctrl+Alt+Up"
+            master_volume_down = "Ctrl+Alt+Down"
+
+            [[group]]
+            name = "Game"
+            output_device = "Speakers"
+            hotkey_mute = "Ctrl+Alt+1"
+            hotkey_volume_up = "Ctrl+Shift+Up"
+            hotkey_volume_down = "Ctrl+Shift+Down"
+        "#;
+        let snapshot = parse(toml).unwrap();
+        assert_eq!(snapshot.app.volume_bind, Some("Game".to_string()));
+        assert_eq!(
+            snapshot.app.hotkeys.push_to_mute,
+            Some(HotkeyChord { ctrl: true, alt: true, shift: false, key: HotkeyKey::Space })
+        );
+        assert_eq!(
+            snapshot.app.hotkeys.master_volume_up,
+            Some(HotkeyChord { ctrl: true, alt: true, shift: false, key: HotkeyKey::Up })
+        );
+        assert_eq!(
+            snapshot.app.hotkeys.master_volume_down,
+            Some(HotkeyChord { ctrl: true, alt: true, shift: false, key: HotkeyKey::Down })
+        );
+        let group = &snapshot.groups[0];
+        assert_eq!(
+            group.hotkey_mute,
+            Some(HotkeyChord { ctrl: true, alt: true, shift: false, key: HotkeyKey::Char('1') })
+        );
+        assert_eq!(
+            group.hotkey_volume_up,
+            Some(HotkeyChord { ctrl: true, shift: true, alt: false, key: HotkeyKey::Up })
+        );
+        assert_eq!(
+            group.hotkey_volume_down,
+            Some(HotkeyChord { ctrl: true, shift: true, alt: false, key: HotkeyKey::Down })
+        );
+    }
+
+    #[test]
+    fn an_absent_hotkey_registers_nothing() {
+        let toml = r#"
+            schema_version = 2
+            master = 1.0
+
+            [[group]]
+            name = "Game"
+            output_device = "Speakers"
+        "#;
+        let snapshot = parse(toml).unwrap();
+        assert_eq!(snapshot.app.volume_bind, None);
+        assert_eq!(snapshot.app.hotkeys.push_to_mute, None);
+        assert_eq!(snapshot.app.hotkeys.master_volume_up, None);
+        assert_eq!(snapshot.app.hotkeys.master_volume_down, None);
+        let group = &snapshot.groups[0];
+        assert_eq!(group.hotkey_mute, None);
+        assert_eq!(group.hotkey_volume_up, None);
+        assert_eq!(group.hotkey_volume_down, None);
     }
 
     #[test]
@@ -714,7 +808,7 @@ mod tests {
         assert!(!p.muted);
         assert_eq!(
             p.hotkey,
-            Some(HotkeyChord { ctrl: true, alt: true, shift: false, key: '1' })
+            Some(HotkeyChord { ctrl: true, alt: true, shift: false, key: HotkeyKey::Char('1') })
         );
         assert_eq!(p.groups.len(), 1);
         assert_eq!(p.groups[0].output_device, "Headphones");

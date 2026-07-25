@@ -580,6 +580,9 @@ impl SettingsApp {
                 duck: None,
                 spatial: false,
                 muted: false,
+                hotkey_mute: None,
+                hotkey_volume_up: None,
+                hotkey_volume_down: None,
             };
             self.send(ShellAction::EditStructure(vec![
                 ConfigEdit::AddGroup(group),
@@ -995,6 +998,9 @@ impl SettingsApp {
                     duck: None,
                     spatial: false,
                     muted: false,
+                    hotkey_mute: None,
+                    hotkey_volume_up: None,
+                    hotkey_volume_down: None,
                 };
                 self.send(ShellAction::EditStructure(vec![ConfigEdit::AddGroup(group)]));
                 self.new_group = NewGroupDraft::default();
@@ -1097,15 +1103,15 @@ fn peak_for(peaks: &[(GroupId, MeterLevel)], id: GroupId) -> MeterLevel {
 
 /// Bottom of fader travel (db-faders.md). Matches [`METER_FLOOR_DB`], so the
 /// fader and the level meter beside it share one scale.
-const FADER_MIN_DB: f32 = -60.0;
+pub(crate) const FADER_MIN_DB: f32 = -60.0;
 /// Top of fader travel -- the last 6 dB is boost above unity (decision 2).
-const FADER_MAX_DB: f32 = 6.0;
+pub(crate) const FADER_MAX_DB: f32 = 6.0;
 
 /// Fader position (dB) -> `Gain`. At or below [`FADER_MIN_DB`] the result is
 /// `Gain::SILENT`, not −60 dB (decision 3): pulling a fader down means off,
 /// not quiet. The input range guarantees a finite non-negative linear value,
 /// so `Gain::new` cannot fail here.
-fn fader_db_to_gain(db: f32) -> Gain {
+pub(crate) fn fader_db_to_gain(db: f32) -> Gain {
     if db <= FADER_MIN_DB {
         Gain::SILENT
     } else {
@@ -1119,7 +1125,7 @@ fn fader_db_to_gain(db: f32) -> Gain {
 /// existing value (e.g. a hand-written `gain = 4.0`, +12 dB) must reach the
 /// slider unclamped so `SliderClamping::Edits` can display it truthfully
 /// instead of silently squashing it on mere render (db-faders.md decision 10).
-fn gain_to_fader_db(gain: Gain) -> f32 {
+pub(crate) fn gain_to_fader_db(gain: Gain) -> f32 {
     linear_to_db(gain.value())
 }
 
@@ -1980,6 +1986,9 @@ mod tests {
             duck: None,
             spatial: false,
             muted: false,
+            hotkey_mute: None,
+            hotkey_volume_up: None,
+            hotkey_volume_down: None,
         }
     }
 

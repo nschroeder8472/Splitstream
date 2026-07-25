@@ -11,8 +11,8 @@ use std::time::Duration;
 use audio_core::Format;
 
 use super::{
-    AudioSystem, CapturePort, DeviceEvent, Endpoint, EndpointId, PortError, RenderPort, RtGuard,
-    SessionEvent, SessionPort,
+    AudioSystem, CapturePort, DeviceEvent, Endpoint, EndpointId, EndpointVolumePort, PortError,
+    RenderPort, RtGuard, SessionEvent, SessionPort, VolumeEvent,
 };
 use crate::rules::SessionInfo;
 
@@ -40,6 +40,10 @@ pub struct MockSystem {
     /// Successful `open_process_capture` calls per pid — lets a test prove a
     /// pid was actually re-opened (not just skipped as "still current").
     open_counts: Mutex<HashMap<u32, usize>>,
+    /// `None` (the default) simulates a device without volume control —
+    /// `open_default_endpoint_volume` errors, matching the real trait's
+    /// default body. Set via `enable_endpoint_volume`.
+    endpoint_volume: Mutex<Option<MockEndpointVolumePort>>,
 }
 
 impl MockSystem {
@@ -52,6 +56,7 @@ impl MockSystem {
             failing_pids: Mutex::new(std::collections::HashSet::new()),
             dying_pids: Mutex::new(std::collections::HashSet::new()),
             open_counts: Mutex::new(HashMap::new()),
+            endpoint_volume: Mutex::new(None),
         }
     }
 
@@ -125,6 +130,17 @@ impl MockSystem {
     pub fn open_count(&self, pid: u32) -> usize {
         self.open_counts.lock().unwrap().get(&pid).copied().unwrap_or(0)
     }
+
+    /// Test hook: make `open_default_endpoint_volume` succeed, returning a
+    /// mock seeded with `level`/`muted`. Returns a cloned handle (same
+    /// underlying state) a test uses to simulate Windows-side changes
+    /// (`emit`) and inspect outbound calls (`set_level_calls`/`set_muted_calls`)
+    /// — same shape as `MockSessionPort`.
+    pub fn enable_endpoint_volume(&self, level: f32, muted: bool) -> MockEndpointVolumePort {
+        let port = MockEndpointVolumePort::new(level, muted);
+        *self.endpoint_volume.lock().unwrap() = Some(port.clone());
+        port
+    }
 }
 
 impl AudioSystem for MockSystem {
@@ -183,6 +199,13 @@ impl AudioSystem for MockSystem {
         let (tx, rx) = mpsc::channel();
         *self.events.lock().unwrap() = Some(tx);
         Ok(rx)
+    }
+
+    fn open_default_endpoint_volume(&self) -> Result<Box<dyn EndpointVolumePort>, PortError> {
+        match self.endpoint_volume.lock().unwrap().clone() {
+            Some(port) => Ok(Box::new(port)),
+            None => Err(PortError::Backend("mock: no endpoint volume port configured".into())),
+        }
     }
 }
 
@@ -380,6 +403,83 @@ impl SessionPort for MockSessionPort {
             set.remove(&pid);
         }
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct EndpointVolumeState {
+    level: Mutex<f32>,
+    muted: Mutex<bool>,
+    events: Mutex<Option<mpsc::Sender<VolumeEvent>>>,
+    set_level_calls: Mutex<Vec<f32>>,
+    set_muted_calls: Mutex<Vec<bool>>,
+}
+
+/// Fake `EndpointVolumePort`. Same `Arc`-backed `Clone` shape as
+/// `MockSessionPort` — `take_events` takes `&mut self`, so the port itself
+/// moves into `Box<dyn EndpointVolumePort>`, and a test keeps a cloned handle
+/// (same underlying state) to drive it afterward.
+#[derive(Clone)]
+pub struct MockEndpointVolumePort(Arc<EndpointVolumeState>);
+
+impl MockEndpointVolumePort {
+    fn new(level: f32, muted: bool) -> MockEndpointVolumePort {
+        let state = EndpointVolumeState {
+            level: Mutex::new(level),
+            muted: Mutex::new(muted),
+            ..Default::default()
+        };
+        MockEndpointVolumePort(Arc::new(state))
+    }
+
+    /// Test hook: simulate Windows changing the volume (keys, OSD, OS mixer)
+    /// — updates the mock's own state and, if `take_events` has been called,
+    /// delivers the notification. No-op on the notification if nothing has
+    /// subscribed yet, same as `MockSystem::emit_device_event`.
+    pub fn emit(&self, event: VolumeEvent) {
+        *self.0.level.lock().unwrap() = event.level;
+        *self.0.muted.lock().unwrap() = event.muted;
+        if let Some(tx) = self.0.events.lock().unwrap().as_ref() {
+            let _ = tx.send(event);
+        }
+    }
+
+    /// Test hook: every value `set_level` has been called with, in order.
+    pub fn set_level_calls(&self) -> Vec<f32> {
+        self.0.set_level_calls.lock().unwrap().clone()
+    }
+
+    /// Test hook: every value `set_muted` has been called with, in order.
+    pub fn set_muted_calls(&self) -> Vec<bool> {
+        self.0.set_muted_calls.lock().unwrap().clone()
+    }
+}
+
+impl EndpointVolumePort for MockEndpointVolumePort {
+    fn level(&self) -> Result<f32, PortError> {
+        Ok(*self.0.level.lock().unwrap())
+    }
+
+    fn set_level(&self, level: f32) -> Result<(), PortError> {
+        self.0.set_level_calls.lock().unwrap().push(level);
+        *self.0.level.lock().unwrap() = level;
+        Ok(())
+    }
+
+    fn muted(&self) -> Result<bool, PortError> {
+        Ok(*self.0.muted.lock().unwrap())
+    }
+
+    fn set_muted(&self, muted: bool) -> Result<(), PortError> {
+        self.0.set_muted_calls.lock().unwrap().push(muted);
+        *self.0.muted.lock().unwrap() = muted;
+        Ok(())
+    }
+
+    fn take_events(&mut self) -> Receiver<VolumeEvent> {
+        let (tx, rx) = mpsc::channel();
+        *self.0.events.lock().unwrap() = Some(tx);
+        rx
     }
 }
 

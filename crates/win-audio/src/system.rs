@@ -2,7 +2,8 @@ use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
 
 use engine::ports::{
-    AudioSystem, CapturePort, DeviceEvent, Endpoint, EndpointId, PortError, RenderPort, RtGuard,
+    AudioSystem, CapturePort, DeviceEvent, Endpoint, EndpointId, EndpointVolumePort, PortError,
+    RenderPort, RtGuard,
 };
 
 use crate::enumerator::EndpointEnumerator;
@@ -58,6 +59,10 @@ impl AudioSystem for WasapiSystem {
         let (monitor, rx) = crate::monitor::subscribe()?;
         *self.monitor.lock().unwrap() = Some(monitor);
         Ok(rx)
+    }
+
+    fn open_default_endpoint_volume(&self) -> Result<Box<dyn EndpointVolumePort>, PortError> {
+        Ok(Box::new(crate::endpoint_volume::open()?))
     }
 }
 

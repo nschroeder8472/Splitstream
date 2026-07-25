@@ -1,5 +1,6 @@
 pub mod com;
 mod device;
+mod endpoint_volume;
 pub mod enumerator;
 pub mod format;
 pub mod mmcss;
