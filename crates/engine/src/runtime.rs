@@ -164,6 +164,15 @@ pub struct EngineStats {
     /// treble bell is ~3 dB wider than the same band drawn at 48 kHz. Static
     /// for the life of the graph.
     pub group_rates: Vec<(GroupId, u32)>,
+    /// Frames the mixer produced that an output ring could not accept
+    /// (audio-flow-control cap 3). Should stay 0 under the governor —
+    /// non-zero means the budget and the ring's real capacity disagree.
+    pub output_drops: u64,
+    /// Frames the capture side read that a group ring could not accept.
+    pub capture_drops: u64,
+    /// Frames offered to a render device that it did not accept. Structurally
+    /// impossible post-B1 — counted because "impossible" is what B1 was.
+    pub render_shortfall: u64,
 }
 
 /// Packs a [`MeterLevel`] into one `AtomicU64` cell: the f32 peak in the low
@@ -213,6 +222,9 @@ fn read_stats(running: &Mutex<Option<RunningGraph>>) -> EngineStats {
             output_peak: Vec::new(),
             output_names: Vec::new(),
             group_rates: Vec::new(),
+            output_drops: 0,
+            capture_drops: 0,
+            render_shortfall: 0,
         },
         Some(rg) => EngineStats {
             xruns: rg.xruns.load(Ordering::Relaxed),
@@ -259,6 +271,9 @@ fn read_stats(running: &Mutex<Option<RunningGraph>>) -> EngineStats {
                 .collect(),
             output_names: rg.output_devices.clone(),
             group_rates: rg.group_formats.iter().map(|(id, fmt)| (*id, fmt.sample_rate)).collect(),
+            output_drops: rg.output_drops.load(Ordering::Relaxed),
+            capture_drops: rg.capture_drops.load(Ordering::Relaxed),
+            render_shortfall: rg.render_shortfall.load(Ordering::Relaxed),
         },
     }
 }
@@ -284,6 +299,22 @@ const MIXER_FALLBACK_INTERVAL: Duration = Duration::from_millis(100);
 /// mixer wakes from a real park/unpark event rather than a polled timer
 /// (decision 2).
 const WAKE_MARGIN: f64 = 1.25;
+/// `render_loop`'s buffer holds this many device periods (audio-flow-control
+/// B1), so a device that drained more than one period in one event (post-
+/// stall catch-up) still refills in a single `wait_event` cycle. The actual
+/// amount popped each event is bounded by `free_frames()`, never this constant
+/// directly — this only sizes the preallocated scratch buffer.
+const RENDER_BUF_PERIODS: usize = 4;
+/// `pid_capture_loop`'s read buffer holds this many poll intervals (B3), so a
+/// late wakeup still drains the source in one `read` call instead of leaving
+/// packets queued. The old fixed 256-frame buffer was ~53% of a single
+/// interval at a typical 10ms poll/48kHz.
+const CAPTURE_BUF_INTERVALS: usize = 2;
+/// Fill fraction at or above which the mixer tick governor stops producing
+/// for an output (audio-flow-control B2/B4, decision 6: full-block-or-skip).
+/// The ring then sawtooths between this floor and one block above it — see
+/// `drift_target_fill` (clock.rs), which aims at that sawtooth's midpoint.
+const GOVERNOR_THRESHOLD_FILL: f32 = 0.5;
 
 /// Wakes the mixer thread out of its park (mixer-demand-driven-wakeup L2/L4).
 /// Clone, no lock: `std::thread::Thread` is already `Send + Sync + Clone`, so
@@ -393,6 +424,15 @@ struct RunningGraph {
     mixer_thread: Option<JoinHandle<()>>,
     render_threads: Vec<JoinHandle<()>>,
     xruns: Arc<AtomicU64>,
+    /// Audio-flow-control cap 3 counters — shared with the threads that
+    /// actually drop frames, read cross-thread by `EngineHandle::stats`.
+    output_drops: Arc<AtomicU64>,
+    capture_drops: Arc<AtomicU64>,
+    render_shortfall: Arc<AtomicU64>,
+    /// This build's own computed drift target (audio-flow-control decision
+    /// 7) — the supervisor reads it to (re)construct `DriftConfig` instead
+    /// of holding one fixed value for the process lifetime.
+    drift_target_fill: f32,
     ring_fill: Arc<Vec<RingGauge>>,
     output_ids: Vec<OutputId>,
     group_ids: Vec<GroupId>,
@@ -784,13 +824,17 @@ impl CaptureControl {
                 return Err(EngineError::AlreadyStopped);
             };
             let waker = rg.mixer_waker.clone();
+            let drops = Arc::clone(&rg.capture_drops);
             for (pid, port, producer, consumer) in opened {
                 let stop = Arc::new(AtomicBool::new(false));
                 let thread = {
                     let stop = Arc::clone(&stop);
                     let sys = Arc::clone(&self.sys);
                     let waker = waker.clone();
-                    thread::spawn(move || pid_capture_loop(port, producer, &stop, sys.as_ref(), waker))
+                    let drops = Arc::clone(&drops);
+                    thread::spawn(move || {
+                        pid_capture_loop(port, producer, &stop, sys.as_ref(), waker, &drops)
+                    })
                 };
                 rg.capture_pids.entry(group).or_default().insert(pid, PidCapture { stop, thread });
                 let _ = rg.capture_tx.send(CaptureMsg::Add { group, pid, consumer });
@@ -805,24 +849,43 @@ impl CaptureControl {
 /// minus fault reporting: a per-pid read failure just ends this one thread
 /// (process-loopback-capture L3 flow E treats it as this pid quietly
 /// dropping out, not a "fault" the recovery supervisor needs to react to).
+/// The sizing B3 got wrong, isolated so a test can pin it: `poll_interval`
+/// worth of audio at `sample_rate`, times `CAPTURE_BUF_INTERVALS` margin, in
+/// interleaved samples. Pure.
+fn capture_buf_samples(poll_interval: Duration, sample_rate: u32, channels: usize) -> usize {
+    let frames = frames_for(poll_interval * CAPTURE_BUF_INTERVALS as u32, sample_rate);
+    frames * channels.max(1)
+}
+
 fn pid_capture_loop(
     mut port: Box<dyn CapturePort>,
     mut producer: rtrb::Producer<f32>,
     stop: &AtomicBool,
     sys: &dyn AudioSystem,
     waker: MixerWaker,
+    drops: &AtomicU64,
 ) {
     let _rt = sys.promote_rt_thread();
     let poll_interval = port.poll_interval();
     let channels = port.format().channels.max(1) as usize;
-    let mut buf = vec![0.0f32; channels * 256];
+    let sample_rate = port.format().sample_rate;
+    // Covers a whole poll interval with margin (B3) — the old fixed 256
+    // frames was ~53% of a single ~10ms/48kHz interval, chronically
+    // under-reading what the source actually produced.
+    let mut buf = vec![0.0f32; capture_buf_samples(poll_interval, sample_rate, channels)];
     let sleeper = spin_sleep::SpinSleeper::default();
 
     while !stop.load(Ordering::Relaxed) {
         match port.read(&mut buf) {
             Ok(n) => {
+                let mut dropped = 0u64;
                 for &sample in &buf[..n] {
-                    let _ = producer.push(sample); // ring full: drop, best-effort (notes §1)
+                    if producer.push(sample).is_err() {
+                        dropped += 1; // ring full: counted, never silent (B2/B3)
+                    }
+                }
+                if dropped > 0 {
+                    drops.fetch_add(dropped, Ordering::Relaxed);
                 }
                 // New audio arrived — mix it (mixer-demand-driven-wakeup L3
                 // Flow D), bounded by MIXER_FALLBACK_INTERVAL if ever missed.
@@ -993,6 +1056,7 @@ fn spawn_render_threads(
     waker: MixerWaker,
     stop: &Arc<AtomicBool>,
     xruns: &Arc<AtomicU64>,
+    shortfall: &Arc<AtomicU64>,
     faults: &Sender<Fault>,
     sys: &Arc<dyn AudioSystem>,
 ) -> Vec<JoinHandle<()>> {
@@ -1000,12 +1064,14 @@ fn spawn_render_threads(
     for (output_id, port, consumer) in prepared.into_iter() {
         let stop = Arc::clone(stop);
         let xruns = Arc::clone(xruns);
+        let shortfall = Arc::clone(shortfall);
         let faults = faults.clone();
         let sys = Arc::clone(sys);
         let waker = waker.clone();
         threads.push(thread::spawn(move || {
             let ctx = RenderFaultCtx {
                 xruns: &xruns,
+                shortfall: &shortfall,
                 output_id,
                 faults: &faults,
             };
@@ -1030,8 +1096,28 @@ fn build_running_graph(
 
     let stop = Arc::new(AtomicBool::new(false));
     let xruns = Arc::new(AtomicU64::new(0));
+    let output_drops = Arc::new(AtomicU64::new(0));
+    let capture_drops = Arc::new(AtomicU64::new(0));
+    let render_shortfall = Arc::new(AtomicU64::new(0));
     let group_ids: Vec<GroupId> = opened.plan.topology.groups.iter().map(|g| g.id).collect();
     let output_ids: Vec<OutputId> = opened.plan.topology.outputs.iter().map(|o| o.id).collect();
+    // Index-parallel to group_consumers/output_producers respectively — the
+    // governor's block_output_frames needs both sides of each group's rate
+    // ratio (audio-flow-control decision 6/7).
+    let group_input_rates: Vec<u32> = opened
+        .plan
+        .topology
+        .groups
+        .iter()
+        .map(|g| g.input_format.sample_rate)
+        .collect();
+    let output_rates: Vec<u32> = opened
+        .plan
+        .topology
+        .outputs
+        .iter()
+        .map(|o| o.format.sample_rate)
+        .collect();
     let ring_fill = Arc::new(
         output_ids
             .iter()
@@ -1102,6 +1188,22 @@ fn build_running_graph(
     // that order, since `render_loop` requires a `MixerWaker` that only
     // exists once the mixer thread is spawned.
     let (prepared_renders, output_producers) = prepare_output_rings(opened.renders);
+    // Audio-flow-control decision 7: the drift loop's target aims at the
+    // governor's own sawtooth midpoint rather than a flat 0.5, computed from
+    // this build's real ring capacity and block size (not the nominal
+    // numbers decision 7 worked out by hand). Representative, not per-group
+    // exact — `DriftConfig` is one scalar for the whole graph, so this reads
+    // the first output's own capacity; `block_out_frames` assumes that
+    // output's feeding group shares its rate (the common case), same
+    // approximation the governor itself falls back on when a group's own
+    // rate isn't separately known at this call site.
+    let drift_target_fill = output_producers
+        .first()
+        .map(|(_, producer, channels)| {
+            let capacity_frames = producer.buffer().capacity() / (*channels).max(1);
+            crate::clock::drift_target_fill(GOVERNOR_THRESHOLD_FILL, max_block_frames, capacity_frames)
+        })
+        .unwrap_or(GOVERNOR_THRESHOLD_FILL);
 
     let (capture_tx, capture_rx) = mpsc::channel();
     let mixer_args = MixerThreadArgs {
@@ -1116,14 +1218,24 @@ fn build_running_graph(
         group_peak: Arc::clone(&group_peak),
         output_peak: Arc::clone(&output_peak),
         capture_rx,
+        group_input_rates,
+        output_rates,
+        output_drops: Arc::clone(&output_drops),
     };
     let mixer_thread = thread::spawn(move || {
         mixer_loop(mixer, group_consumers, output_producers, mixer_args);
     });
     let mixer_waker = MixerWaker(mixer_thread.thread().clone());
 
-    let render_threads =
-        spawn_render_threads(prepared_renders, mixer_waker.clone(), &stop, &xruns, &fault_tx, sys);
+    let render_threads = spawn_render_threads(
+        prepared_renders,
+        mixer_waker.clone(),
+        &stop,
+        &xruns,
+        &render_shortfall,
+        &fault_tx,
+        sys,
+    );
 
     Ok(RunningGraph {
         stop,
@@ -1132,6 +1244,10 @@ fn build_running_graph(
         mixer_thread: Some(mixer_thread),
         render_threads,
         xruns,
+        output_drops,
+        capture_drops,
+        render_shortfall,
+        drift_target_fill,
         ring_fill,
         output_ids,
         group_ids,
@@ -1188,6 +1304,10 @@ fn log_channel_conversions(topology: &Topology, max_block_frames: usize) {
 /// functions should be applied to both).
 struct RenderFaultCtx<'a> {
     xruns: &'a AtomicU64,
+    /// Frames offered to the device via `write` that it did not accept
+    /// (audio-flow-control B1) — structurally impossible post-B1's
+    /// `free_frames`-bounded pop, counted because "impossible" is what B1 was.
+    shortfall: &'a AtomicU64,
     output_id: OutputId,
     faults: &'a Sender<Fault>,
 }
@@ -1202,8 +1322,22 @@ fn render_loop(
 ) {
     let _rt = sys.promote_rt_thread();
     let channels = port.format().channels.max(1) as usize;
-    let mut buf = vec![0.0f32; port.period_frames() * channels];
+    // Sized generously (RENDER_BUF_PERIODS periods); the amount actually
+    // popped each event is bounded below by `free_frames()`, not this length
+    // (audio-flow-control B1 — this used to be conflated with the device's
+    // full buffer size).
+    let mut buf = vec![0.0f32; RENDER_BUF_PERIODS * port.period_frames() * channels];
     let wait_timeout = Duration::from_millis(100);
+    // Fill this ring must reach before the loop starts draining it. The
+    // governor's own threshold, deliberately NOT `drift_target_fill`: the
+    // governor stops producing at the threshold, so any higher target is only
+    // reachable via a block overshoot, which would make this exit condition
+    // race the mixer. At the threshold it is exactly decision 7's "two full
+    // device periods of cushion".
+    let prime_target_frames = (consumer.buffer().capacity() as f32
+        / channels.max(1) as f32
+        * GOVERNOR_THRESHOLD_FILL) as usize;
+    let mut priming = true;
 
     while !stop.load(Ordering::Relaxed) {
         if let Err(e) = port.wait_event(wait_timeout) {
@@ -1214,30 +1348,85 @@ fn render_loop(
             return; // device invalidated — exit, rest of the graph keeps running
         }
 
+        let free_frames = match port.free_frames() {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = ctx.faults.send(Fault {
+                    source: FaultSource::Output(ctx.output_id),
+                    kind: FaultKind::from(&e),
+                });
+                return;
+            }
+        };
+        // Never ask for more than the device just told us it will accept
+        // (B1) — the whole point of `free_frames`.
+        let want_frames = free_frames.min(buf.len() / channels.max(1));
+        let want = want_frames * channels;
+        let slice = &mut buf[..want];
+
+        // The governor (Flow C) bounds an output ring from ABOVE only — it
+        // withholds production, it cannot create audio — so nothing in the
+        // blueprint establishes the ring FLOOR that decision 7's cushion
+        // depends on. Production is capture-limited to roughly one device
+        // period per period, matching this loop's drain exactly, so a ring
+        // that starts empty stays empty: every event pops the little that is
+        // there and silence-pads the rest. Priming builds the cushion once,
+        // by feeding the device silence while leaving the ring alone.
+        //
+        // Re-armed only on a COMPLETELY empty ring: an empty ring is already
+        // emitting silence, so waiting costs nothing, whereas a partially
+        // filled one is mid-stream and must never be interrupted to rebuild a
+        // cushion. That also covers engine start, where no capture exists yet.
+        let available_frames = consumer.slots() / channels.max(1);
+        if available_frames == 0 {
+            priming = true;
+        } else if available_frames >= prime_target_frames {
+            priming = false;
+        }
+
         let mut got = 0;
-        while got < buf.len() {
-            match consumer.pop() {
-                Ok(sample) => {
-                    buf[got] = sample;
-                    got += 1;
+        if !priming {
+            while got < slice.len() {
+                match consumer.pop() {
+                    Ok(sample) => {
+                        slice[got] = sample;
+                        got += 1;
+                    }
+                    Err(_) => break, // ring empty
                 }
-                Err(_) => break, // ring empty
             }
         }
-        if got < buf.len() {
-            buf[got..].fill(0.0); // underrun: pad with silence, never wait for the mixer
-            ctx.xruns.fetch_add(1, Ordering::Relaxed);
+        if got < slice.len() {
+            slice[got..].fill(0.0); // underrun: pad with silence, never wait for the mixer
+            if !priming {
+                // Priming is a deliberate cushion build, not an underrun —
+                // counting it would make `xruns` unusable as the very signal
+                // that tells us whether the floor is holding.
+                ctx.xruns.fetch_add(1, Ordering::Relaxed);
+            }
         }
         // "I just consumed — refill me for next time" (mixer-demand-driven-
         // wakeup L3 Flow C), synchronized to this real hardware event's own
         // precision, before handing the just-drained buffer to the device.
         waker.wake();
-        if let Err(e) = port.write(&buf) {
-            let _ = ctx.faults.send(Fault {
-                source: FaultSource::Output(ctx.output_id),
-                kind: FaultKind::from(&e),
-            });
-            return;
+        match port.write(slice) {
+            Ok(accepted_frames) => {
+                // Structurally impossible now (we only ever offer up to what
+                // free_frames() just reported) — counted, never silent, per
+                // B1's own "never move more than the receiver can accept AND
+                // never let a shortfall go silent" invariant.
+                if accepted_frames < want_frames {
+                    ctx.shortfall
+                        .fetch_add((want_frames - accepted_frames) as u64, Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                let _ = ctx.faults.send(Fault {
+                    source: FaultSource::Output(ctx.output_id),
+                    kind: FaultKind::from(&e),
+                });
+                return;
+            }
         }
     }
 }
@@ -1258,6 +1447,16 @@ struct MixerThreadArgs {
     /// `CaptureControl::apply_capture_sources` sends per-pid add/remove here —
     /// drained once per tick, same as `persistent.commands`.
     capture_rx: Receiver<CaptureMsg>,
+    /// Each group's input sample rate, index-parallel to `group_consumers` —
+    /// the governor's `block_output_frames` needs it alongside the group's
+    /// own output's rate (audio-flow-control decision 6/7).
+    group_input_rates: Vec<u32>,
+    /// Each output's sample rate, index-parallel to `output_producers`.
+    output_rates: Vec<u32>,
+    /// Frames the governor's budget said fit that an output ring rejected
+    /// anyway (cap 3) — should stay 0; a disagreement between the budget and
+    /// the ring's real capacity.
+    output_drops: Arc<AtomicU64>,
 }
 
 fn mixer_loop(
@@ -1284,15 +1483,34 @@ fn mixer_loop(
     // index order, which was built from the same topology.
     let group_ids: Vec<GroupId> = group_consumers.iter().map(|slot| slot.group_id).collect();
     let output_ids: Vec<OutputId> = output_producers.iter().map(|(id, ..)| *id).collect();
+    // Governor budget, computed once (audio-flow-control decision 6): output
+    // frames one full input block becomes after each group's own SRC.
+    let block_out_frames: Vec<usize> = group_consumers
+        .iter()
+        .enumerate()
+        .map(|(i, slot)| {
+            let group_rate = args.group_input_rates[i];
+            let output_rate = args.output_rates[slot.output_index];
+            block_output_frames(args.max_block_frames, group_rate, output_rate)
+        })
+        .collect();
+    let mut headroom = vec![OutputHeadroom { filled_frames: 0, capacity_frames: 0 }; output_producers.len()];
 
     while !args.stop.load(Ordering::Relaxed) {
         drain_capture_commands(&args.capture_rx, &mut group_consumers);
         drain_commands(&args.persistent, &mut mixer, &args.ring_fill, &args.output_index_of);
+        // Sampled once per tick, before any group is pulled, so every group
+        // this tick decides against the same snapshot (audio-flow-control
+        // Flow C) — a stalled output can't be made to look healthier by a
+        // push that happens to land between two groups' checks.
+        sample_output_headroom(&output_producers, &mut headroom);
         pull_group_inputs(
             &mut group_consumers,
             &mut group_scratch,
             &mut mixer,
             &mut real_this_tick,
+            &headroom,
+            &block_out_frames,
         );
         mixer.mix_tick();
         update_telemetry(&mixer, &group_ids, &output_ids, &args);
@@ -1300,9 +1518,12 @@ fn mixer_loop(
             &mut output_producers,
             &mut output_scratch,
             &mut mixer,
-            &args.ring_fill,
-            &real_this_tick,
-            &mut ticks_since_real,
+            FlushCtx {
+                ring_fill: &args.ring_fill,
+                real_this_tick: &real_this_tick,
+                ticks_since_real: &mut ticks_since_real,
+                drops: &args.output_drops,
+            },
         );
 
         // Block (zero CPU) until real demand wakes this thread again — a
@@ -1394,59 +1615,136 @@ fn drain_capture_commands(capture_rx: &Receiver<CaptureMsg>, group_consumers: &m
     }
 }
 
+/// One output ring's state, sampled once per tick before any group is pulled
+/// (audio-flow-control Flow C) — in that output's own frames, not samples.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct OutputHeadroom {
+    filled_frames: usize,
+    capacity_frames: usize,
+}
+
+/// Snapshots every output ring's fill/capacity once per tick, in frames.
+fn sample_output_headroom(
+    output_producers: &[(OutputId, rtrb::Producer<f32>, usize)],
+    out: &mut [OutputHeadroom],
+) {
+    for (i, (_, producer, channels)) in output_producers.iter().enumerate() {
+        let capacity_samples = producer.buffer().capacity();
+        let filled_samples = capacity_samples - producer.slots();
+        let ch = (*channels).max(1);
+        out[i] = OutputHeadroom {
+            filled_frames: filled_samples / ch,
+            capacity_frames: capacity_samples / ch,
+        };
+    }
+}
+
+/// Output frames one full input block becomes after that group's SRC —
+/// computed once per group at mixer-thread start (audio-flow-control
+/// decision 7), not per tick.
+fn block_output_frames(block_frames: usize, group_rate: u32, output_rate: u32) -> usize {
+    ((block_frames as u64 * output_rate.max(1) as u64) / group_rate.max(1) as u64) as usize
+}
+
+/// Policy (β, decision 6): may this group push a full block this tick? Pure —
+/// testable with synthetic headroom, no `Mixer` and no threads. Skips once
+/// the output ring is at/above `GOVERNOR_THRESHOLD_FILL`, and as a hard
+/// safety net (beyond the default constants' own numbers, which never hit
+/// this in practice) never pushes a block that would overflow the ring
+/// outright.
+fn group_may_push(headroom: OutputHeadroom, block_out_frames: usize) -> bool {
+    let threshold_frames = (GOVERNOR_THRESHOLD_FILL * headroom.capacity_frames as f32) as usize;
+    headroom.filled_frames < threshold_frames
+        && headroom.filled_frames + block_out_frames <= headroom.capacity_frames
+}
+
 /// Sums every pid currently captured into a group's scratch buffer, one
 /// frame at a time — a group with zero pids (nothing matched yet, or every
 /// pid starved this tick) behaves exactly like the old single-consumer
 /// "starved" case: silence, never a stall (the mixer tick is timer-paced).
-/// `real_this_tick` for a group's output is set if *any* pid fully filled
-/// the block this tick (even WASAPI-silent audio still delivers
-/// SILENT-flagged packets — notes §6).
+///
+/// Governed per group (audio-flow-control B2/B4, decision 6: full-block-or-
+/// skip): a group whose own output is at/above threshold (`group_may_push`)
+/// is skipped entirely this tick — its pids' rings are left untouched (the
+/// audio waits for a tick with headroom) and `push_group` is called with an
+/// empty slice, so the mixer sees zero valid frames rather than replaying a
+/// stale block. A group allowed to push pulls up to one full block from its
+/// pids and pushes only the frames actually popped — never the zero-padded
+/// remainder (B4): `filled_max` is the frame count, maxed across pids (pids
+/// are summed sample-by-sample; lengths are maxed, matching the existing
+/// per-pid summation). `real_this_tick` for a group's output is set whenever
+/// *any* pushed group popped at least one real frame (B8: no longer requires
+/// a fully-filled block, which the governor's own skip could otherwise make
+/// permanently unreachable).
 fn pull_group_inputs(
     group_consumers: &mut [GroupSlot],
     group_scratch: &mut [Vec<f32>],
     mixer: &mut Mixer,
     real_this_tick: &mut [bool],
+    headroom: &[OutputHeadroom],
+    block_out_frames: &[usize],
 ) {
     real_this_tick.fill(false);
     for (i, slot) in group_consumers.iter_mut().enumerate() {
         let scratch = &mut group_scratch[i];
+
+        if !group_may_push(headroom[slot.output_index], block_out_frames[i]) {
+            mixer.push_group(slot.group_id, &[]);
+            continue;
+        }
+
         scratch.fill(0.0);
-        let mut any_full = false;
+        let channels = slot.channels.max(1);
+        let mut filled_max_frames = 0usize;
         for (_, consumer) in slot.pids.iter_mut() {
-            let mut filled = 0;
-            while filled < scratch.len() {
+            let mut filled_samples = 0;
+            while filled_samples < scratch.len() {
                 match consumer.pop() {
                     Ok(sample) => {
-                        scratch[filled] += sample;
-                        filled += 1;
+                        scratch[filled_samples] += sample;
+                        filled_samples += 1;
                     }
                     Err(_) => break,
                 }
             }
-            if filled == scratch.len() {
-                any_full = true;
-            }
+            filled_max_frames = filled_max_frames.max(filled_samples / channels);
         }
-        if any_full {
+        if filled_max_frames > 0 {
             real_this_tick[slot.output_index] = true;
         }
-        mixer.push_group(slot.group_id, scratch);
+        mixer.push_group(slot.group_id, &scratch[..filled_max_frames * channels]);
     }
+}
+
+/// The parameter threshold, extracted at the same point as `RenderFaultCtx`
+/// (operational learnings) — `flush_outputs` would otherwise take 6.
+struct FlushCtx<'a> {
+    ring_fill: &'a [RingGauge],
+    real_this_tick: &'a [bool],
+    ticks_since_real: &'a mut [u32],
+    /// Frames the governor's budget said fit that the ring rejected anyway —
+    /// should stay 0 (cap 3); non-zero means the budget and the ring's real
+    /// capacity disagree.
+    drops: &'a AtomicU64,
 }
 
 fn flush_outputs(
     output_producers: &mut [(OutputId, rtrb::Producer<f32>, usize)],
     output_scratch: &mut [Vec<f32>],
     mixer: &mut Mixer,
-    ring_fill: &[RingGauge],
-    real_this_tick: &[bool],
-    ticks_since_real: &mut [u32],
+    ctx: FlushCtx<'_>,
 ) {
     for (i, (output_id, producer, _)) in output_producers.iter_mut().enumerate() {
         let scratch = &mut output_scratch[i];
         let n = mixer.take_output(*output_id, scratch);
+        let mut dropped = 0u64;
         for &sample in &scratch[..n] {
-            let _ = producer.push(sample); // ring full: drop, best-effort (notes §1)
+            if producer.push(sample).is_err() {
+                dropped += 1; // counted, never silent (cap 3) — the governor should prevent this
+            }
+        }
+        if dropped > 0 {
+            ctx.drops.fetch_add(dropped, Ordering::Relaxed);
         }
         let capacity = producer.buffer().capacity();
         let filled = capacity - producer.slots();
@@ -1455,12 +1753,12 @@ fn flush_outputs(
         } else {
             0
         };
-        ring_fill[i]
+        ctx.ring_fill[i]
             .fill_permille
             .store(permille, Ordering::Relaxed);
 
-        let active = update_activity(real_this_tick[i], &mut ticks_since_real[i]);
-        ring_fill[i].active.store(active, Ordering::Relaxed);
+        let active = update_activity(ctx.real_this_tick[i], &mut ctx.ticks_since_real[i]);
+        ctx.ring_fill[i].active.store(active, Ordering::Relaxed);
     }
 }
 
@@ -1527,6 +1825,7 @@ struct SupervisorSnapshot {
     ring_fill: Arc<Vec<RingGauge>>,
     group_outputs: Vec<(GroupId, OutputId)>,
     output_endpoints: Vec<(OutputId, EndpointId)>,
+    drift_target_fill: f32,
 }
 
 fn push_envelope(persistent: &Persistent, cmd: MixerCommand) {
@@ -1572,9 +1871,13 @@ fn supervisor_loop(
     sys: Arc<dyn AudioSystem>,
     stop: Arc<AtomicBool>,
 ) {
-    let cfg = DriftConfig::default();
+    // `target_fill` is per-build (decision 7 — read from each rebuild's own
+    // `RunningGraph`, below); every other gain/timing stays the shared
+    // default. `default_tick` is used for every sleep regardless, since it
+    // never varies with target_fill.
+    let default_tick = DriftConfig::default().tick;
     let device_events = sys.subscribe_device_events().ok();
-    let mut drift = DriftController::new(&[], cfg);
+    let mut drift = DriftController::new(&[], DriftConfig::default());
     let mut known_outputs: Vec<OutputId> = Vec::new();
     let sleeper = spin_sleep::SpinSleeper::default();
 
@@ -1593,16 +1896,20 @@ fn supervisor_loop(
                 ring_fill: Arc::clone(&rg.ring_fill),
                 group_outputs: rg.group_outputs.clone(),
                 output_endpoints: rg.output_endpoints.clone(),
+                drift_target_fill: rg.drift_target_fill,
             })
         };
         let Some(snap) = snapshot else {
-            sleeper.sleep(cfg.tick);
+            sleeper.sleep(default_tick);
             continue;
         };
 
         // Topology changed since last tick (rebuild happened) — old
-        // integrator state no longer applies to a fresh set of rings.
+        // integrator state no longer applies to a fresh set of rings, and
+        // this build's own `drift_target_fill` (decision 7) replaces
+        // whatever the previous graph's ring capacity/block size implied.
         if snap.output_ids != known_outputs {
+            let cfg = DriftConfig { target_fill: snap.drift_target_fill, ..DriftConfig::default() };
             drift = DriftController::new(&snap.output_ids, cfg);
             known_outputs = snap.output_ids.clone();
         }
@@ -1676,7 +1983,7 @@ fn supervisor_loop(
             handle_device_added(&persistent, &sys, &running, endpoint);
         }
 
-        sleeper.sleep(cfg.tick);
+        sleeper.sleep(default_tick);
     }
 }
 
@@ -2120,8 +2427,11 @@ mod tests {
         fn wait_event(&mut self, _timeout: Duration) -> Result<(), PortError> {
             Err(PortError::Backend("simulated backend failure".into()))
         }
-        fn write(&mut self, _frames: &[f32]) -> Result<(), PortError> {
-            Ok(())
+        fn free_frames(&self) -> Result<usize, PortError> {
+            Ok(usize::MAX)
+        }
+        fn write(&mut self, frames: &[f32]) -> Result<usize, PortError> {
+            Ok(frames.len() / self.format().channels.max(1) as usize)
         }
         fn format(&self) -> Format {
             stereo(48_000)
@@ -2141,8 +2451,60 @@ mod tests {
         let sys = MockSystem::new(vec![]);
         let (producer, _consumer) = RingBuffer::<f32>::new(4);
         let waker = MixerWaker(thread::current());
+        let drops = AtomicU64::new(0);
 
-        pid_capture_loop(Box::new(FailingCapture), producer, &stop, &sys, waker);
+        pid_capture_loop(Box::new(FailingCapture), producer, &stop, &sys, waker, &drops);
+    }
+
+    #[test]
+    fn capture_buf_samples_covers_a_whole_poll_interval() {
+        // B3: the old fixed 256-frame buffer was ~53% of a single ~10ms/48kHz
+        // interval. CAPTURE_BUF_INTERVALS=2 covers a whole interval with
+        // margin: 10ms*2 = 20ms @ 48kHz = 960 frames, stereo -> 1920 samples.
+        let samples = capture_buf_samples(Duration::from_millis(10), 48_000, 2);
+        assert_eq!(samples, 1920);
+    }
+
+    #[test]
+    fn pid_capture_loop_counts_ring_full_drops() {
+        // A source that always has more audio ready than a tiny consumer
+        // ring can hold — every sample that doesn't fit must be counted,
+        // never silently discarded via `let _ = producer.push(..)` (B2/B3).
+        struct BurstCapture {
+            calls: u32,
+        }
+        impl CapturePort for BurstCapture {
+            fn read(&mut self, buf: &mut [f32]) -> Result<usize, PortError> {
+                self.calls += 1;
+                if self.calls > 1 {
+                    return Err(PortError::DeviceInvalidated); // end the loop after one read
+                }
+                buf.fill(0.1);
+                Ok(buf.len())
+            }
+            fn format(&self) -> Format {
+                mono(48_000)
+            }
+            fn poll_interval(&self) -> Duration {
+                Duration::from_millis(1)
+            }
+        }
+        let stop = AtomicBool::new(false);
+        let sys = MockSystem::new(vec![]);
+        let ring_capacity = 10;
+        let (producer, _consumer) = RingBuffer::<f32>::new(ring_capacity);
+        let waker = MixerWaker(thread::current());
+        let drops = AtomicU64::new(0);
+
+        pid_capture_loop(Box::new(BurstCapture { calls: 0 }), producer, &stop, &sys, waker, &drops);
+
+        // buf is capture_buf_samples(1ms, 48000, 1) = 96 samples; only
+        // ring_capacity fit, the rest must show up here, not vanish.
+        let expected_buf_len = capture_buf_samples(Duration::from_millis(1), 48_000, 1);
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            (expected_buf_len - ring_capacity) as u64
+        );
     }
 
     #[test]
@@ -2218,11 +2580,13 @@ mod tests {
     fn render_loop_reports_non_invalidated_faults_as_other() {
         let stop = AtomicBool::new(false);
         let xruns = AtomicU64::new(0);
+        let shortfall = AtomicU64::new(0);
         let (fault_tx, fault_rx) = mpsc::channel();
         let sys = MockSystem::new(vec![]);
         let (_producer, consumer) = RingBuffer::<f32>::new(4);
         let ctx = RenderFaultCtx {
             xruns: &xruns,
+            shortfall: &shortfall,
             output_id: OutputId(0),
             faults: &fault_tx,
         };
@@ -2233,6 +2597,193 @@ mod tests {
         let fault = fault_rx.recv().unwrap();
         assert!(matches!(fault.source, FaultSource::Output(OutputId(0))));
         assert!(matches!(fault.kind, FaultKind::Other));
+    }
+
+    #[test]
+    fn render_loop_pops_only_what_the_device_will_accept() {
+        // B1's core regression: a device offering far less free space than
+        // the ring holds must only ever lose exactly that much from the
+        // ring — never the whole buf-sized pop the old GetBufferSize-based
+        // sizing produced.
+        let format = stereo(48_000);
+        let (sink, device) = crate::ports::mock::SinkRender::paced(format, 4, 4);
+        let ring_frames = 40;
+        let (mut producer, consumer) = RingBuffer::<f32>::new(ring_frames * 2);
+        for _ in 0..ring_frames * 2 {
+            producer.push(0.5).unwrap();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let xruns = AtomicU64::new(0);
+        let shortfall = AtomicU64::new(0);
+        let (fault_tx, _fault_rx) = mpsc::channel();
+        let sys = MockSystem::new(vec![]);
+        let ctx = RenderFaultCtx {
+            xruns: &xruns,
+            shortfall: &shortfall,
+            output_id: OutputId(0),
+            faults: &fault_tx,
+        };
+        let waker = MixerWaker(thread::current());
+
+        let device2 = device.clone();
+        let stop2 = Arc::clone(&stop);
+        let helper = thread::spawn(move || {
+            // `drain` releases a counter, not a one-shot signal, so this is
+            // safe to call before render_loop even reaches its first
+            // wait_event -- no wait needed here.
+            device2.drain(0);
+            // Poll-until-deadline (established idiom in this file, e.g.
+            // `a_pid_whose_capture_thread_dies_mid_stream_is_reaped_and_retried`)
+            // instead of guessing a fixed sleep duration: wait for the real
+            // observable effect of one pop+write landing before signalling
+            // stop, so the test isn't tied to how fast that happens to run.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while device2.filled_frames() == 0 && std::time::Instant::now() < deadline {
+                thread::yield_now();
+            }
+            stop2.store(true, Ordering::Relaxed);
+            device2.drain(0); // release the second (now-blocking) wait_event so it can notice stop
+        });
+
+        render_loop(Box::new(sink), consumer, &stop, &ctx, &sys, waker);
+        helper.join().unwrap();
+
+        assert_eq!(
+            device.filled_frames(),
+            4,
+            "the device must only have accepted one period's worth, not the whole ring"
+        );
+        let remaining = ring_frames * 2 - producer.slots();
+        assert_eq!(
+            remaining, 72,
+            "only the frames the device could accept may leave the ring — the rest must stay, never be discarded (B1)"
+        );
+    }
+
+    #[test]
+    fn render_loop_counts_a_short_write_instead_of_discarding_it() {
+        // cap 3: even though free_frames()-bounded popping makes a short
+        // write structurally impossible in the happy path, a write that
+        // still accepts less than offered (e.g. the device's state changed
+        // between free_frames() and write()) must be counted, never
+        // swallowed into a bare success.
+        struct ShortWriteRender {
+            first_call: bool,
+        }
+        impl RenderPort for ShortWriteRender {
+            fn wait_event(&mut self, _timeout: Duration) -> Result<(), PortError> {
+                if self.first_call {
+                    self.first_call = false;
+                    Ok(())
+                } else {
+                    Err(PortError::DeviceInvalidated)
+                }
+            }
+            fn free_frames(&self) -> Result<usize, PortError> {
+                Ok(8)
+            }
+            fn write(&mut self, frames: &[f32]) -> Result<usize, PortError> {
+                let channels = 2;
+                let offered = frames.len() / channels;
+                Ok(offered / 2) // accepts half of what free_frames() promised
+            }
+            fn format(&self) -> Format {
+                stereo(48_000)
+            }
+            fn period_frames(&self) -> usize {
+                4
+            }
+        }
+        let stop = AtomicBool::new(false);
+        let xruns = AtomicU64::new(0);
+        let shortfall = AtomicU64::new(0);
+        let (fault_tx, _fault_rx) = mpsc::channel();
+        let sys = MockSystem::new(vec![]);
+        let (mut producer, consumer) = RingBuffer::<f32>::new(32);
+        for _ in 0..16 {
+            producer.push(0.1).unwrap(); // 8 frames stereo
+        }
+        let ctx = RenderFaultCtx {
+            xruns: &xruns,
+            shortfall: &shortfall,
+            output_id: OutputId(0),
+            faults: &fault_tx,
+        };
+        let waker = MixerWaker(thread::current());
+
+        render_loop(Box::new(ShortWriteRender { first_call: true }), consumer, &stop, &ctx, &sys, waker);
+
+        assert_eq!(
+            shortfall.load(Ordering::Relaxed),
+            4,
+            "a write accepting less than offered must be counted, never silent"
+        );
+    }
+
+    #[test]
+    fn rings_prime_before_the_first_render_event() {
+        // Flow G. The governor can only withhold production, never create
+        // audio, so a ring that starts empty would otherwise be drained to
+        // zero by every event and silence-padded — a gap roughly every third
+        // event until the drift controller integrates the level up over
+        // seconds. Below the prime target the loop must feed the device
+        // silence and leave the ring untouched.
+        let format = stereo(48_000);
+        let (sink, device) = crate::ports::mock::SinkRender::paced(format, 4, 8);
+        // 20 frames capacity -> a 10-frame prime target at GOVERNOR_THRESHOLD_FILL.
+        let ring_frames = 20;
+        let queued_frames = 6; // real audio, but short of the target
+        let (mut producer, consumer) = RingBuffer::<f32>::new(ring_frames * 2);
+        for _ in 0..queued_frames * 2 {
+            producer.push(0.5).unwrap();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let xruns = AtomicU64::new(0);
+        let shortfall = AtomicU64::new(0);
+        let (fault_tx, _fault_rx) = mpsc::channel();
+        let sys = MockSystem::new(vec![]);
+        let ctx = RenderFaultCtx {
+            xruns: &xruns,
+            shortfall: &shortfall,
+            output_id: OutputId(0),
+            faults: &fault_tx,
+        };
+        let waker = MixerWaker(thread::current());
+
+        let device2 = device.clone();
+        let stop2 = Arc::clone(&stop);
+        let helper = thread::spawn(move || {
+            device2.drain(0); // release the first wait_event
+            // Poll-until-deadline for the real observable effect (the same
+            // idiom as `render_loop_pops_only_what_the_device_will_accept`)
+            // rather than guessing a sleep duration.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while device2.filled_frames() == 0 && std::time::Instant::now() < deadline {
+                thread::yield_now();
+            }
+            stop2.store(true, Ordering::Relaxed);
+            device2.drain(0); // release the now-blocking second wait_event
+        });
+
+        render_loop(Box::new(sink), consumer, &stop, &ctx, &sys, waker);
+        helper.join().unwrap();
+
+        assert_eq!(
+            ring_frames * 2 - producer.slots(),
+            queued_frames * 2,
+            "below the prime target the ring must not be drained at all — the cushion \
+             has to build before the first real pop"
+        );
+        assert!(
+            device.recorded().iter().all(|&s| s == 0.0),
+            "a priming event feeds the device silence, never a partial pop"
+        );
+        assert_eq!(
+            xruns.load(Ordering::Relaxed),
+            0,
+            "priming is a deliberate cushion build, not an underrun — counting it would \
+             destroy the one signal that reports whether the floor holds"
+        );
     }
 
     // --- mixer-demand-driven-wakeup test contracts (context doc L4) ---
@@ -2247,8 +2798,11 @@ mod tests {
             fn wait_event(&mut self, _timeout: Duration) -> Result<(), PortError> {
                 Ok(())
             }
-            fn write(&mut self, _frames: &[f32]) -> Result<(), PortError> {
-                Ok(())
+            fn free_frames(&self) -> Result<usize, PortError> {
+                Ok(usize::MAX)
+            }
+            fn write(&mut self, frames: &[f32]) -> Result<usize, PortError> {
+                Ok(frames.len() / self.format.channels.max(1) as usize)
             }
             fn format(&self) -> Format {
                 self.format
@@ -2292,8 +2846,11 @@ mod tests {
                     Ok(())
                 }
             }
-            fn write(&mut self, _frames: &[f32]) -> Result<(), PortError> {
-                Ok(())
+            fn free_frames(&self) -> Result<usize, PortError> {
+                Ok(usize::MAX)
+            }
+            fn write(&mut self, frames: &[f32]) -> Result<usize, PortError> {
+                Ok(frames.len() / self.format().channels.max(1) as usize)
             }
             fn format(&self) -> Format {
                 stereo(48_000)
@@ -2304,12 +2861,14 @@ mod tests {
         }
         let stop = AtomicBool::new(false);
         let xruns = AtomicU64::new(0);
+        let shortfall = AtomicU64::new(0);
         let (fault_tx, _fault_rx) = mpsc::channel();
         let sys = MockSystem::new(vec![]);
         let (mut producer, consumer) = RingBuffer::<f32>::new(4);
         producer.push(0.25).unwrap();
         let ctx = RenderFaultCtx {
             xruns: &xruns,
+            shortfall: &shortfall,
             output_id: OutputId(0),
             faults: &fault_tx,
         };
@@ -2366,8 +2925,9 @@ mod tests {
             start.elapsed()
         });
         let waker = MixerWaker(parker.thread().clone());
+        let drops = AtomicU64::new(0);
 
-        pid_capture_loop(Box::new(OneShotCapture { called: false }), producer, &stop, &sys, waker);
+        pid_capture_loop(Box::new(OneShotCapture { called: false }), producer, &stop, &sys, waker, &drops);
 
         let elapsed = parker.join().unwrap();
         assert!(
@@ -2454,6 +3014,9 @@ mod tests {
             group_peak: Arc::new(vec![AtomicU64::new(0)]),
             output_peak: Arc::new(vec![AtomicU64::new(0)]),
             capture_rx,
+            group_input_rates: vec![48_000],
+            output_rates: vec![48_000],
+            output_drops: Arc::new(AtomicU64::new(0)),
         };
         let handle = thread::spawn(move || mixer_loop(mixer, group_consumers, output_producers, args));
 
@@ -2539,6 +3102,9 @@ mod tests {
             group_peak: Arc::new(vec![AtomicU64::new(0)]),
             output_peak: Arc::new(vec![AtomicU64::new(0)]),
             capture_rx,
+            group_input_rates: vec![48_000],
+            output_rates: vec![48_000],
+            output_drops: Arc::new(AtomicU64::new(0)),
         };
         let handle = thread::spawn(move || mixer_loop(mixer, group_consumers, output_producers, args));
 
@@ -2582,6 +3148,9 @@ mod tests {
             group_peak: Arc::new(Vec::new()),
             output_peak: Arc::new(Vec::new()),
             capture_rx,
+            group_input_rates: Vec::new(),
+            output_rates: Vec::new(),
+            output_drops: Arc::new(AtomicU64::new(0)),
         };
         let handle = thread::spawn(move || mixer_loop(mixer, group_consumers, output_producers, args));
         let waker = MixerWaker(handle.thread().clone());
@@ -2860,8 +3429,17 @@ mod tests {
             outputs: vec![audio_core::OutputSpec { id: OutputId(0), format: mono(48_000) }],
         };
         let mut mixer = Mixer::new(&topology, 8).unwrap();
+        let headroom = vec![OutputHeadroom { filled_frames: 0, capacity_frames: 1000 }];
+        let block_out_frames = vec![2];
 
-        pull_group_inputs(&mut consumers, &mut scratch, &mut mixer, &mut real_this_tick);
+        pull_group_inputs(
+            &mut consumers,
+            &mut scratch,
+            &mut mixer,
+            &mut real_this_tick,
+            &headroom,
+            &block_out_frames,
+        );
 
         assert!(real_this_tick[0], "both pids fully filled this tick");
         // The two pids' contributions are summed sample-by-sample before
@@ -2891,11 +3469,376 @@ mod tests {
             outputs: vec![audio_core::OutputSpec { id: OutputId(0), format: mono(48_000) }],
         };
         let mut mixer = Mixer::new(&topology, 8).unwrap();
+        let headroom = vec![OutputHeadroom { filled_frames: 0, capacity_frames: 1000 }];
+        let block_out_frames = vec![4];
 
-        pull_group_inputs(&mut consumers, &mut scratch, &mut mixer, &mut real_this_tick);
+        pull_group_inputs(
+            &mut consumers,
+            &mut scratch,
+            &mut mixer,
+            &mut real_this_tick,
+            &headroom,
+            &block_out_frames,
+        );
 
         assert!(!real_this_tick[0], "no pids -> not active");
+        // Scratch itself is zeroed either way — what makes this B4's boundary
+        // case is that `filled_max` is 0, so `push_group` receives a genuinely
+        // empty slice rather than the whole zero-padded buffer. The slice
+        // length is asserted directly (via its downstream effect on the SRC)
+        // by `pull_group_inputs_pushes_only_the_frames_it_popped`.
         assert_eq!(scratch[0], vec![0.0; 4]);
+    }
+
+    /// One mono group on one output, `block`-frame blocks — the shape both
+    /// B4 tests below need. Kept local to them so neither has to carry a
+    /// 20-line inline `Topology` the assertions don't depend on.
+    fn one_mono_group_topology() -> Topology {
+        Topology {
+            master: audio_core::Gain::UNITY,
+            groups: vec![audio_core::GroupSpec {
+                id: GroupId(0),
+                gain: audio_core::Gain::UNITY,
+                follow_master: false,
+                output: OutputId(0),
+                input_format: mono(48_000),
+                dsp: Vec::new(),
+                duck: None,
+                spatial: false,
+                mute: false,
+            }],
+            outputs: vec![audio_core::OutputSpec { id: OutputId(0), format: mono(48_000) }],
+        }
+    }
+
+    /// `block` is a realistic `max_block_frames`, not a token 8: `Src` wraps a
+    /// 256-tap sinc (`resample.rs`'s `SINC_LEN`), so at a block of 8 the
+    /// resampler spends dozens of chunks filling its delay line and emits
+    /// nothing — which would make both B4 tests below pass vacuously.
+    const B4_BLOCK: usize = 512;
+
+    /// Pulls one tick through `pull_group_inputs` -> `mix_tick` ->
+    /// `take_output` with the governor deliberately wide open (this is a test
+    /// about slice lengths, not about the skip decision), and returns the
+    /// samples that reached the output.
+    fn b4_tick(
+        mixer: &mut Mixer,
+        consumers: &mut [GroupSlot],
+        scratch: &mut [Vec<f32>],
+        out_buf: &mut [f32],
+    ) -> usize {
+        let headroom = [OutputHeadroom { filled_frames: 0, capacity_frames: usize::MAX / 2 }];
+        let block_out_frames = [B4_BLOCK];
+        let mut real_this_tick = [false];
+        pull_group_inputs(consumers, scratch, mixer, &mut real_this_tick, &headroom, &block_out_frames);
+        mixer.mix_tick();
+        mixer.take_output(OutputId(0), out_buf)
+    }
+
+    #[test]
+    fn pull_group_inputs_pushes_only_the_frames_it_popped() {
+        // B4. `push_group`'s slice length isn't observable directly
+        // (`valid_len` is private), so this asserts it through the one thing
+        // that depends on it: `Src` consumes a FIXED `chunk_in` ==
+        // max_block_frames, buffering anything short of that until a later
+        // call completes the chunk. Feed half a block and a correct
+        // implementation must produce NOTHING that tick; the pre-fix code,
+        // which pushed the whole zero-padded scratch, handed over a full chunk
+        // and emitted immediately.
+        let half = B4_BLOCK / 2;
+        let (mut pid_producer, pid_consumer) = RingBuffer::<f32>::new(B4_BLOCK * 4);
+        let mut consumers = vec![slot(GroupId(0), 1, 0)];
+        consumers[0].pids.push((1, pid_consumer));
+        let mut scratch = vec![vec![0.0f32; B4_BLOCK]];
+        let mut mixer = Mixer::new(&one_mono_group_topology(), B4_BLOCK).unwrap();
+        let mut out_buf = vec![0.0f32; B4_BLOCK * 2];
+
+        // Warm the sinc delay line first, with whole blocks, so the partial
+        // assertions below are about the slice length and not about resampler
+        // start-up. A whole block exactly fills `chunk_in`, so this leaves no
+        // partial input buffered.
+        let mut warmed = false;
+        for _ in 0..8 {
+            for _ in 0..B4_BLOCK {
+                pid_producer.push(0.5).unwrap();
+            }
+            if b4_tick(&mut mixer, &mut consumers, &mut scratch, &mut out_buf) > 0 {
+                warmed = true;
+                break;
+            }
+        }
+        assert!(warmed, "resampler never produced output on whole blocks — test setup is wrong");
+
+        for _ in 0..half {
+            pid_producer.push(0.5).unwrap();
+        }
+        assert_eq!(
+            b4_tick(&mut mixer, &mut consumers, &mut scratch, &mut out_buf),
+            0,
+            "half a block of real audio must be handed over as half a block — the SRC \
+             then buffers it, producing nothing. Non-zero here means the unfilled tail \
+             was zero-padded into the stream (B4)."
+        );
+
+        for _ in 0..half {
+            pid_producer.push(0.5).unwrap();
+        }
+        assert!(
+            b4_tick(&mut mixer, &mut consumers, &mut scratch, &mut out_buf) > 0,
+            "the two half-blocks must accumulate into one full chunk and emit, proving \
+             the first half was pushed rather than discarded"
+        );
+    }
+
+    #[test]
+    fn a_partially_filled_group_never_zero_pads_the_stream() {
+        // B4's "never fabricate frames to fill a gap", as conservation: feed
+        // only ever half a block per tick, and no more frames may come out
+        // than went in. The pre-fix code pushed a full zero-padded block every
+        // tick, which would roughly DOUBLE the output frame count here.
+        let ticks = 40;
+        let per_tick = B4_BLOCK / 2;
+        let (mut pid_producer, pid_consumer) = RingBuffer::<f32>::new(B4_BLOCK * 4);
+        let mut consumers = vec![slot(GroupId(0), 1, 0)];
+        consumers[0].pids.push((1, pid_consumer));
+        let mut scratch = vec![vec![0.0f32; B4_BLOCK]];
+        let mut mixer = Mixer::new(&one_mono_group_topology(), B4_BLOCK).unwrap();
+        let mut out_buf = vec![0.0f32; B4_BLOCK * 2];
+
+        let mut total_out = 0usize;
+        for _ in 0..ticks {
+            for _ in 0..per_tick {
+                pid_producer.push(0.5).unwrap();
+            }
+            total_out += b4_tick(&mut mixer, &mut consumers, &mut scratch, &mut out_buf);
+        }
+
+        let total_in = ticks * per_tick;
+        assert!(
+            total_out <= total_in,
+            "no frame may leave the mixer that didn't enter it — {total_out} out vs \
+             {total_in} in means the unfilled block tail was fabricated (B4)"
+        );
+        // Lower bound so this can't pass by producing nothing at all. Loose on
+        // purpose: the shortfall is the sinc delay line's start-up plus one
+        // in-flight chunk, not loss. The decisive assertion is the upper bound.
+        assert!(
+            total_out > total_in / 2,
+            "expected the real audio to actually flow through, got {total_out} of {total_in}"
+        );
+    }
+
+    #[test]
+    fn ring_gauge_active_is_true_when_a_group_received_real_audio() {
+        // B8: the old code required a FULLY-filled block to mark activity —
+        // under the governor (and ordinary capture jitter) that can become
+        // permanently unreachable. A partial pop must still count.
+        let (mut p1, c1) = RingBuffer::<f32>::new(16);
+        p1.push(0.5).unwrap(); // far short of a full 8-frame block
+        let mut consumers = vec![slot(GroupId(0), 1, 0)];
+        consumers[0].pids.push((1, c1));
+        let mut scratch = vec![vec![0.0f32; 8]];
+        let mut real_this_tick = vec![false];
+        let topology = Topology {
+            master: audio_core::Gain::UNITY,
+            groups: vec![audio_core::GroupSpec {
+                id: GroupId(0),
+                gain: audio_core::Gain::UNITY,
+                follow_master: false,
+                output: OutputId(0),
+                input_format: mono(48_000),
+                dsp: Vec::new(),
+                duck: None,
+                spatial: false,
+                mute: false,
+            }],
+            outputs: vec![audio_core::OutputSpec { id: OutputId(0), format: mono(48_000) }],
+        };
+        let mut mixer = Mixer::new(&topology, 8).unwrap();
+        let headroom = vec![OutputHeadroom { filled_frames: 0, capacity_frames: 1000 }];
+        let block_out_frames = vec![8];
+
+        pull_group_inputs(
+            &mut consumers,
+            &mut scratch,
+            &mut mixer,
+            &mut real_this_tick,
+            &headroom,
+            &block_out_frames,
+        );
+
+        assert!(real_this_tick[0], "a partial pop is still real audio (B8) — must not require a full block");
+    }
+
+    #[test]
+    fn group_may_push_skips_when_its_output_ring_is_at_threshold() {
+        let below = OutputHeadroom { filled_frames: 100, capacity_frames: 1000 }; // 10%
+        let at = OutputHeadroom { filled_frames: 500, capacity_frames: 1000 }; // exactly 50%
+        assert!(group_may_push(below, 50));
+        assert!(
+            !group_may_push(at, 50),
+            "a ring already at the governor threshold must not receive another block"
+        );
+    }
+
+    #[test]
+    fn a_stalled_output_does_not_starve_a_healthy_one() {
+        // Level 3 finding: `mix_tick` sums each group into its OWN output's
+        // accumulator, so budgets are per-group/per-output — one stalled
+        // output must never block a healthy one from being pulled.
+        let (mut p0, c0) = RingBuffer::<f32>::new(16);
+        let (mut p1, c1) = RingBuffer::<f32>::new(16);
+        for _ in 0..8 {
+            p0.push(0.3).unwrap();
+            p1.push(0.4).unwrap();
+        }
+        let mut consumers = vec![slot(GroupId(0), 1, 0), slot(GroupId(1), 1, 1)];
+        consumers[0].pids.push((100, c0));
+        consumers[1].pids.push((200, c1));
+        let mut scratch = vec![vec![0.0f32; 8], vec![0.0f32; 8]];
+        let mut real_this_tick = vec![false, false];
+
+        let topology = Topology {
+            master: audio_core::Gain::UNITY,
+            groups: vec![
+                audio_core::GroupSpec {
+                    id: GroupId(0),
+                    gain: audio_core::Gain::UNITY,
+                    follow_master: false,
+                    output: OutputId(0),
+                    input_format: mono(48_000),
+                    dsp: Vec::new(),
+                    duck: None,
+                    spatial: false,
+                    mute: false,
+                },
+                audio_core::GroupSpec {
+                    id: GroupId(1),
+                    gain: audio_core::Gain::UNITY,
+                    follow_master: false,
+                    output: OutputId(1),
+                    input_format: mono(48_000),
+                    dsp: Vec::new(),
+                    duck: None,
+                    spatial: false,
+                    mute: false,
+                },
+            ],
+            outputs: vec![
+                audio_core::OutputSpec { id: OutputId(0), format: mono(48_000) },
+                audio_core::OutputSpec { id: OutputId(1), format: mono(48_000) },
+            ],
+        };
+        let mut mixer = Mixer::new(&topology, 8).unwrap();
+
+        // Output 0 is stalled (at the governor threshold); output 1 is empty.
+        let headroom = vec![
+            OutputHeadroom { filled_frames: 500, capacity_frames: 1000 },
+            OutputHeadroom { filled_frames: 0, capacity_frames: 1000 },
+        ];
+        let block_out_frames = vec![8, 8];
+
+        pull_group_inputs(
+            &mut consumers,
+            &mut scratch,
+            &mut mixer,
+            &mut real_this_tick,
+            &headroom,
+            &block_out_frames,
+        );
+
+        assert!(!real_this_tick[0], "stalled output's group must be skipped");
+        assert!(real_this_tick[1], "a stalled output must not prevent a healthy one from being pulled");
+    }
+
+    #[test]
+    fn extra_wakes_do_not_over_produce() {
+        // B2's core regression: many ticks in a row (simulating repeated
+        // spurious wakes with nothing draining the output) must never push
+        // more into an output ring than it can hold, and must never do so
+        // by silently dropping the excess — the governor stops pulling from
+        // the group once the output is saturated, leaving the remainder
+        // queued for a later tick instead.
+        let block = 8usize; // max_block_frames
+        // Far more queued than 20 ticks could drain once the governor locks
+        // the output out after its very first real push (capacity below).
+        let (mut in_p, in_c) = RingBuffer::<f32>::new(block * 30);
+        for _ in 0..block * 30 {
+            in_p.push(0.25).unwrap();
+        }
+        let mut consumers = vec![slot(GroupId(0), 1, 0)];
+        consumers[0].pids.push((1, in_c));
+        let mut group_scratch = vec![vec![0.0f32; block]];
+        let mut real_this_tick = vec![false];
+
+        let topology = Topology {
+            master: audio_core::Gain::UNITY,
+            groups: vec![audio_core::GroupSpec {
+                id: GroupId(0),
+                gain: audio_core::Gain::UNITY,
+                follow_master: false,
+                output: OutputId(0),
+                input_format: mono(48_000),
+                dsp: Vec::new(),
+                duck: None,
+                spatial: false,
+                mute: false,
+            }],
+            outputs: vec![audio_core::OutputSpec { id: OutputId(0), format: mono(48_000) }],
+        };
+        let mut mixer = Mixer::new(&topology, block).unwrap();
+
+        // Small on purpose: the safety net (filled + block_out_frames <=
+        // capacity) locks the output out after its very first non-empty
+        // push, regardless of exactly how many frames the SRC's warm-up
+        // produces — this is what makes the "leftover stays queued"
+        // assertion deterministic rather than timing-dependent.
+        let (out_p, _out_c) = RingBuffer::<f32>::new(8); // never drained by this test
+        let mut output_producers = vec![(OutputId(0), out_p, 1usize)];
+        let mut output_scratch = vec![vec![0.0f32; block]];
+        let ring_fill = vec![RingGauge {
+            fill_permille: AtomicU32::new(0),
+            active: AtomicBool::new(false),
+            applied_ratio_bits: AtomicU64::new(1.0f64.to_bits()),
+        }];
+        let mut ticks_since_real = vec![ACTIVE_HOLD_TICKS];
+        let drops = AtomicU64::new(0);
+        let mut headroom = vec![OutputHeadroom { filled_frames: 0, capacity_frames: 0 }];
+        let block_out_frames = vec![block];
+
+        for _ in 0..20 {
+            sample_output_headroom(&output_producers, &mut headroom);
+            pull_group_inputs(
+                &mut consumers,
+                &mut group_scratch,
+                &mut mixer,
+                &mut real_this_tick,
+                &headroom,
+                &block_out_frames,
+            );
+            mixer.mix_tick();
+            flush_outputs(
+                &mut output_producers,
+                &mut output_scratch,
+                &mut mixer,
+                FlushCtx {
+                    ring_fill: &ring_fill,
+                    real_this_tick: &real_this_tick,
+                    ticks_since_real: &mut ticks_since_real,
+                    drops: &drops,
+                },
+            );
+        }
+
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            0,
+            "the governor must stop pulling before the ring overflows, never drop silently"
+        );
+        assert!(
+            consumers[0].pids[0].1.slots() > 0,
+            "once the output ring is saturated, leftover audio must stay queued in the pid ring, not be pulled and dropped"
+        );
     }
 
     #[test]

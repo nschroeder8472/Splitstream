@@ -158,7 +158,22 @@ pub trait CapturePort: Send {
 /// Event-driven shared mode — the render side is the pull clock (spec §7.1).
 pub trait RenderPort: Send {
     fn wait_event(&mut self, timeout: Duration) -> Result<(), PortError>;
-    fn write(&mut self, frames: &[f32]) -> Result<(), PortError>;
+
+    /// Frames this device will accept *right now* — its buffer capacity minus
+    /// current padding (audio-flow-control B1). No default body: a default
+    /// that claims space is available is indistinguishable from an infinite
+    /// device, which is exactly the condition this method exists to make
+    /// observable. Every implementor, mocks included, must answer honestly.
+    fn free_frames(&self) -> Result<usize, PortError>;
+
+    /// Returns frames actually accepted. A caller offering more than the last
+    /// `free_frames()` reported is a caller bug; any shortfall must be
+    /// reported by the caller, never swallowed into a bare `Ok(())` (B1).
+    fn write(&mut self, frames: &[f32]) -> Result<usize, PortError>;
+
     fn format(&self) -> Format;
+
+    /// The device *period* — the audio one `wait_event` wakeup corresponds
+    /// to. NOT the total buffer size (B1: those used to be conflated).
     fn period_frames(&self) -> usize;
 }

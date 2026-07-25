@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::f32::consts::TAU;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use audio_core::Format;
 
@@ -229,12 +229,22 @@ impl CapturePort for DyingCapture {
     }
 }
 
+/// Test-side state for a `SineCapture::paced` source (audio-flow-control
+/// B17) — frames a `read` may yield are only ever what `CaptureSource::produce`
+/// has made available, never the caller's whole buffer unconditionally.
+struct CaptureState {
+    produced_frames: Mutex<usize>,
+}
+
 /// Deterministic signal source: a sine wave at `freq_hz`, same value on every
 /// channel. Lets tests assert on exact expected samples instead of "some audio".
+/// Two modes, same "new() stays unpaced, paced() purely additive" shape as
+/// `SinkRender` (decision 5).
 pub struct SineCapture {
     format: Format,
     freq_hz: f32,
     phase: f32,
+    paced: Option<Arc<CaptureState>>,
 }
 
 impl SineCapture {
@@ -243,20 +253,47 @@ impl SineCapture {
             format,
             freq_hz,
             phase: 0.0,
+            paced: None,
         }
+    }
+
+    /// A source that yields at most what `CaptureSource::produce` has made
+    /// available, then 0 — never `buf.len()` unconditionally.
+    pub fn paced(freq_hz: f32, format: Format) -> (SineCapture, CaptureSource) {
+        let state = Arc::new(CaptureState {
+            produced_frames: Mutex::new(0),
+        });
+        let port = SineCapture {
+            format,
+            freq_hz,
+            phase: 0.0,
+            paced: Some(Arc::clone(&state)),
+        };
+        (port, CaptureSource(state))
     }
 }
 
 impl CapturePort for SineCapture {
     fn read(&mut self, buf: &mut [f32]) -> Result<usize, PortError> {
-        let channels = self.format.channels as usize;
+        let channels = self.format.channels.max(1) as usize;
+        let want_frames = buf.len() / channels;
+        let frames = match &self.paced {
+            Some(state) => {
+                let mut produced = state.produced_frames.lock().unwrap();
+                let take = want_frames.min(*produced);
+                *produced -= take;
+                take
+            }
+            None => want_frames, // unpaced: fills whatever it's given (decision 5)
+        };
+
         let step = TAU * self.freq_hz / self.format.sample_rate as f32;
-        for frame in buf.chunks_exact_mut(channels.max(1)) {
+        for frame in buf[..frames * channels].chunks_exact_mut(channels) {
             let sample = self.phase.sin();
             frame.fill(sample);
             self.phase = (self.phase + step) % TAU;
         }
-        Ok(buf.len())
+        Ok(frames * channels)
     }
 
     fn format(&self) -> Format {
@@ -268,13 +305,46 @@ impl CapturePort for SineCapture {
     }
 }
 
+/// Test-side handle to a paced `SineCapture` (audio-flow-control B17).
+/// `Arc`-backed and `Clone`, same idiom as `SinkDevice`/`MockSessionPort`.
+#[derive(Clone)]
+pub struct CaptureSource(Arc<CaptureState>);
+
+impl CaptureSource {
+    /// Makes `frames` more frames available to the next `read` call(s).
+    pub fn produce(&self, frames: usize) {
+        *self.0.produced_frames.lock().unwrap() += frames;
+    }
+}
+
+/// Test-side state for a `SinkRender::paced` device — the render sink's own
+/// simulated clock. `filled_frames` is freed only by `SinkDevice::drain`,
+/// which is also what releases exactly one pending `wait_event` (audio-flow-
+/// control B17): nothing about the port advances without the test driving it.
+struct SinkState {
+    capacity_frames: usize,
+    period_frames: usize,
+    filled_frames: Mutex<usize>,
+    /// Un-consumed `wait_event` releases — `drain` increments, `wait_event`
+    /// decrements. A plain counter/condvar pair, not a channel: `wait_event`
+    /// needs a bounded timeout wait, which `mpsc::Receiver::recv_timeout`
+    /// would also give, but the counter lets `drain` be called any number of
+    /// times before a `wait_event` call ever arrives without growing unbounded.
+    releases: Mutex<u64>,
+    cond: Condvar,
+    recorded: Mutex<Vec<f32>>,
+}
+
 /// Records every frame written to it, for test assertions (gain applied?
-/// groups summed correctly?). Never blocks `wait_event`; errors only if
-/// `invalidated` is set (via `MockSystem::invalidate_render`).
+/// groups summed correctly?). Two modes (decision 5, audio-flow-control):
+/// `new()` stays the original infinite/immediate sink — zero churn across
+/// existing tests that assert on recorded *content*, not flow — `paced()` is
+/// purely additive, for tests asserting on flow control itself.
 pub struct SinkRender {
     format: Format,
     recorded: Vec<f32>,
     invalidated: Option<Arc<AtomicBool>>,
+    paced: Option<Arc<SinkState>>,
 }
 
 impl SinkRender {
@@ -283,6 +353,7 @@ impl SinkRender {
             format,
             recorded: Vec::new(),
             invalidated: None,
+            paced: None,
         }
     }
 
@@ -291,16 +362,43 @@ impl SinkRender {
             format,
             recorded: Vec::new(),
             invalidated: Some(flag),
+            paced: None,
         }
     }
 
+    /// A finite device: `capacity_frames` of buffer, `period_frames` per
+    /// event. Returns the port (moved into the spawned `render_loop` thread)
+    /// and a cloneable test-side handle to the same underlying state — the
+    /// device clock.
+    pub fn paced(format: Format, period_frames: usize, capacity_frames: usize) -> (SinkRender, SinkDevice) {
+        let state = Arc::new(SinkState {
+            capacity_frames,
+            period_frames,
+            filled_frames: Mutex::new(0),
+            releases: Mutex::new(0),
+            cond: Condvar::new(),
+            recorded: Mutex::new(Vec::new()),
+        });
+        let port = SinkRender {
+            format,
+            recorded: Vec::new(),
+            invalidated: None,
+            paced: Some(Arc::clone(&state)),
+        };
+        (port, SinkDevice(state))
+    }
+
+    /// Unpaced-mode-only accessor — every frame written, in order. Existing
+    /// 118-test idiom kept exactly as-is (decision 5); a paced port's content
+    /// is read via `SinkDevice::recorded` instead, since the port itself has
+    /// moved into a thread by the time a test wants to inspect it.
     pub fn recorded(&self) -> &[f32] {
         &self.recorded
     }
 }
 
 impl RenderPort for SinkRender {
-    fn wait_event(&mut self, _timeout: Duration) -> Result<(), PortError> {
+    fn wait_event(&mut self, timeout: Duration) -> Result<(), PortError> {
         if let Some(flag) = &self.invalidated {
             // One-shot: consume the flag so this port doesn't fault forever
             // (real WASAPI invalidation is a single terminal event too).
@@ -308,12 +406,55 @@ impl RenderPort for SinkRender {
                 return Err(PortError::DeviceInvalidated);
             }
         }
+        let Some(state) = &self.paced else {
+            return Ok(()); // unpaced: never blocks (decision 5)
+        };
+        let deadline = Instant::now() + timeout;
+        let mut releases = state.releases.lock().unwrap();
+        while *releases == 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(PortError::Backend("paced sink wait_event timed out".into()));
+            }
+            let (guard, _timed_out) = state.cond.wait_timeout(releases, deadline - now).unwrap();
+            releases = guard;
+        }
+        *releases -= 1;
         Ok(())
     }
 
-    fn write(&mut self, frames: &[f32]) -> Result<(), PortError> {
-        self.recorded.extend_from_slice(frames);
-        Ok(())
+    fn free_frames(&self) -> Result<usize, PortError> {
+        match &self.paced {
+            Some(state) => {
+                let filled = *state.filled_frames.lock().unwrap();
+                Ok(state.capacity_frames.saturating_sub(filled))
+            }
+            // Unpaced: models an infinite device (decision 5) — never the
+            // cause of a caller's short write.
+            None => Ok(usize::MAX),
+        }
+    }
+
+    fn write(&mut self, frames: &[f32]) -> Result<usize, PortError> {
+        let channels = self.format.channels.max(1) as usize;
+        let offered = frames.len() / channels;
+        let Some(state) = &self.paced else {
+            self.recorded.extend_from_slice(frames);
+            return Ok(offered); // unpaced: accepts everything (decision 5)
+        };
+        let mut filled = state.filled_frames.lock().unwrap();
+        let free = state.capacity_frames.saturating_sub(*filled);
+        let accepted = offered.min(free);
+        *filled += accepted;
+        drop(filled);
+        if accepted > 0 {
+            state
+                .recorded
+                .lock()
+                .unwrap()
+                .extend_from_slice(&frames[..accepted * channels]);
+        }
+        Ok(accepted)
     }
 
     fn format(&self) -> Format {
@@ -321,7 +462,44 @@ impl RenderPort for SinkRender {
     }
 
     fn period_frames(&self) -> usize {
-        480
+        match &self.paced {
+            Some(state) => state.period_frames,
+            None => 480,
+        }
+    }
+}
+
+/// Test-side handle to a paced `SinkRender` — the device clock (audio-flow-
+/// control B17). `Arc`-backed and `Clone`, same idiom as `MockSessionPort`:
+/// the port itself moves into the spawned `render_loop` thread, so a test
+/// keeps this cloned handle to drive it afterward.
+#[derive(Clone)]
+pub struct SinkDevice(Arc<SinkState>);
+
+impl SinkDevice {
+    /// Consumes up to `frames` from the simulated device buffer and releases
+    /// exactly one `wait_event`. Nothing advances without this call. Returns
+    /// frames actually freed (may be less than requested if the buffer holds
+    /// less).
+    pub fn drain(&self, frames: usize) -> usize {
+        let mut filled = self.0.filled_frames.lock().unwrap();
+        let n = frames.min(*filled);
+        *filled -= n;
+        drop(filled);
+        *self.0.releases.lock().unwrap() += 1;
+        self.0.cond.notify_all();
+        n
+    }
+
+    pub fn filled_frames(&self) -> usize {
+        *self.0.filled_frames.lock().unwrap()
+    }
+
+    /// Everything `write` has accepted so far — the paced equivalent of
+    /// `SinkRender::recorded`, reachable after the port has moved into a
+    /// thread.
+    pub fn recorded(&self) -> Vec<f32> {
+        self.0.recorded.lock().unwrap().clone()
     }
 }
 
@@ -631,4 +809,63 @@ mod tests {
         sessions.emit_event(SessionEvent::Ended(1)); // no subscriber yet — must not panic
     }
 
+    // -- audio-flow-control B17: paced mocks -------------------------------
+
+    #[test]
+    fn paced_sink_rejects_more_than_its_free_space() {
+        let (mut sink, device) = SinkRender::paced(stereo(48_000), 480, 960);
+        let block = vec![0.0f32; 480 * 2]; // 480 frames, well under capacity
+        assert_eq!(sink.write(&block).unwrap(), 480);
+        assert_eq!(device.filled_frames(), 480);
+
+        // Offer another 480 (would be 960, exactly capacity) then a third
+        // that must be rejected outright: only 0 free frames remain.
+        assert_eq!(sink.write(&block).unwrap(), 480);
+        assert_eq!(device.filled_frames(), 960);
+        assert_eq!(
+            sink.write(&block).unwrap(),
+            0,
+            "a full device must accept nothing, never silently drop the excess (B1)"
+        );
+        assert_eq!(device.filled_frames(), 960);
+    }
+
+    #[test]
+    fn paced_sink_wait_event_blocks_until_drained() {
+        let (mut sink, device) = SinkRender::paced(stereo(48_000), 480, 1920);
+        let (done_tx, done_rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let result = sink.wait_event(Duration::from_secs(5));
+            done_tx.send(result.is_ok()).unwrap();
+        });
+
+        // Nothing has drained yet — the wait must still be pending.
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "wait_event returned before any drain() released it"
+        );
+
+        device.drain(480);
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "wait_event must unblock once drain() releases it"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn sine_capture_yields_no_more_than_produced() {
+        let (mut capture, source) = SineCapture::paced(440.0, stereo(48_000));
+        let mut buf = [0.0f32; 20 * 2]; // room for 20 frames
+
+        assert_eq!(capture.read(&mut buf).unwrap(), 0, "nothing produced yet");
+
+        source.produce(8);
+        assert_eq!(
+            capture.read(&mut buf).unwrap(),
+            8 * 2,
+            "must yield exactly what was produced, not the whole buffer"
+        );
+        assert_eq!(capture.read(&mut buf).unwrap(), 0, "produced frames are consumed, not reusable");
+    }
 }

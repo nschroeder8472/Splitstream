@@ -24,7 +24,18 @@ pub struct WasapiRender {
     render_client: IAudioRenderClient,
     event: HANDLE,
     format: Format,
+    /// `GetBufferSize()` -- retained only as `free_frames`'s capacity basis
+    /// (audio-flow-control B1); no longer reported as `period_frames()`.
     buffer_frames: u32,
+    /// `GetDevicePeriod()`'s default period, in frames at `format.sample_rate`
+    /// -- what one `wait_event` wakeup actually corresponds to (B1).
+    period_frames: u32,
+}
+
+/// Converts a 100ns reference-time period (as `GetDevicePeriod` reports) to
+/// frames at `sample_rate`. Pure, so this is testable without a device.
+fn device_period_frames(period_100ns: i64, sample_rate: u32) -> u32 {
+    ((period_100ns.max(0) as f64 / 10_000_000.0) * sample_rate as f64).round() as u32
 }
 
 // SAFETY: see the identical note on `WasapiCapture` — MTA-only usage makes
@@ -70,6 +81,12 @@ pub fn open(id: &EndpointId) -> Result<WasapiRender, PortError> {
             .GetBufferSize()
             .map_err(|e| PortError::Backend(e.to_string()))?;
 
+        let mut default_period_100ns: i64 = 0;
+        client
+            .GetDevicePeriod(Some(&mut default_period_100ns), None)
+            .map_err(|e| PortError::Backend(e.to_string()))?;
+        let period_frames = device_period_frames(default_period_100ns, format.sample_rate);
+
         client
             .Start()
             .map_err(|e| PortError::Backend(e.to_string()))?;
@@ -80,6 +97,7 @@ pub fn open(id: &EndpointId) -> Result<WasapiRender, PortError> {
             event,
             format,
             buffer_frames,
+            period_frames,
         })
     }
 }
@@ -97,16 +115,21 @@ impl RenderPort for WasapiRender {
         }
     }
 
-    fn write(&mut self, frames: &[f32]) -> Result<(), PortError> {
+    fn free_frames(&self) -> Result<usize, PortError> {
+        let padding = unsafe { self.client.GetCurrentPadding().map_err(map_invalidated)? };
+        Ok(self.buffer_frames.saturating_sub(padding) as usize)
+    }
+
+    fn write(&mut self, frames: &[f32]) -> Result<usize, PortError> {
         let channels = self.format.channels.max(1) as usize;
         let frame_count = (frames.len() / channels) as u32;
 
-        unsafe {
+        let to_write = unsafe {
             let padding = self.client.GetCurrentPadding().map_err(map_invalidated)?;
             let free = self.buffer_frames.saturating_sub(padding);
             let to_write = frame_count.min(free);
             if to_write == 0 {
-                return Ok(());
+                return Ok(0);
             }
 
             let dst_ptr = self
@@ -120,8 +143,9 @@ impl RenderPort for WasapiRender {
             self.render_client
                 .ReleaseBuffer(to_write, 0) // flags=0: we filled real data, not silence
                 .map_err(map_invalidated)?;
-        }
-        Ok(())
+            to_write
+        };
+        Ok(to_write as usize)
     }
 
     fn format(&self) -> Format {
@@ -129,7 +153,7 @@ impl RenderPort for WasapiRender {
     }
 
     fn period_frames(&self) -> usize {
-        self.buffer_frames as usize
+        self.period_frames as usize
     }
 }
 
@@ -146,5 +170,46 @@ fn map_invalidated(e: windows::core::Error) -> PortError {
         PortError::DeviceInvalidated
     } else {
         PortError::Backend(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_period_frames_converts_reference_time_at_the_device_rate() {
+        // 10ms @ 48kHz = 480 frames; 100ns units, so 10ms = 100_000.
+        assert_eq!(device_period_frames(100_000, 48_000), 480);
+        // 20.83ms @ 48kHz (a real device's commonly-reported default period)
+        // rounds to 1000 frames, not truncates to 999.
+        assert_eq!(device_period_frames(208_333, 48_000), 1000);
+    }
+
+    /// Talks to real WASAPI on whatever machine runs it — not part of the
+    /// normal suite (no audio hardware guarantee in CI). Confirms B1's actual
+    /// defect: the device *period* (`GetDevicePeriod`) is smaller than the
+    /// full shared-mode buffer (`GetBufferSize`), so a caller sizing its
+    /// per-event buffer from `period_frames()` must not get the buffer size
+    /// back. Run explicitly:
+    /// `cargo test -p win-audio -- --ignored wasapi_render_period_frames_is_the_device_period_not_the_buffer_size`.
+    #[test]
+    #[ignore]
+    fn wasapi_render_period_frames_is_the_device_period_not_the_buffer_size() {
+        let endpoints = crate::enumerator::EndpointEnumerator::new()
+            .enumerate()
+            .expect("enumerate should succeed on a machine with any render device");
+        let endpoint = endpoints.first().expect("expected at least one render endpoint");
+        let render = open(&endpoint.id).expect("open should succeed for a real render endpoint");
+        println!(
+            "period_frames={} buffer_frames={} format={:?}",
+            render.period_frames, render.buffer_frames, render.format
+        );
+        assert!(
+            render.period_frames <= render.buffer_frames,
+            "device period must not exceed the shared-mode buffer size, got period={} buffer={}",
+            render.period_frames,
+            render.buffer_frames
+        );
     }
 }
