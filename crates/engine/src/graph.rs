@@ -77,6 +77,13 @@ pub struct GroupConfig {
     /// `audio_core::GroupSpec.mute`. No `solo` counterpart: solo is
     /// session-only, never sourced from config.
     pub muted: bool,
+    /// Per-group hotkeys (external-controls.md decision 8) — live on the
+    /// group's own table, not `[hotkeys]`, so deleting the group deletes its
+    /// bindings. Config-file-only (no editing UI), same as every other
+    /// hotkey chord.
+    pub hotkey_mute: Option<HotkeyChord>,
+    pub hotkey_volume_up: Option<HotkeyChord>,
+    pub hotkey_volume_down: Option<HotkeyChord>,
 }
 
 /// Pairs a stage's construction spec with its persisted bypass state.
@@ -115,11 +122,20 @@ pub struct AppConfig {
     /// Restart returns to the same profile; `None` means no profile is
     /// active (also the state after the active one is deleted, L3 flow H).
     pub active_profile: Option<String>,
+    /// Which target is bound to the Windows default playback device's
+    /// volume (external-controls.md capability 1) — `"master"` or a group
+    /// name; `None` (the default) means unbound, behaving exactly as today.
+    pub volume_bind: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct HotkeyMap {
     pub mute_master: Option<HotkeyChord>,
+    /// Master push-to-mute (external-controls.md capability 13) — held
+    /// while pressed, restores the prior state on release or max-hold expiry.
+    pub push_to_mute: Option<HotkeyChord>,
+    pub master_volume_up: Option<HotkeyChord>,
+    pub master_volume_down: Option<HotkeyChord>,
 }
 
 /// A validated global hotkey chord, e.g. spec §11.3's `"Ctrl+Alt+M"`. At least
@@ -130,7 +146,22 @@ pub struct HotkeyChord {
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
-    pub key: char,
+    pub key: HotkeyKey,
+}
+
+/// The non-modifier key half of a [`HotkeyChord`]. A plain `char` (the
+/// original shape) can't represent the named keys external-controls.md's own
+/// example config needs (`push_to_mute = "...+Space"`, `master_volume_up =
+/// "...+Up"`) — widened to this small closed set rather than accepting
+/// arbitrary key-name strings, which would push validation (and platform
+/// key-code mapping) failures out to `hotkeys.rs` instead of catching an
+/// unsupported name at config-parse time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyKey {
+    Char(char),
+    Space,
+    Up,
+    Down,
 }
 
 impl HotkeyChord {
@@ -146,13 +177,17 @@ impl HotkeyChord {
                 "ctrl" | "control" => ctrl = true,
                 "alt" => alt = true,
                 "shift" => shift = true,
+                "space" => set_key(&mut key, HotkeyKey::Space, token, s)?,
+                "up" => set_key(&mut key, HotkeyKey::Up, token, s)?,
+                "down" => set_key(&mut key, HotkeyKey::Down, token, s)?,
                 _ => {
                     let mut chars = token.chars();
                     let first = chars.next().filter(|c| c.is_ascii_alphanumeric());
-                    if key.is_some() || first.is_none() || chars.next().is_some() {
+                    if first.is_none() || chars.next().is_some() {
                         return Err(format!("invalid key token {token:?} in hotkey chord {s:?}"));
                     }
-                    key = first.map(|c| c.to_ascii_uppercase());
+                    let c = first.map(|c| c.to_ascii_uppercase()).expect("checked Some above");
+                    set_key(&mut key, HotkeyKey::Char(c), token, s)?;
                 }
             }
         }
@@ -162,6 +197,25 @@ impl HotkeyChord {
             return Err(format!("hotkey chord {s:?} needs at least one modifier"));
         }
         Ok(HotkeyChord { ctrl, alt, shift, key })
+    }
+}
+
+fn set_key(key: &mut Option<HotkeyKey>, value: HotkeyKey, token: &str, whole: &str) -> Result<(), String> {
+    if key.is_some() {
+        return Err(format!("invalid key token {token:?} in hotkey chord {whole:?}"));
+    }
+    *key = Some(value);
+    Ok(())
+}
+
+impl std::fmt::Display for HotkeyKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HotkeyKey::Char(c) => write!(f, "{c}"),
+            HotkeyKey::Space => write!(f, "Space"),
+            HotkeyKey::Up => write!(f, "Up"),
+            HotkeyKey::Down => write!(f, "Down"),
+        }
     }
 }
 
@@ -358,6 +412,9 @@ mod tests {
             duck: None,
             spatial: false,
             muted: false,
+            hotkey_mute: None,
+            hotkey_volume_up: None,
+            hotkey_volume_down: None,
         }
     }
 
@@ -370,7 +427,7 @@ mod tests {
                 ctrl: true,
                 alt: true,
                 shift: false,
-                key: 'M',
+                key: HotkeyKey::Char('M'),
             }
         );
     }
@@ -395,6 +452,21 @@ mod tests {
         let chord = HotkeyChord::parse("ctrl+alt+1").unwrap();
         assert_eq!(chord.to_string(), "Ctrl+Alt+1");
         assert_eq!(HotkeyChord::parse(&chord.to_string()).unwrap(), chord);
+    }
+
+    #[test]
+    fn hotkey_chord_parses_named_keys_case_insensitively() {
+        assert_eq!(HotkeyChord::parse("Ctrl+Alt+Space").unwrap().key, HotkeyKey::Space);
+        assert_eq!(HotkeyChord::parse("ctrl+up").unwrap().key, HotkeyKey::Up);
+        assert_eq!(HotkeyChord::parse("Ctrl+DOWN").unwrap().key, HotkeyKey::Down);
+    }
+
+    #[test]
+    fn hotkey_chord_with_a_named_key_round_trips_through_display() {
+        for chord_str in ["Ctrl+Alt+Space", "Ctrl+Up", "Ctrl+Down"] {
+            let chord = HotkeyChord::parse(chord_str).unwrap();
+            assert_eq!(HotkeyChord::parse(&chord.to_string()).unwrap(), chord);
+        }
     }
 
     #[test]

@@ -82,6 +82,45 @@ pub trait AudioSystem: Send + Sync {
     /// facade method, not a second port trait — single consumer, the recovery supervisor).
     /// Callable once; a second call replaces the previous subscription in real `win-audio`.
     fn subscribe_device_events(&self) -> Result<Receiver<DeviceEvent>, PortError>;
+    /// The Windows default playback device's master volume (external-controls.md
+    /// decision 10) — a distinct, best-effort, possibly-unavailable concern with
+    /// its own owner, same `SessionPort` rationale, not folded into this facade
+    /// as a plain method. Default body errors so `MockSystem` and future
+    /// backends need no change unless they opt in (the `set_bus_match`
+    /// precedent) — a device with no volume control is a real, expected case,
+    /// not a bug.
+    fn open_default_endpoint_volume(&self) -> Result<Box<dyn EndpointVolumePort>, PortError> {
+        Err(PortError::Backend("endpoint volume not supported by this backend".into()))
+    }
+}
+
+/// A volume change the binding did **not** cause — the adapter filters its own
+/// writes by `guidEventContext` before ever emitting one (external-controls.md
+/// decision 11: that GUID is a COM detail and stays out of this contract).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VolumeEvent {
+    /// 0.0..=1.0 slider position, straight from the notification payload —
+    /// not dB (decision 14: the payload carries only the scalar, and this
+    /// codebase forbids calling back into the API that delivered a
+    /// notification, which a dB conversion via `GetVolumeRange` would need).
+    pub level: f32,
+    pub muted: bool,
+}
+
+/// Read/write access to one endpoint's master volume, plus change
+/// notifications. Separate from `AudioSystem` for the same reason as
+/// `SessionPort`: a distinct, best-effort, possibly-unavailable concern with
+/// its own owner, not a call every backend must support.
+pub trait EndpointVolumePort: Send {
+    fn level(&self) -> Result<f32, PortError>;
+    /// Tagged with this port's own GUID on the real backend, so the
+    /// resulting notification is filtered out and never re-enters as an
+    /// event (decision 11).
+    fn set_level(&self, level: f32) -> Result<(), PortError>;
+    fn muted(&self) -> Result<bool, PortError>;
+    fn set_muted(&self, muted: bool) -> Result<(), PortError>;
+    /// Single-consume, same pattern as `SessionPort::take_events`.
+    fn take_events(&mut self) -> Receiver<VolumeEvent>;
 }
 
 /// `IAudioSessionManager2` notifications (session-routing L4).

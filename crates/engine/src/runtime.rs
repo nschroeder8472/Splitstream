@@ -129,6 +129,14 @@ pub enum EngineEvent {
     RoutingDegraded {
         reason: String,
     },
+    /// The OS default playback device changed (external-controls.md flow E).
+    /// Forwarded from `DeviceEvent::DefaultChanged` rather than discarded —
+    /// this is the one existing `subscribe_device_events` subscription
+    /// (`WasapiSystem` allows only one live registration at a time), so a
+    /// consumer needing default-device changes (the volume-bind coordinator)
+    /// reacts to this event instead of subscribing a second time, which
+    /// would silently replace the recovery supervisor's own subscription.
+    DefaultDeviceChanged(EndpointId),
 }
 
 #[derive(Debug, Clone)]
@@ -1641,7 +1649,10 @@ fn supervisor_loop(
                 match evt {
                     DeviceEvent::Removed(id) => dead_endpoints.push(id),
                     DeviceEvent::Added(endpoint) => added_endpoints.push(endpoint),
-                    DeviceEvent::DefaultChanged(_) | DeviceEvent::StateChanged(_) => {}
+                    DeviceEvent::DefaultChanged(id) => {
+                        let _ = persistent.events_tx.send(EngineEvent::DefaultDeviceChanged(id));
+                    }
+                    DeviceEvent::StateChanged(_) => {}
                 }
             }
         }
@@ -1862,6 +1873,9 @@ mod tests {
                 duck: None,
                 spatial: false,
                 muted: false,
+                hotkey_mute: None,
+                hotkey_volume_up: None,
+                hotkey_volume_down: None,
             }],
         }
     }
@@ -2748,6 +2762,29 @@ mod tests {
         assert!(matches!(evt, EngineEvent::DeviceAvailable(e) if e.id == mic.id));
         // The duplicate must not produce a second DeviceAvailable.
         assert!(events.recv_timeout(Duration::from_millis(300)).is_err());
+
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn default_device_changed_forwards_as_an_engine_event() {
+        // external-controls.md flow E: the volume-bind coordinator can't
+        // subscribe to device events itself (a second `subscribe_device_events`
+        // call would replace the recovery supervisor's own registration), so
+        // it reacts to this forwarded event instead. Regression for that
+        // forwarding actually happening rather than being silently dropped
+        // the way `StateChanged` still is.
+        let sys = Arc::new(MockSystem::new(mock_endpoints()));
+        let mut handle = start(&snapshot(), Arc::clone(&sys) as Arc<dyn AudioSystem>).unwrap();
+        let events = handle.take_events();
+        sleep(Duration::from_millis(50));
+
+        sys.emit_device_event(DeviceEvent::DefaultChanged(EndpointId("out-2".into())));
+
+        let evt = events
+            .recv_timeout(Duration::from_millis(1000))
+            .expect("expected a DefaultDeviceChanged event");
+        assert!(matches!(evt, EngineEvent::DefaultDeviceChanged(id) if id == EndpointId("out-2".into())));
 
         handle.shutdown().unwrap();
     }

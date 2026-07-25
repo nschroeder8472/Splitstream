@@ -121,6 +121,9 @@ mod tests {
             duck: None,
             spatial: false,
             muted: false,
+            hotkey_mute: None,
+            hotkey_volume_up: None,
+            hotkey_volume_down: None,
         }
     }
 

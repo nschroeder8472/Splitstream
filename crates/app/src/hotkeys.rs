@@ -4,10 +4,9 @@
 //! on its creation thread, verified against docs.rs). No-ops (returns an
 //! idle handle, spawns nothing) when the config defines no hotkeys.
 
+use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 use std::thread::{self, JoinHandle};
-
-use std::collections::HashMap;
 
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
@@ -16,20 +15,37 @@ use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::platform::windows::EventLoopBuilderExtWindows;
 
-use engine::{HotkeyChord, HotkeyMap, ProfileConfig};
+use engine::HotkeyChord;
 
 use crate::lifecycle::ShellError;
-use crate::ShellAction;
+use crate::{ShellAction, VolumeTarget, VOLUME_STEP_DB};
 
 enum HotkeyCommand {
     Quit,
 }
 
-/// What a registered chord does once pressed (profiles.md decision 7 —
-/// generalizes `spawn_hotkeys` from exactly one registered chord to N).
-enum HotkeyAction {
-    ToggleMute,
+/// What a registered chord does once pressed (external-controls.md decision
+/// 16 — supersedes profiles.md's `spawn_hotkeys(map, profiles, actions)`
+/// with one binding list, so a new hotkey kind is a new variant here rather
+/// than a new function parameter).
+#[derive(Clone)]
+pub enum HotkeyAction {
+    ToggleMasterMute,
+    /// Held while pressed, restores the prior state on release or max-hold
+    /// expiry (capabilities 13-15) — the only action that reacts to
+    /// `HotKeyState::Released` at all; every other binding ignores it.
+    PushToMuteMaster,
+    VolumeUp(VolumeTarget),
+    VolumeDown(VolumeTarget),
+    ToggleGroupMute(String),
     ApplyProfile(String),
+}
+
+/// A chord paired with what it does — the whole hotkey config surface
+/// (master, per-group, push-to-mute, profiles) reduces to one `Vec` of these.
+pub struct HotkeyBinding {
+    pub chord: HotkeyChord,
+    pub action: HotkeyAction,
 }
 
 pub struct HotkeyHandle {
@@ -53,30 +69,18 @@ impl HotkeyHandle {
     }
 }
 
-/// Registers `map.mute_master` (if set) plus one chord per profile that
-/// names a `hotkey` (profiles.md capability 10/decision 7). No-ops when
-/// neither exists. A chord that fails to parse or register is skipped
-/// individually — same best-effort spirit as the single-hotkey case: a bad
-/// binding never blocks the others or audio itself.
-pub fn spawn_hotkeys(
-    map: &HotkeyMap,
-    profiles: &[ProfileConfig],
-    actions: Sender<ShellAction>,
-) -> Result<HotkeyHandle, ShellError> {
-    let mut bindings: Vec<(HotKey, HotkeyAction)> = Vec::new();
-    if let Some(chord) = map.mute_master {
-        if let Ok(hotkey) = to_global_hotkey(chord) {
-            bindings.push((hotkey, HotkeyAction::ToggleMute));
+/// Registers every binding whose chord converts successfully. No-ops when
+/// `bindings` is empty. A chord that fails to convert or register is
+/// skipped individually — a bad binding never blocks the others or audio
+/// itself.
+pub fn spawn_hotkeys(bindings: &[HotkeyBinding], actions: Sender<ShellAction>) -> Result<HotkeyHandle, ShellError> {
+    let mut converted: Vec<(HotKey, HotkeyAction)> = Vec::new();
+    for binding in bindings {
+        if let Ok(hotkey) = to_global_hotkey(binding.chord) {
+            converted.push((hotkey, binding.action.clone()));
         }
     }
-    for profile in profiles {
-        if let Some(chord) = profile.hotkey {
-            if let Ok(hotkey) = to_global_hotkey(chord) {
-                bindings.push((hotkey, HotkeyAction::ApplyProfile(profile.name.clone())));
-            }
-        }
-    }
-    if bindings.is_empty() {
+    if converted.is_empty() {
         return Ok(HotkeyHandle::idle());
     }
 
@@ -88,7 +92,7 @@ pub fn spawn_hotkeys(
         if proxy_tx.send(event_loop.create_proxy()).is_err() {
             return; // caller gave up waiting
         }
-        run_hotkeys(&mut event_loop, bindings, actions);
+        run_hotkeys(&mut event_loop, converted, actions);
     });
 
     let proxy = proxy_rx
@@ -121,15 +125,10 @@ fn run_hotkeys(
         *control_flow = ControlFlow::Wait;
 
         while let Ok(evt) = hotkey_events.try_recv() {
-            if evt.state != HotKeyState::Pressed {
-                continue;
-            }
             if let Some(action) = by_id.get(&evt.id) {
-                let shell_action = match action {
-                    HotkeyAction::ToggleMute => ShellAction::ToggleMute,
-                    HotkeyAction::ApplyProfile(name) => ShellAction::ApplyProfile(name.clone()),
-                };
-                let _ = actions.send(shell_action);
+                if let Some(shell_action) = to_shell_action(action, evt.state) {
+                    let _ = actions.send(shell_action);
+                }
             }
         }
 
@@ -137,6 +136,28 @@ fn run_hotkeys(
             *control_flow = ControlFlow::Exit;
         }
     });
+}
+
+/// `None` = this (action, state) pair fires nothing — every binding but
+/// `PushToMuteMaster` ignores `Released` (the mechanism already exists in
+/// `global-hotkey`/Windows; earlier code just discarded that half of it).
+fn to_shell_action(action: &HotkeyAction, state: HotKeyState) -> Option<ShellAction> {
+    match (action, state) {
+        (HotkeyAction::PushToMuteMaster, HotKeyState::Pressed) => Some(ShellAction::PushToMute(true)),
+        (HotkeyAction::PushToMuteMaster, HotKeyState::Released) => Some(ShellAction::PushToMute(false)),
+        (_, HotKeyState::Released) => None,
+        (HotkeyAction::ToggleMasterMute, HotKeyState::Pressed) => Some(ShellAction::ToggleMute),
+        (HotkeyAction::ToggleGroupMute(name), HotKeyState::Pressed) => {
+            Some(ShellAction::ToggleGroupMute(name.clone()))
+        }
+        (HotkeyAction::ApplyProfile(name), HotKeyState::Pressed) => Some(ShellAction::ApplyProfile(name.clone())),
+        (HotkeyAction::VolumeUp(target), HotKeyState::Pressed) => {
+            Some(ShellAction::VolumeStep { target: target.clone(), delta_db: VOLUME_STEP_DB })
+        }
+        (HotkeyAction::VolumeDown(target), HotKeyState::Pressed) => {
+            Some(ShellAction::VolumeStep { target: target.clone(), delta_db: -VOLUME_STEP_DB })
+        }
+    }
 }
 
 fn to_global_hotkey(chord: HotkeyChord) -> Result<HotKey, ShellError> {
@@ -155,8 +176,14 @@ fn to_global_hotkey(chord: HotkeyChord) -> Result<HotKey, ShellError> {
     Ok(HotKey::new(Some(mods), code))
 }
 
-fn key_code(key: char) -> Option<Code> {
-    Some(match key {
+fn key_code(key: engine::HotkeyKey) -> Option<Code> {
+    let c = match key {
+        engine::HotkeyKey::Space => return Some(Code::Space),
+        engine::HotkeyKey::Up => return Some(Code::ArrowUp),
+        engine::HotkeyKey::Down => return Some(Code::ArrowDown),
+        engine::HotkeyKey::Char(c) => c,
+    };
+    Some(match c {
         'A' => Code::KeyA,
         'B' => Code::KeyB,
         'C' => Code::KeyC,
@@ -195,4 +222,62 @@ fn key_code(key: char) -> Option<Code> {
         '9' => Code::Digit9,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_binding_but_push_to_mute_ignores_released() {
+        for action in [
+            HotkeyAction::ToggleMasterMute,
+            HotkeyAction::ToggleGroupMute("Game".into()),
+            HotkeyAction::ApplyProfile("Gaming".into()),
+            HotkeyAction::VolumeUp(VolumeTarget::Master),
+            HotkeyAction::VolumeDown(VolumeTarget::Group("Game".into())),
+        ] {
+            assert!(to_shell_action(&action, HotKeyState::Released).is_none());
+        }
+    }
+
+    #[test]
+    fn push_to_mute_fires_on_both_pressed_and_released() {
+        assert!(matches!(
+            to_shell_action(&HotkeyAction::PushToMuteMaster, HotKeyState::Pressed),
+            Some(ShellAction::PushToMute(true))
+        ));
+        assert!(matches!(
+            to_shell_action(&HotkeyAction::PushToMuteMaster, HotKeyState::Released),
+            Some(ShellAction::PushToMute(false))
+        ));
+    }
+
+    #[test]
+    fn volume_up_and_down_step_in_opposite_directions() {
+        let up = to_shell_action(&HotkeyAction::VolumeUp(VolumeTarget::Master), HotKeyState::Pressed);
+        let down = to_shell_action(&HotkeyAction::VolumeDown(VolumeTarget::Master), HotKeyState::Pressed);
+        match (up, down) {
+            (
+                Some(ShellAction::VolumeStep { delta_db: up_db, .. }),
+                Some(ShellAction::VolumeStep { delta_db: down_db, .. }),
+            ) => {
+                assert_eq!(up_db, VOLUME_STEP_DB);
+                assert_eq!(down_db, -VOLUME_STEP_DB);
+            }
+            other => panic!("expected two VolumeStep actions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn toggle_group_mute_and_apply_profile_carry_the_right_name() {
+        assert!(matches!(
+            to_shell_action(&HotkeyAction::ToggleGroupMute("Game".into()), HotKeyState::Pressed),
+            Some(ShellAction::ToggleGroupMute(name)) if name == "Game"
+        ));
+        assert!(matches!(
+            to_shell_action(&HotkeyAction::ApplyProfile("Gaming".into()), HotKeyState::Pressed),
+            Some(ShellAction::ApplyProfile(name)) if name == "Gaming"
+        ));
+    }
 }

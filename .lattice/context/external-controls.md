@@ -2,7 +2,7 @@
 feature: external-controls
 requirement_doc: null
 created: 2026-07-23
-status: approved
+status: complete
 note: >
   Roadmap Priorities 9 and 10 (minus what profiles already brings), plus a
   system-volume binding raised by the user mid-design that supersedes the

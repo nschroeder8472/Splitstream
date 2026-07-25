@@ -466,6 +466,19 @@ fn group_table(g: &GroupConfig) -> Table {
     t["match_rules"] = value(string_array(&g.match_rules));
     write_dsp_stages(&mut t, &g.dsp);
     write_duck(&mut t, g.duck.as_ref());
+    // Config-file-only chords (external-controls.md decision 8) — always
+    // `None` for `AddGroup`'s actual caller today (no hotkey-editing UI
+    // exists), but writing them when present keeps this a faithful whole-
+    // `GroupConfig` serializer rather than one that silently drops fields.
+    if let Some(h) = &g.hotkey_mute {
+        t["hotkey_mute"] = value(h.to_string());
+    }
+    if let Some(h) = &g.hotkey_volume_up {
+        t["hotkey_volume_up"] = value(h.to_string());
+    }
+    if let Some(h) = &g.hotkey_volume_down {
+        t["hotkey_volume_down"] = value(h.to_string());
+    }
     t
 }
 
@@ -623,6 +636,9 @@ follow_master = true
             duck: None,
             spatial: false,
             muted: false,
+            hotkey_mute: None,
+            hotkey_volume_up: None,
+            hotkey_volume_down: None,
         };
         let snapshot = store.apply(&[ConfigEdit::AddGroup(added)]).unwrap();
         assert_eq!(snapshot.groups.len(), 2);
@@ -1114,6 +1130,9 @@ dsp = [{ type = "limiter", ceiling_db = -1.0 }]
                 duck: None,
                 spatial: false,
                 muted: false,
+                hotkey_mute: None,
+                hotkey_volume_up: None,
+                hotkey_volume_down: None,
             }),
             ConfigEdit::RemoveGroup("g".into()),
         ];
