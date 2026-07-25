@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crossbeam_queue::ArrayQueue;
 use rtrb::RingBuffer;
@@ -266,6 +266,29 @@ const BLOCK_FRAME_MARGIN: usize = 8;
 /// thread's push is best-effort (drop-on-full, same tolerance as every other
 /// ring/queue here), so this only needs to absorb a burst, not hold forever.
 const RETIRED_CHAIN_QUEUE_CAPACITY: usize = 32;
+/// Upper bound on how long `mixer_loop` can stay parked before a tick runs
+/// anyway (mixer-demand-driven-wakeup L1 capability 5/Flow B/H) — keeps
+/// `EngineStats`/`ring_fill` telemetry from going stale when nothing real
+/// (render/capture/command) wakes it.
+const MIXER_FALLBACK_INTERVAL: Duration = Duration::from_millis(100);
+/// Headroom over one exact render period applied by `compute_wake_unit_period`,
+/// replacing the old implicit half-period doubling (notes §5) now that the
+/// mixer wakes from a real park/unpark event rather than a polled timer
+/// (decision 2).
+const WAKE_MARGIN: f64 = 1.25;
+
+/// Wakes the mixer thread out of its park (mixer-demand-driven-wakeup L2/L4).
+/// Clone, no lock: `std::thread::Thread` is already `Send + Sync + Clone`, so
+/// every render/capture/command-enqueue site can hold its own clone and call
+/// `wake()` without a `Condvar`/`Mutex` on this RT-adjacent path.
+#[derive(Clone)]
+struct MixerWaker(thread::Thread);
+
+impl MixerWaker {
+    fn wake(&self) {
+        self.0.unpark();
+    }
+}
 
 struct RingGauge {
     fill_permille: AtomicU32,
@@ -395,6 +418,10 @@ struct RunningGraph {
     /// Friendly device name per `OutputId` (level-meters.md) — fixed at build,
     /// surfaced verbatim via `EngineStats::output_names`.
     output_devices: Vec<(OutputId, String)>,
+    /// Clone of the mixer thread's `Thread` handle (mixer-demand-driven-wakeup)
+    /// — every render/capture thread and `EngineHandle::apply_params` holds
+    /// its own clone to wake the mixer out of its park on demand.
+    mixer_waker: MixerWaker,
 }
 
 pub struct EngineHandle {
@@ -450,9 +477,9 @@ impl EngineHandle {
     /// a `Box<DspChain>`, moved into the queue's `Envelope`, never copied.
     pub fn apply_params(&self, cmds: Vec<MixerCommand>) -> Result<(), EngineError> {
         let running = self.running.lock().unwrap();
-        if running.is_none() {
+        let Some(rg) = running.as_ref() else {
             return Err(EngineError::AlreadyStopped);
-        }
+        };
         let epoch = Epoch(self.persistent.epoch.load(Ordering::Relaxed));
         for cmd in cmds {
             self.persistent
@@ -460,6 +487,11 @@ impl EngineHandle {
                 .push(Envelope { epoch, cmd })
                 .map_err(|_| EngineError::CommandQueueFull)?;
         }
+        // A live edit must apply promptly while the mixer is parked, not wait
+        // for the next incidental render/capture wake (mixer-demand-driven-
+        // wakeup L3 Flow E — the one call site apply_dsp_chains/apply_spatial
+        // both funnel through).
+        rg.mixer_waker.wake();
         Ok(())
     }
 
@@ -617,6 +649,11 @@ impl EngineHandle {
 
 fn stop_running_graph(mut rg: RunningGraph) {
     rg.stop.store(true, Ordering::Relaxed);
+    // Without this, the mixer thread only notices `stop` at its next real
+    // render/capture/command wake, or after MIXER_FALLBACK_INTERVAL (100ms)
+    // — a real join-latency regression on every shutdown/rebuild (review
+    // finding, 2026-07-24) that none of the design's Flows A-I covered.
+    rg.mixer_waker.wake();
     // Per-pid capture threads use their own stop flags (not `rg.stop`) so
     // `CaptureControl` can stop one independently mid-run — a full teardown
     // stops every one of them here.
@@ -738,12 +775,14 @@ impl CaptureControl {
             let Some(rg) = guard.as_mut() else {
                 return Err(EngineError::AlreadyStopped);
             };
+            let waker = rg.mixer_waker.clone();
             for (pid, port, producer, consumer) in opened {
                 let stop = Arc::new(AtomicBool::new(false));
                 let thread = {
                     let stop = Arc::clone(&stop);
                     let sys = Arc::clone(&self.sys);
-                    thread::spawn(move || pid_capture_loop(port, producer, &stop, sys.as_ref()))
+                    let waker = waker.clone();
+                    thread::spawn(move || pid_capture_loop(port, producer, &stop, sys.as_ref(), waker))
                 };
                 rg.capture_pids.entry(group).or_default().insert(pid, PidCapture { stop, thread });
                 let _ = rg.capture_tx.send(CaptureMsg::Add { group, pid, consumer });
@@ -763,6 +802,7 @@ fn pid_capture_loop(
     mut producer: rtrb::Producer<f32>,
     stop: &AtomicBool,
     sys: &dyn AudioSystem,
+    waker: MixerWaker,
 ) {
     let _rt = sys.promote_rt_thread();
     let poll_interval = port.poll_interval();
@@ -776,6 +816,9 @@ fn pid_capture_loop(
                 for &sample in &buf[..n] {
                     let _ = producer.push(sample); // ring full: drop, best-effort (notes §1)
                 }
+                // New audio arrived — mix it (mixer-demand-driven-wakeup L3
+                // Flow D), bounded by MIXER_FALLBACK_INTERVAL if ever missed.
+                waker.wake();
             }
             Err(_) => return, // this pid's stream is done — other pids/groups keep running
         }
@@ -916,14 +959,15 @@ fn build_group_slots(plan: &GraphPlan, group_output_index: &HashMap<GroupId, usi
         .collect()
 }
 
-fn spawn_render_threads(
-    renders: Vec<(OutputId, Box<dyn RenderPort>)>,
-    stop: &Arc<AtomicBool>,
-    xruns: &Arc<AtomicU64>,
-    faults: &Sender<Fault>,
-    sys: &Arc<dyn AudioSystem>,
-) -> (Vec<JoinHandle<()>>, OutputProducers) {
-    let mut threads = Vec::with_capacity(renders.len());
+type PreparedRenders = Vec<(OutputId, Box<dyn RenderPort>, rtrb::Consumer<f32>)>;
+
+/// Builds every output's ring buffer without spawning any thread yet
+/// (mixer-demand-driven-wakeup L3 Flow I): `render_loop` needs a `MixerWaker`,
+/// which only exists once the mixer thread is spawned, and the mixer thread
+/// needs these same producers — splitting "build the rings" from "spawn the
+/// threads" resolves that construction-order circularity.
+fn prepare_output_rings(renders: Vec<(OutputId, Box<dyn RenderPort>)>) -> (PreparedRenders, OutputProducers) {
+    let mut prepared = Vec::with_capacity(renders.len());
     let mut producers = Vec::with_capacity(renders.len());
     for (output_id, port) in renders.into_iter() {
         let format = port.format();
@@ -931,21 +975,36 @@ fn spawn_render_threads(
         let capacity = ring_capacity_samples(device_period_s, format.sample_rate, format.channels);
         let (producer, consumer) = RingBuffer::<f32>::new(capacity);
         producers.push((output_id, producer, format.channels as usize));
+        prepared.push((output_id, port, consumer));
+    }
+    (prepared, producers)
+}
 
+fn spawn_render_threads(
+    prepared: PreparedRenders,
+    waker: MixerWaker,
+    stop: &Arc<AtomicBool>,
+    xruns: &Arc<AtomicU64>,
+    faults: &Sender<Fault>,
+    sys: &Arc<dyn AudioSystem>,
+) -> Vec<JoinHandle<()>> {
+    let mut threads = Vec::with_capacity(prepared.len());
+    for (output_id, port, consumer) in prepared.into_iter() {
         let stop = Arc::clone(stop);
         let xruns = Arc::clone(xruns);
         let faults = faults.clone();
         let sys = Arc::clone(sys);
+        let waker = waker.clone();
         threads.push(thread::spawn(move || {
             let ctx = RenderFaultCtx {
                 xruns: &xruns,
                 output_id,
                 faults: &faults,
             };
-            render_loop(port, consumer, &stop, &ctx, sys.as_ref());
+            render_loop(port, consumer, &stop, &ctx, sys.as_ref(), waker);
         }));
     }
-    (threads, producers)
+    threads
 }
 
 fn build_running_graph(
@@ -956,8 +1015,8 @@ fn build_running_graph(
 ) -> Result<RunningGraph, EngineError> {
     let opened = open_graph(snapshot, sys, parked)?;
 
-    let tick_period = compute_tick_period(&opened.renders);
-    let max_block_frames = compute_max_block_frames(&opened.plan, tick_period);
+    let wake_unit_period = compute_wake_unit_period(&opened.renders);
+    let max_block_frames = compute_max_block_frames(&opened.plan, wake_unit_period);
     let mixer = Mixer::new(&opened.plan.topology, max_block_frames)?;
     log_channel_conversions(&opened.plan.topology, max_block_frames);
 
@@ -1029,8 +1088,12 @@ fn build_running_graph(
 
     let (fault_tx, fault_rx) = mpsc::channel();
     let group_consumers = build_group_slots(&opened.plan, &group_output_index);
-    let (render_threads, output_producers) =
-        spawn_render_threads(opened.renders, &stop, &xruns, &fault_tx, sys);
+    // Flow I: build every output's ring buffer first (no thread spawned yet),
+    // then the mixer thread (its `Thread` handle becomes the one `MixerWaker`
+    // every render thread needs), then the render threads themselves — in
+    // that order, since `render_loop` requires a `MixerWaker` that only
+    // exists once the mixer thread is spawned.
+    let (prepared_renders, output_producers) = prepare_output_rings(opened.renders);
 
     let (capture_tx, capture_rx) = mpsc::channel();
     let mixer_args = MixerThreadArgs {
@@ -1039,7 +1102,6 @@ fn build_running_graph(
         ring_fill: Arc::clone(&ring_fill),
         output_index_of: output_index_of.clone(),
         stop: Arc::clone(&stop),
-        tick_period,
         sys: Arc::clone(sys),
         duck_depth_db: Arc::clone(&duck_depth_db),
         limiter_engaged: Arc::clone(&limiter_engaged),
@@ -1050,6 +1112,10 @@ fn build_running_graph(
     let mixer_thread = thread::spawn(move || {
         mixer_loop(mixer, group_consumers, output_producers, mixer_args);
     });
+    let mixer_waker = MixerWaker(mixer_thread.thread().clone());
+
+    let render_threads =
+        spawn_render_threads(prepared_renders, mixer_waker.clone(), &stop, &xruns, &fault_tx, sys);
 
     Ok(RunningGraph {
         stop,
@@ -1072,6 +1138,7 @@ fn build_running_graph(
         group_peak,
         output_peak,
         output_devices,
+        mixer_waker,
     })
 }
 
@@ -1123,6 +1190,7 @@ fn render_loop(
     stop: &AtomicBool,
     ctx: &RenderFaultCtx,
     sys: &dyn AudioSystem,
+    waker: MixerWaker,
 ) {
     let _rt = sys.promote_rt_thread();
     let channels = port.format().channels.max(1) as usize;
@@ -1152,6 +1220,10 @@ fn render_loop(
             buf[got..].fill(0.0); // underrun: pad with silence, never wait for the mixer
             ctx.xruns.fetch_add(1, Ordering::Relaxed);
         }
+        // "I just consumed — refill me for next time" (mixer-demand-driven-
+        // wakeup L3 Flow C), synchronized to this real hardware event's own
+        // precision, before handing the just-drained buffer to the device.
+        waker.wake();
         if let Err(e) = port.write(&buf) {
             let _ = ctx.faults.send(Fault {
                 source: FaultSource::Output(ctx.output_id),
@@ -1170,7 +1242,6 @@ struct MixerThreadArgs {
     ring_fill: Arc<Vec<RingGauge>>,
     output_index_of: HashMap<OutputId, usize>,
     stop: Arc<AtomicBool>,
-    tick_period: Duration,
     sys: Arc<dyn AudioSystem>,
     duck_depth_db: Arc<Vec<AtomicU32>>,
     limiter_engaged: Arc<Vec<AtomicU64>>,
@@ -1188,7 +1259,6 @@ fn mixer_loop(
     args: MixerThreadArgs,
 ) {
     let _rt = args.sys.promote_rt_thread();
-    let sleeper = spin_sleep::SpinSleeper::default();
 
     let mut group_scratch: Vec<Vec<f32>> = group_consumers
         .iter()
@@ -1208,8 +1278,6 @@ fn mixer_loop(
     let output_ids: Vec<OutputId> = output_producers.iter().map(|(id, ..)| *id).collect();
 
     while !args.stop.load(Ordering::Relaxed) {
-        let tick_start = Instant::now();
-
         drain_capture_commands(&args.capture_rx, &mut group_consumers);
         drain_commands(&args.persistent, &mut mixer, &args.ring_fill, &args.output_index_of);
         pull_group_inputs(
@@ -1229,8 +1297,13 @@ fn mixer_loop(
             &mut ticks_since_real,
         );
 
-        let budget = args.tick_period.saturating_sub(tick_start.elapsed());
-        sleeper.sleep(budget);
+        // Block (zero CPU) until real demand wakes this thread again — a
+        // render/capture event or a command enqueue (mixer-demand-driven-
+        // wakeup L3 Flow B/C/D/E), or the fallback bound if none arrives in
+        // time (Flow B/H). `park`/`unpark` coalesce (Flow F): several wakes
+        // before this park collapse into one, safe because the tick body
+        // above already drained everything pending regardless of source.
+        thread::park_timeout(MIXER_FALLBACK_INTERVAL);
     }
 }
 
@@ -1407,30 +1480,34 @@ fn ring_capacity_samples(period_s: f64, sample_rate: u32, channels: u16) -> usiz
     (frames * RING_PERIOD_MARGIN * channels.max(1) as usize).max(64)
 }
 
-/// notes §5: tick period is half the minimum device period across the graph.
-/// No more capture ports here (process-loopback-capture pivot — capture
-/// sources are opened dynamically per pid, long after the tick period is
-/// fixed at build time): render ports alone set the floor, same fallback for
-/// an empty topology as before.
-fn compute_tick_period(renders: &[(OutputId, Box<dyn RenderPort>)]) -> Duration {
+/// notes §5 (superseded — decision 2): buffer-sizing basis is a full render
+/// period plus `WAKE_MARGIN` headroom, not the old implicit half-period
+/// doubling. The halving existed to compensate for a polled/`spin_sleep`
+/// wake's imprecision; a real park/unpark wake doesn't carry that same
+/// imprecision, but some margin is still kept for scheduling jitter between
+/// "render drained" and "mixer refilled." No capture ports here
+/// (process-loopback-capture pivot — capture sources are opened dynamically
+/// per pid, long after this is fixed at build time): render ports alone set
+/// the floor, same fallback for an empty topology as before.
+fn compute_wake_unit_period(renders: &[(OutputId, Box<dyn RenderPort>)]) -> Duration {
     let min_period_s = renders
         .iter()
         .map(|(_, r)| r.period_frames() as f64 / r.format().sample_rate.max(1) as f64)
         .fold(f64::INFINITY, f64::min);
 
     let period_s = if min_period_s.is_finite() {
-        (min_period_s / 2.0).max(0.001)
+        min_period_s * WAKE_MARGIN
     } else {
         0.005 // no ports at all (empty topology) — arbitrary safe default
     };
     Duration::from_secs_f64(period_s)
 }
 
-fn compute_max_block_frames(plan: &GraphPlan, tick_period: Duration) -> usize {
+fn compute_max_block_frames(plan: &GraphPlan, wake_unit_period: Duration) -> usize {
     plan.topology
         .groups
         .iter()
-        .map(|g| frames_for(tick_period, g.input_format.sample_rate) + BLOCK_FRAME_MARGIN)
+        .map(|g| frames_for(wake_unit_period, g.input_format.sample_rate) + BLOCK_FRAME_MARGIN)
         .max()
         .unwrap_or(BLOCK_FRAME_MARGIN)
 }
@@ -2048,8 +2125,9 @@ mod tests {
         let stop = AtomicBool::new(false);
         let sys = MockSystem::new(vec![]);
         let (producer, _consumer) = RingBuffer::<f32>::new(4);
+        let waker = MixerWaker(thread::current());
 
-        pid_capture_loop(Box::new(FailingCapture), producer, &stop, &sys);
+        pid_capture_loop(Box::new(FailingCapture), producer, &stop, &sys, waker);
     }
 
     #[test]
@@ -2097,7 +2175,14 @@ mod tests {
     }
 
     #[test]
-    fn set_output_ratio_command_updates_applied_ratio_stat() {
+    fn a_parked_mixer_still_ticks_within_the_fallback_interval() {
+        // Pushes straight onto the raw command queue, bypassing
+        // `EngineHandle::apply_params` (the only call site that wakes the
+        // mixer explicitly) — so this command can only ever be picked up by
+        // `mixer_loop`'s MIXER_FALLBACK_INTERVAL bound (Flow B/H), never a
+        // real wake. Sleeping comfortably past that bound (not the old
+        // 30ms — that assumed the pre-redesign fixed-clock tick) proves the
+        // fallback still fires with nothing else driving it.
         let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(mock_endpoints()));
         let persistent = bare_persistent(&snapshot());
         let rg = build_running_graph(&snapshot(), &sys, &persistent, &HashSet::new()).unwrap();
@@ -2108,7 +2193,7 @@ mod tests {
             cmd: MixerCommand::SetOutputRatio(OutputId(0), ratio),
         });
         assert!(pushed.is_ok());
-        sleep(Duration::from_millis(30));
+        sleep(MIXER_FALLBACK_INTERVAL + Duration::from_millis(50));
         let applied = f64::from_bits(rg.ring_fill[0].applied_ratio_bits.load(Ordering::Relaxed));
         assert_eq!(applied, 1.003);
         stop_running_graph(rg);
@@ -2126,12 +2211,377 @@ mod tests {
             output_id: OutputId(0),
             faults: &fault_tx,
         };
+        let waker = MixerWaker(thread::current());
 
-        render_loop(Box::new(FailingRender), consumer, &stop, &ctx, &sys);
+        render_loop(Box::new(FailingRender), consumer, &stop, &ctx, &sys, waker);
 
         let fault = fault_rx.recv().unwrap();
         assert!(matches!(fault.source, FaultSource::Output(OutputId(0))));
         assert!(matches!(fault.kind, FaultKind::Other));
+    }
+
+    // --- mixer-demand-driven-wakeup test contracts (context doc L4) ---
+
+    #[test]
+    fn compute_wake_unit_period_applies_the_margin_not_a_half_period_split() {
+        struct FixedPeriodRender {
+            period_frames: usize,
+            format: Format,
+        }
+        impl RenderPort for FixedPeriodRender {
+            fn wait_event(&mut self, _timeout: Duration) -> Result<(), PortError> {
+                Ok(())
+            }
+            fn write(&mut self, _frames: &[f32]) -> Result<(), PortError> {
+                Ok(())
+            }
+            fn format(&self) -> Format {
+                self.format
+            }
+            fn period_frames(&self) -> usize {
+                self.period_frames
+            }
+        }
+        // 480 frames @ 48kHz = 10ms device period.
+        let renders: Vec<(OutputId, Box<dyn RenderPort>)> = vec![(
+            OutputId(0),
+            Box::new(FixedPeriodRender { period_frames: 480, format: stereo(48_000) }),
+        )];
+
+        let wake_unit = compute_wake_unit_period(&renders);
+
+        let expected = Duration::from_secs_f64(0.010 * WAKE_MARGIN);
+        assert!(
+            (wake_unit.as_secs_f64() - expected.as_secs_f64()).abs() < 1e-9,
+            "got {wake_unit:?}"
+        );
+        assert!(
+            wake_unit > Duration::from_millis(10),
+            "must apply WAKE_MARGIN over the full period, not the old half-period split, got {wake_unit:?}"
+        );
+    }
+
+    #[test]
+    fn render_loop_wakes_the_mixer_after_draining_its_ring() {
+        // Succeeds once (drains + wakes + writes), then fails so the loop
+        // exits deterministically without needing a second thread to flip `stop`.
+        struct OneShotRender {
+            called: bool,
+        }
+        impl RenderPort for OneShotRender {
+            fn wait_event(&mut self, _timeout: Duration) -> Result<(), PortError> {
+                if self.called {
+                    Err(PortError::DeviceInvalidated)
+                } else {
+                    self.called = true;
+                    Ok(())
+                }
+            }
+            fn write(&mut self, _frames: &[f32]) -> Result<(), PortError> {
+                Ok(())
+            }
+            fn format(&self) -> Format {
+                stereo(48_000)
+            }
+            fn period_frames(&self) -> usize {
+                2
+            }
+        }
+        let stop = AtomicBool::new(false);
+        let xruns = AtomicU64::new(0);
+        let (fault_tx, _fault_rx) = mpsc::channel();
+        let sys = MockSystem::new(vec![]);
+        let (mut producer, consumer) = RingBuffer::<f32>::new(4);
+        producer.push(0.25).unwrap();
+        let ctx = RenderFaultCtx {
+            xruns: &xruns,
+            output_id: OutputId(0),
+            faults: &fault_tx,
+        };
+
+        // Bounded, race-free: `unpark`'s token persists until the next
+        // `park`/`park_timeout` consumes it, so it doesn't matter whether
+        // `render_loop`'s wake() lands before or after this thread reaches
+        // its own park call.
+        let parker = thread::spawn(|| {
+            let start = std::time::Instant::now();
+            thread::park_timeout(Duration::from_secs(2));
+            start.elapsed()
+        });
+        let waker = MixerWaker(parker.thread().clone());
+
+        render_loop(Box::new(OneShotRender { called: false }), consumer, &stop, &ctx, &sys, waker);
+
+        let elapsed = parker.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "render_loop must wake the mixer promptly after draining its ring, got {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn pid_capture_loop_wakes_the_mixer_after_producing_a_block() {
+        struct OneShotCapture {
+            called: bool,
+        }
+        impl CapturePort for OneShotCapture {
+            fn read(&mut self, buf: &mut [f32]) -> Result<usize, PortError> {
+                if self.called {
+                    Err(PortError::DeviceInvalidated)
+                } else {
+                    self.called = true;
+                    buf[0] = 0.1;
+                    Ok(1)
+                }
+            }
+            fn format(&self) -> Format {
+                stereo(48_000)
+            }
+            fn poll_interval(&self) -> Duration {
+                Duration::from_millis(1)
+            }
+        }
+        let stop = AtomicBool::new(false);
+        let sys = MockSystem::new(vec![]);
+        let (producer, _consumer) = RingBuffer::<f32>::new(8);
+
+        let parker = thread::spawn(|| {
+            let start = std::time::Instant::now();
+            thread::park_timeout(Duration::from_secs(2));
+            start.elapsed()
+        });
+        let waker = MixerWaker(parker.thread().clone());
+
+        pid_capture_loop(Box::new(OneShotCapture { called: false }), producer, &stop, &sys, waker);
+
+        let elapsed = parker.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "pid_capture_loop must wake the mixer after producing a block, got {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn apply_params_wakes_the_mixer_after_enqueueing_commands() {
+        let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(mock_endpoints()));
+        let handle = start(&snapshot(), sys).unwrap();
+        let ratio = audio_core::ResampleRatio::new(1.003).unwrap();
+
+        handle
+            .apply_params(vec![MixerCommand::SetOutputRatio(OutputId(0), ratio)])
+            .unwrap();
+
+        // Well under MIXER_FALLBACK_INTERVAL (100ms) — only passes if
+        // apply_params's own wake() call fired the tick, not the fallback.
+        sleep(Duration::from_millis(20));
+        assert_eq!(handle.stats().applied_ratio, vec![(OutputId(0), 1.003)]);
+
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn mixer_loop_ticks_immediately_on_first_run_before_any_wake() {
+        // Nothing in this test ever calls `waker.wake()` or waits past a
+        // handful of milliseconds — the only way `ring_fill[0].active` can
+        // become true is `mixer_loop` running its first tick unconditionally
+        // before ever parking (Flow A). Observing via `RingGauge.active`
+        // (set by `pull_group_inputs`'/`flush_outputs`' own bookkeeping) not
+        // actual output audio: a real `Mixer` always resamples through a real
+        // `Src`, which needs several ticks' worth of input before its sinc
+        // filter emits anything — a pipeline-latency property unrelated to
+        // whether the mixer ticked, so it's the wrong signal to assert on here.
+        let in_capacity = 8; // == max_block_frames below: a full block this tick
+        let (mut in_p, in_c) = RingBuffer::<f32>::new(in_capacity);
+        for _ in 0..in_capacity {
+            in_p.push(0.5).unwrap();
+        }
+        let mut group_consumers = vec![slot(GroupId(0), 1, 0)];
+        group_consumers[0].pids.push((1, in_c));
+        let (out_p, _out_c) = RingBuffer::<f32>::new(64);
+        let output_producers = vec![(OutputId(0), out_p, 1usize)];
+
+        let topology = Topology {
+            master: audio_core::Gain::UNITY,
+            groups: vec![audio_core::GroupSpec {
+                id: GroupId(0),
+                gain: audio_core::Gain::UNITY,
+                follow_master: false,
+                output: OutputId(0),
+                input_format: mono(48_000),
+                dsp: Vec::new(),
+                duck: None,
+                spatial: false,
+                mute: false,
+            }],
+            outputs: vec![audio_core::OutputSpec { id: OutputId(0), format: mono(48_000) }],
+        };
+        let mixer = Mixer::new(&topology, 8).unwrap();
+        let (_capture_tx, capture_rx) = mpsc::channel();
+        let mut output_index_of = HashMap::new();
+        output_index_of.insert(OutputId(0), 0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(vec![]));
+        let ring_fill = Arc::new(vec![RingGauge {
+            fill_permille: AtomicU32::new(0),
+            active: AtomicBool::new(false),
+            applied_ratio_bits: AtomicU64::new(1.0f64.to_bits()),
+        }]);
+
+        let args = MixerThreadArgs {
+            max_block_frames: 8,
+            persistent: bare_persistent(&snapshot()),
+            ring_fill: Arc::clone(&ring_fill),
+            output_index_of,
+            stop: Arc::clone(&stop),
+            sys,
+            duck_depth_db: Arc::new(vec![AtomicU32::new(0)]),
+            limiter_engaged: Arc::new(vec![AtomicU64::new(0)]),
+            group_peak: Arc::new(vec![AtomicU64::new(0)]),
+            output_peak: Arc::new(vec![AtomicU64::new(0)]),
+            capture_rx,
+        };
+        let handle = thread::spawn(move || mixer_loop(mixer, group_consumers, output_producers, args));
+
+        sleep(Duration::from_millis(30)); // comfortably before MIXER_FALLBACK_INTERVAL
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(
+            ring_fill[0].active.load(Ordering::Relaxed),
+            "the pre-loaded full block must have registered as real activity on the first tick"
+        );
+    }
+
+    #[test]
+    fn mixer_loop_drains_everything_pending_regardless_of_which_source_woke_it() {
+        // A capture add for two pids AND a queued command are both pending
+        // before the thread ever starts; only the guaranteed first tick (no
+        // explicit wake) runs before assertions — proving one tick drains
+        // every pending source together, not just the one that "woke" it.
+        // Each pid fills a full max_block_frames block (not just one sample —
+        // `real_this_tick`/`RingGauge.active` only trips on a fully-filled
+        // block, and that's the observable used below, not raw output audio:
+        // a real `Mixer` always resamples through a real `Src`, which needs
+        // several ticks' worth of input before its sinc filter emits
+        // anything, unrelated to whether both pids were actually drained).
+        let block = 8; // == max_block_frames below
+        let (mut p1, c1) = RingBuffer::<f32>::new(block);
+        let (mut p2, c2) = RingBuffer::<f32>::new(block);
+        for _ in 0..block {
+            p1.push(0.2).unwrap();
+            p2.push(0.5).unwrap();
+        }
+        let (capture_tx, capture_rx) = mpsc::channel();
+        capture_tx.send(CaptureMsg::Add { group: GroupId(0), pid: 1, consumer: c1 }).unwrap();
+        capture_tx.send(CaptureMsg::Add { group: GroupId(0), pid: 2, consumer: c2 }).unwrap();
+
+        let persistent = bare_persistent(&snapshot());
+        let ratio = audio_core::ResampleRatio::new(1.05).unwrap();
+        let epoch = Epoch(persistent.epoch.load(Ordering::Relaxed));
+        let pushed = persistent
+            .commands
+            .push(Envelope { epoch, cmd: MixerCommand::SetOutputRatio(OutputId(0), ratio) });
+        assert!(pushed.is_ok());
+
+        let group_consumers = vec![slot(GroupId(0), 1, 0)]; // starts with zero pids -- the Add messages populate it mid-tick
+        let (out_p, _out_c) = RingBuffer::<f32>::new(64);
+        let output_producers = vec![(OutputId(0), out_p, 1usize)];
+        let topology = Topology {
+            master: audio_core::Gain::UNITY,
+            groups: vec![audio_core::GroupSpec {
+                id: GroupId(0),
+                gain: audio_core::Gain::UNITY,
+                follow_master: false,
+                output: OutputId(0),
+                input_format: mono(48_000),
+                dsp: Vec::new(),
+                duck: None,
+                spatial: false,
+                mute: false,
+            }],
+            outputs: vec![audio_core::OutputSpec { id: OutputId(0), format: mono(48_000) }],
+        };
+        let mixer = Mixer::new(&topology, 8).unwrap();
+        let ring_fill = Arc::new(vec![RingGauge {
+            fill_permille: AtomicU32::new(0),
+            active: AtomicBool::new(false),
+            applied_ratio_bits: AtomicU64::new(1.0f64.to_bits()),
+        }]);
+        let mut output_index_of = HashMap::new();
+        output_index_of.insert(OutputId(0), 0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(vec![]));
+
+        let args = MixerThreadArgs {
+            max_block_frames: 8,
+            persistent: Arc::clone(&persistent),
+            ring_fill: Arc::clone(&ring_fill),
+            output_index_of,
+            stop: Arc::clone(&stop),
+            sys,
+            duck_depth_db: Arc::new(vec![AtomicU32::new(0)]),
+            limiter_engaged: Arc::new(vec![AtomicU64::new(0)]),
+            group_peak: Arc::new(vec![AtomicU64::new(0)]),
+            output_peak: Arc::new(vec![AtomicU64::new(0)]),
+            capture_rx,
+        };
+        let handle = thread::spawn(move || mixer_loop(mixer, group_consumers, output_producers, args));
+
+        sleep(Duration::from_millis(30)); // comfortably before MIXER_FALLBACK_INTERVAL
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+
+        assert!(
+            ring_fill[0].active.load(Ordering::Relaxed),
+            "both pids' full blocks must have been drained together on the first tick"
+        );
+        let applied = f64::from_bits(ring_fill[0].applied_ratio_bits.load(Ordering::Relaxed));
+        assert_eq!(applied, 1.05, "the queued command must also have applied in that same tick");
+    }
+
+    #[test]
+    fn stopping_a_parked_mixer_joins_promptly_not_after_the_fallback_interval() {
+        // Regression (review finding, 2026-07-24): `stop_running_graph` must
+        // wake the mixer right after setting `stop`, or shutdown/rebuild
+        // silently waits up to MIXER_FALLBACK_INTERVAL to notice — nothing
+        // else in this harness (no render/capture threads at all, an empty
+        // topology) would ever wake it otherwise.
+        let empty_topology =
+            Topology { master: audio_core::Gain::UNITY, groups: Vec::new(), outputs: Vec::new() };
+        let mixer = Mixer::new(&empty_topology, 8).unwrap();
+        let group_consumers: GroupConsumers = Vec::new();
+        let output_producers: OutputProducers = Vec::new();
+        let (_capture_tx, capture_rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(vec![]));
+
+        let args = MixerThreadArgs {
+            max_block_frames: 8,
+            persistent: bare_persistent(&snapshot()),
+            ring_fill: Arc::new(Vec::new()),
+            output_index_of: HashMap::new(),
+            stop: Arc::clone(&stop),
+            sys,
+            duck_depth_db: Arc::new(Vec::new()),
+            limiter_engaged: Arc::new(Vec::new()),
+            group_peak: Arc::new(Vec::new()),
+            output_peak: Arc::new(Vec::new()),
+            capture_rx,
+        };
+        let handle = thread::spawn(move || mixer_loop(mixer, group_consumers, output_producers, args));
+        let waker = MixerWaker(handle.thread().clone());
+        sleep(Duration::from_millis(10)); // let it complete its first tick and park
+
+        let start = std::time::Instant::now();
+        stop.store(true, Ordering::Relaxed);
+        waker.wake(); // the fix under test: stop_running_graph now does this too
+        handle.join().unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < MIXER_FALLBACK_INTERVAL / 2,
+            "stopping a parked mixer must join promptly via wake(), not wait for the fallback interval, got {elapsed:?}"
+        );
     }
 
     // --- Recovery supervisor integration tests. These run the real

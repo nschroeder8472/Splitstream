@@ -1,74 +1,16 @@
 # Review Log
 
-## 2026-07-22 — level-meters, full implementation
-- **Scope**: 5 files (audio-core meter.rs new + mixer.rs taps, engine runtime.rs telemetry + StatsReader, engine graph.rs output-name map, app ui.rs widgets + main.rs handoff) — domain + engine + shell
-- **Atoms**: clean-code, architecture, DDD, test-quality (secure-coding skipped — read-only telemetry, no trust boundary)
-- **Result**: 0 critical, 1 warning, 3 suggestion — labels-warning fixed same session; re-review of working tree confirmed no correctness/concurrency defects; open items (widget DRY between `level_meter`/`output_meter_row`, unbounded `holds` map, per-frame double-clone of stats vecs into locals) left as optional
-- **Key findings**: master-column output-meter labels reproduced the engine's `OutputId` order from `snapshot.groups`, which mislabels every device after a parked group during a device-loss episode (values correct, names wrong) — fixed by exposing a real `OutputId → name` map from `graph::resolve` through `EngineStats.output_names`; regression test added for the parked-earlier-group case
-- **Strengths**: rides the existing RT-atomic→EngineStats→poll telemetry path with zero new transport (domain stays transport-free); idle-freeze trap caught with `observe_silence`; peak+clip packed into one `AtomicU64` (no torn pair); egui 0.35 painter APIs verified against vendored source before writing; strong AAA tests incl. silence-paths-agree invariant
-
-## 2026-07-22 — responsive-ui-refinement, full implementation
-- **Scope**: 3 files (ui.rs main delta, lifecycle.rs/logging.rs minor fixes), single shell layer
-- **Atoms**: clean-code, test-quality (architecture/DDD/secure-coding skipped — single-file/layer, no domain, no trust boundary)
-- **Result**: 1 critical/warning borderline, 0 warning, 1 suggestion — both fixed same session
-- **Key findings**: `speaker_mute_button`'s cone was one 6-point `convex_polygon` call, but the combined body+horn outline has a reflex vertex at the seam (verified via cross-product sign flip: `-42,+140,+140,-42,+36,+36`) — epaint's fill is convex-only, so the concave shape rendered incorrectly; split into two convex calls (rect body + horn quad). `Screen`'s unused `PartialEq` derive dropped (only `matches!` used, never `==`).
-- **Strengths**: every L4 contract implemented with zero deviation from approved design; 8 new unit tests hit both clamp bounds plus pass-through/zero-column edge cases; `Shape`/`Painter` constructor signatures verified against vendored egui 0.35 source rather than memory; `cargo clippy -p app --tests -- -D warnings` and 39/39 tests clean throughout
-
-## 2026-07-22 — session-mute-on-capture, full implementation
-- **Scope**: 4 files (ports/mod.rs, ports/mock.rs, routing.rs, win-audio/sessions.rs) — application+infrastructure layers
-- **Atoms**: clean-code, architecture, secure-coding, test-quality (DDD skipped — no domain-folder files touched)
-- **Result**: 0 critical, 0 warning, 0 suggestion
-- **Key findings**: none survived — matches L4 contracts verbatim, mute strictly follows confirmed capture success, mute failure correctly isolated from `RoutingDegraded`
-- **Strengths**: all 4 L3 flows plus the negative (failed-capture-never-muted) case covered by tests; 94/94 engine tests + full workspace build clean
-
-## 2026-07-22 — mixer-ui-redesign, settings window column layout + drag-and-drop
-- **Scope**: 4 files (routing.rs, event_pump.rs, main.rs wiring, ui.rs full rewrite), engine+shell layers
-- **Atoms**: clean-code, architecture, test-quality
-- **Result**: 0 critical, 1 warning (resolved: confirmed intentional), 1 suggestion (fixed)
-- **Key findings**: Master's Mute checkbox moved behind gear icon by inferred symmetry, not mockup-dictated — user confirmed keep-as-is; one test's input data never actually exercised the glob-rule-survives-unassign path it claimed to test
-- **Strengths**: `resolve_drag_assign`'s full target×has_exact branch matrix independently tested; egui 0.35 dnd API verified against real vendored source, zero compile-fix churn across all 3 layers
-
-## 2026-07-22 — process-loopback-capture, full architecture pivot
-- **Scope**: 22 files (4 new, 2 deleted) across engine/win-audio/control/app, all layers
-- **Atoms**: clean-code, architecture, secure-coding, test-quality
-- **Result**: 0 critical, 1 warning, 1 suggestion
-- **Key findings**: spec `## Links` says §9.5 (virtual driver) is eliminated, but §2.2/§9.5 body/§13/§15 open-question text still describes BYOD as active; `Dispatcher::set_current` double-locks `ui` mutex unnecessarily
-- **Strengths**: async completion-callback given a bounded timeout, lock scope kept off the blocking WASAPI activation call, and a dead-capture-thread reap/retry path — all three real-hardware review findings from the prior session, already fixed before this review; `cargo check`/`cargo test --workspace` clean (87+ engine tests)
-
-## 2026-07-21 — simple-launch, installer/splitstream.iss
-- **Scope**: 1 file (new), build-artifact layer (no code)
-- **Atoms**: clean-code, architecture, secure-coding
-- **Result**: 0 critical, 0 warning, 0 suggestion
-- **Key findings**: none survived — verified `ArchitecturesInstallIn64BitMode=x64compatible`, `RunOnceId`, GUID escaping against live docs rather than memory
-- **Strengths**: `runasoriginaluser` correctly used on both `[Run]` and `[UninstallRun]` for the elevated-installer/de-elevated-app split
-
-## 2026-07-21 — simple-launch, onboarding UI + bus-classification plumbing
-- **Scope**: 8 files (ui.rs, engine::AudioSystem/AppConfig, win-audio enumerator/monitor/system/sessions/lib) across domain/application/shell layers
-- **Atoms**: clean-code, architecture, secure-coding, test-quality
-- **Result**: 0 critical, 1 warning, 0 suggestion — fixed
-- **Key findings**: onboarding's `output_device` fallback could collide with the picked `bus_endpoint` (OS default output already being the virtual cable), silently failing the first post-onboarding rebuild
-- **Strengths**: proactively reused the prior review's "never hold a shared lock across a blocking call" fix in the new `BusMatch` enumerator code, unprompted
-
-## 2026-07-21 — simple-launch, control + app infra layers (in-progress)
-- **Scope**: 7 files (2 new) across control/app, application+shell layers
-- **Atoms**: clean-code, architecture, secure-coding, test-quality
-- **Result**: 0 critical, 1 warning, 2 suggestion — all fixed
-- **Key findings**: `Dispatcher::set_current` held the per-frame UI mutex across a blocking WASAPI `enumerate()` call; `write_atomic` duplicated verbatim between `config.rs`/`store.rs`; seed template's `schema_version` was a second hardcoded literal
-- **Strengths**: reused one `sys.enumerate()` call across `needs_onboarding`+`available_devices` instead of duplicating it; fatal-vs-non-fatal startup error classification matches the blueprint's Flow 5 exactly
-
-## 2026-07-19 — engine-core (P0–P1), full implementation
-- **Scope**: ~20 files across 5 crates, all layers (domain/application/infrastructure/shell)
-- **Atoms**: clean-code, architecture, domain-driven-design, secure-coding, test-quality
-- **Result**: 0 critical, 2 warning, 5 suggestion — all fixed
-- **Key findings**: `build_running_graph` bundled 5 responsibilities in one function; `mixer_loop` took 9 params behind a suppressed clippy lint; a test name claimed behavior it didn't assert
-- **Strengths**: clean acyclic dependency graph (verified via `cargo tree`), consistent RT-safety discipline with documented `unsafe impl Send` invariants, real-hardware smoke tests alongside 35 unit/integration tests
-
-## 2026-07-19 — channel-mixdown, full implementation
-- **Scope**: 10 files across audio-core/win-audio/engine, domain+infra+application layers
-- **Atoms**: clean-code, architecture, domain-driven-design, secure-coding, test-quality
-- **Result**: 0 critical, 1 warning, 0 suggestion — fixed
-- **Key findings**: `fold_targets`'s FL/FR/FC arms were unguarded, silently dropping audio for output layouts lacking all three, unlike the correctly-guarded BL/SL/BR/SR arms
-- **Strengths**: real-hardware validation against the exact motivating device (SteelSeries Sonar "Media" → `SURROUND_7_1`), zero-signature-change reuse of `Src`, DRY consolidation of a 3-site duplicated unsafe WASAPI parse
+## History
+- 2026-07-22 level-meters (full implementation) — 0 critical/1 warning/3 suggestion, warning fixed; `OutputId`-order mislabeling after a parked group fixed with a real name map
+- 2026-07-22 responsive-ui-refinement — 1 critical/warning borderline/0/1, both fixed; concave speaker-cone polygon (epaint convex-only) split into two convex calls
+- 2026-07-22 session-mute-on-capture — 0/0/0, clean; all 4 L3 flows plus the negative case covered
+- 2026-07-22 mixer-ui-redesign (drag-and-drop) — 0/1/1, warning confirmed intentional, suggestion fixed
+- 2026-07-22 process-loopback-capture (architecture pivot) — 0/1/1, spec-doc BYOD-still-described drift + `Dispatcher` double-lock fixed
+- 2026-07-21 simple-launch (installer) — 0/0/0, clean; Inno Setup flags verified against live docs
+- 2026-07-21 simple-launch (onboarding UI) — 0/1/0, `output_device`/`bus_endpoint` collision on first rebuild fixed
+- 2026-07-21 simple-launch (control+app infra) — 0/1/2, blocking-call-under-shared-lock + duplicated `write_atomic` fixed
+- 2026-07-19 engine-core (P0-P1) — 0/2/5, all fixed; `build_running_graph` SRP split + `mixer_loop` param-count cleanup
+- 2026-07-19 channel-mixdown — 0/1/0, unguarded FL/FR/FC fold arms fixed, real-hardware validated
 
 ## 2026-07-20 — drift-and-recovery (P2), full implementation
 - **Scope**: 12 files across engine/win-audio, application+infrastructure layers
@@ -160,3 +102,10 @@
 - **Result**: 1 warning — **fixed same session**
 - **Key findings**: `hit_test_handle` (nearest-handle-within-radius, the function every drag/click/scroll/remove routes through) had zero test coverage despite needing no egui frame — no test contract in the design doc covered it either. Added 3 tests, verified discriminating (swapped `min_by`/`max_by`, confirmed the nearest-picking test caught the swap). Independently re-traced whether `press_origin()`/`smooth_scroll_delta` being frame-global rather than per-widget could cross-contaminate multiple EQ stages' editors — confirmed safe, `hover_pos()` and the click/drag response flags are correctly per-widget-scoped.
 - **Strengths**: `eq_response_db` built directly on the real `Biquad::set_coeffs_peaking`, pinned by a test that measures an actual filtered sine wave rather than re-checking internal consistency; decision 13's stage-index bug fixed and regression-tested at both the store and shell layers independently; `SetEqBands` replaces the whole array rather than mutating in place, sidestepping the inline-array trap by construction rather than by reuse; zero scope creep across the largest diff this session block; 340 workspace tests green, clippy clean throughout
+
+## 2026-07-24 — mixer-demand-driven-wakeup, full implementation
+- **Scope**: 1 file (crates/engine/src/runtime.rs), engine orchestration layer only
+- **Atoms**: clean-code, test-quality (architecture/DDD/secure-coding skipped — single file/layer, no domain/trust-boundary touch)
+- **Result**: 1 warning, 1 suggestion — **both fixed same session**
+- **Key findings**: `stop_running_graph` set the mixer's `stop` flag but never called the new `MixerWaker::wake()`, so `EngineHandle::shutdown`/`apply_rebuild` (including automatic device-fault recovery) silently regressed from ~5-10ms join latency to up to `MIXER_FALLBACK_INTERVAL` (100ms) whenever nothing else happened to wake the mixer — a shutdown/rebuild exit path none of the design's Flows A-I named; fixed with one `wake()` call plus a new regression test (`stopping_a_parked_mixer_joins_promptly...`). `CaptureControl::apply_capture_sources` cloned `mixer_waker` once per pid inside a loop instead of once before it; hoisted.
+- **Strengths**: `mixer_loop`'s two hardest-to-test contracts (ticks immediately before any wake; drains every pending source in one tick) correctly asserted against `RingGauge.active` bookkeeping rather than mixed audio content, sidestepping the real `Src` resampler's genuine warm-up latency rather than fighting it; `park`/`unpark`'s token-persistence used for race-free, bounded wake-regression tests (`park_timeout` + elapsed-time assertion, never a bare hang-risk `park()`); 103/103 engine tests + full workspace green, clippy clean throughout
