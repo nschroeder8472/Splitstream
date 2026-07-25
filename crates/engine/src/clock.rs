@@ -46,6 +46,22 @@ struct OutputState {
     integ: f64,
 }
 
+/// The governor's (β, full-block-or-skip) sawtooth midpoint (audio-flow-
+/// control decision 7) — what `DriftController` should aim at, not the
+/// governor's own skip threshold. (β) leaves an output ring sawtoothing
+/// between `threshold_fill` and one block above it, so its *average* fill
+/// sits about half a block above the threshold; aiming the controller at the
+/// threshold itself would read a permanent positive error and hold a
+/// permanent negative ratio bias against the governor. Pure — computed, not
+/// estimated, and pinned by a test against the exact numbers decision 7
+/// worked out by hand.
+pub fn drift_target_fill(threshold_fill: f32, block_out_frames: usize, capacity_frames: usize) -> f32 {
+    if capacity_frames == 0 {
+        return threshold_fill;
+    }
+    threshold_fill + block_out_frames as f32 / (2.0 * capacity_frames as f32)
+}
+
 pub struct DriftController {
     cfg: DriftConfig,
     state: HashMap<OutputId, OutputState>,
@@ -86,8 +102,13 @@ impl DriftController {
                 state.integ -= err * tick_secs;
             }
 
-            // ring too full (err > 0) -> corr > 0 -> ratio > 1 -> resampler consumes faster.
-            let ratio = ResampleRatio::new(1.0 + corr)
+            // ring too full (err > 0) -> corr > 0 -> ratio < 1 (B7 fix).
+            // `SincFixedIn` consumes a FIXED input chunk and produces
+            // `chunk_in * ratio` output frames (audio-flow-control grounding,
+            // resample.rs's `Src::process`) — raising the ratio produces
+            // MORE output, filling an already-too-full ring further. A ring
+            // above target must drive the ratio below 1 to produce less.
+            let ratio = ResampleRatio::new(1.0 - corr)
                 .expect("max_correction configured within ResampleRatio's clamp range");
             cmds.push(MixerCommand::SetOutputRatio(*id, ratio));
         }
@@ -108,25 +129,29 @@ mod tests {
     }
 
     #[test]
-    fn overfull_ring_produces_a_ratio_above_one() {
+    fn drift_controller_lowers_the_ratio_when_the_ring_is_above_target() {
+        // B7: SincFixedIn produces chunk_in * ratio output frames, so an
+        // overfull ring must be corrected by producing LESS — a lower
+        // ratio — not more (replaces the old, inverted
+        // `overfull_ring_produces_a_ratio_above_one`).
         let mut ctrl = DriftController::new(&[OutputId(0)], cfg());
         let cmds = ctrl.tick(&[(OutputId(0), active(0.62))]);
         let MixerCommand::SetOutputRatio(id, ratio) = cmds[0] else {
             panic!("expected SetOutputRatio");
         };
         assert_eq!(id, OutputId(0));
-        assert!(ratio.value() > 1.0, "overfull ring must speed up consumption");
-        assert!(ratio.value() <= 1.0 + cfg().max_correction);
+        assert!(ratio.value() < 1.0, "overfull ring must produce less output to drain");
+        assert!(ratio.value() >= 1.0 - cfg().max_correction);
     }
 
     #[test]
-    fn underfull_ring_produces_a_ratio_below_one() {
+    fn drift_controller_raises_the_ratio_when_the_ring_is_below_target() {
         let mut ctrl = DriftController::new(&[OutputId(0)], cfg());
         let cmds = ctrl.tick(&[(OutputId(0), active(0.38))]);
         let MixerCommand::SetOutputRatio(_, ratio) = cmds[0] else {
             panic!("expected SetOutputRatio");
         };
-        assert!(ratio.value() < 1.0, "underfull ring must slow down consumption");
+        assert!(ratio.value() > 1.0, "underfull ring must produce more output to fill");
     }
 
     #[test]
@@ -145,7 +170,7 @@ mod tests {
             let MixerCommand::SetOutputRatio(_, ratio) = cmds[0] else {
                 panic!("expected SetOutputRatio");
             };
-            let corr = (ratio.value() - 1.0) as f32;
+            let corr = (1.0 - ratio.value()) as f32; // B7: ratio = 1 - corr now, not 1 + corr
             fill -= corr;
             let err = (fill - cfg().target_fill).abs();
             assert!(err <= initial_err * 1.1, "error must stay bounded, not diverge");
@@ -211,8 +236,8 @@ mod tests {
                 })
                 .unwrap()
         };
-        assert!(ratio_of(OutputId(0)) > 1.0);
-        assert!(ratio_of(OutputId(1)) < 1.0);
+        assert!(ratio_of(OutputId(0)) < 1.0, "overfull (0.9) must produce less output");
+        assert!(ratio_of(OutputId(1)) > 1.0, "underfull (0.1) must produce more output");
     }
 
     #[test]
@@ -220,5 +245,58 @@ mod tests {
         let mut ctrl = DriftController::new(&[OutputId(0)], cfg());
         let cmds = ctrl.tick(&[(OutputId(99), active(0.9))]);
         assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn src_produces_fewer_frames_at_a_lower_ratio() {
+        // B7's sign pinned against `Src`'s MEASURED behaviour, not just
+        // asserted from a reading of resample.rs (operational learnings:
+        // a design doc's stated mechanism has been wrong before even when
+        // the fix was right).
+        use audio_core::{Format, Src};
+        let fmt = Format {
+            sample_rate: 48_000,
+            channels: 2,
+            layout: audio_core::ChannelLayout::STEREO,
+        };
+        let block = 256;
+        let input = vec![0.0f32; block * 2];
+        let mut output = vec![0.0f32; block * 2 * 4];
+
+        let mut low = Src::new(fmt, fmt, block).unwrap();
+        low.set_ratio(ResampleRatio::new(0.99).unwrap());
+        let mut produced_low = 0usize;
+        for _ in 0..60 {
+            produced_low += low.process(&input, &mut output).produced;
+        }
+
+        let mut high = Src::new(fmt, fmt, block).unwrap();
+        high.set_ratio(ResampleRatio::new(1.01).unwrap());
+        let mut produced_high = 0usize;
+        for _ in 0..60 {
+            produced_high += high.process(&input, &mut output).produced;
+        }
+
+        assert!(
+            produced_low < produced_high,
+            "a lower ratio must yield fewer output frames than a higher one — \
+             the physical fact the drift correction's sign depends on \
+             (low={produced_low}, high={produced_high})"
+        );
+    }
+
+    #[test]
+    fn drift_target_fill_lands_on_the_governors_sawtooth_midpoint() {
+        // Decision 7's worked numbers (audio-flow-control): 48kHz stereo,
+        // 10ms device period -> RING_PERIOD_MARGIN=4 gives 1920-frame
+        // capacity; WAKE_MARGIN=1.25 + BLOCK_FRAME_MARGIN=8 gives a
+        // 608-frame block. Midpoint of the 960->1568 sawtooth is 1264/1920.
+        let target = drift_target_fill(0.5, 608, 1920);
+        assert!((target - 0.658_333).abs() < 0.001, "got {target}");
+    }
+
+    #[test]
+    fn drift_target_fill_falls_back_to_the_threshold_with_no_capacity() {
+        assert_eq!(drift_target_fill(0.5, 608, 0), 0.5);
     }
 }
