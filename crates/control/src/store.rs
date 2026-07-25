@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use toml_edit::{value, Array, ArrayOfTables, DocumentMut, Item, Table};
 
 use audio_core::{DspSpec, EqBandSpec, Gain, GroupId};
-use engine::{ConfigSnapshot, DuckSpecConfig, GroupConfig};
+use engine::{ConfigSnapshot, DspStageConfig, DuckSpecConfig, GroupConfig, ProfileConfig, ProfileGroupConfig};
 
 use crate::config::{parse, ConfigError};
 
@@ -59,6 +59,62 @@ pub enum ConfigEdit {
     /// `None`), the dispatcher reconciles `lifecycle::set_autostart` when
     /// `app.autostart` differs from the prior snapshot instead.
     SetAutostart(bool),
+    /// Replace a group's whole DSP chain in one structural edit (profiles.md
+    /// decision 9) — applying a profile needs this; no add/remove sequence
+    /// against the existing stage list is index-safe for a full replace.
+    SetDspChain(String, Vec<DspStageConfig>),
+    /// Upsert by name: overwrites an existing `[[profile]]` table with the
+    /// same name, or appends a new one (profiles.md — save vs. save-as share
+    /// this one edit).
+    SetProfile(ProfileConfig),
+    RemoveProfile(String),
+    /// `[app] active_profile` — `None` clears the key (profiles.md decision 5).
+    SetActiveProfile(Option<String>),
+}
+
+/// Which apply path an edit requires (profiles.md decision 12 — revises the
+/// draft `is_structural(&ConfigEdit) -> bool`: this codebase has four apply
+/// paths, not two, and a profile batch can mix them). `Dispatcher` computes
+/// this per edit to route a batch instead of each call site hardcoding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditPath {
+    /// Lock-free `MixerCommand` fast path, no rebuild.
+    Param,
+    /// Full engine graph rebuild — output device / group set changes.
+    Structural,
+    /// `EngineHandle::apply_spatial`'s off-RT build-and-swap.
+    Spatial,
+    /// `EngineHandle::apply_dsp_chains`'s off-RT build-and-swap.
+    DspChain,
+}
+
+/// Exhaustive by construction — a new `ConfigEdit` variant is a compile error
+/// here until classified, not a silent gap (profiles.md test contract).
+pub fn edit_path(edit: &ConfigEdit) -> EditPath {
+    match edit {
+        ConfigEdit::SetGroupGain(..)
+        | ConfigEdit::SetMaster(..)
+        | ConfigEdit::SetMuted(..)
+        | ConfigEdit::SetFollowMaster(..)
+        | ConfigEdit::SetGroupMute(..)
+        | ConfigEdit::SetRules(..)
+        | ConfigEdit::SetEqBand(..)
+        | ConfigEdit::SetLimiterCeiling(..)
+        | ConfigEdit::SetDuck(..)
+        | ConfigEdit::SetDspBypass(..)
+        | ConfigEdit::SetAutostart(..)
+        | ConfigEdit::SetProfile(..)
+        | ConfigEdit::RemoveProfile(..)
+        | ConfigEdit::SetActiveProfile(..) => EditPath::Param,
+        ConfigEdit::SetGroupOutput(..) | ConfigEdit::AddGroup(..) | ConfigEdit::RemoveGroup(..) => {
+            EditPath::Structural
+        }
+        ConfigEdit::SetSpatial(..) => EditPath::Spatial,
+        ConfigEdit::AddDspStage(..)
+        | ConfigEdit::RemoveDspStage(..)
+        | ConfigEdit::SetEqBands(..)
+        | ConfigEdit::SetDspChain(..) => EditPath::DspChain,
+    }
 }
 
 #[derive(Debug)]
@@ -246,6 +302,48 @@ fn apply_edit(doc: &mut DocumentMut, edit: &ConfigEdit) -> Result<(), StoreError
                 }
             }
         }
+        ConfigEdit::SetDspChain(name, dsp) => {
+            let group = find_group_table(doc, name)?;
+            // Full replace, same collapse as SetEqBands — immune to a prior
+            // inline-array shape and to index races between frames.
+            let mut arr = ArrayOfTables::new();
+            for stage in dsp {
+                let mut st = dsp_stage_table(&stage.spec);
+                st["bypassed"] = value(stage.bypassed);
+                arr.push(st);
+            }
+            group["dsp"] = Item::ArrayOfTables(arr);
+        }
+        ConfigEdit::SetProfile(profile) => {
+            let profiles = profiles_array(doc);
+            let index = profiles
+                .iter()
+                .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(profile.name.as_str()));
+            match index {
+                Some(i) => *profiles.get_mut(i).expect("index just found") = profile_table(profile),
+                None => profiles.push(profile_table(profile)),
+            }
+        }
+        ConfigEdit::RemoveProfile(name) => {
+            let profiles = profiles_array(doc);
+            let index = profiles
+                .iter()
+                .position(|t| t.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))
+                .ok_or_else(|| no_such_profile(name))?;
+            profiles.remove(index);
+        }
+        ConfigEdit::SetActiveProfile(name) => {
+            let app = doc["app"]
+                .or_insert(Item::Table(Table::new()))
+                .as_table_mut()
+                .ok_or_else(malformed_app_shape)?;
+            match name {
+                Some(n) => app["active_profile"] = value(n.as_str()),
+                None => {
+                    app.remove("active_profile");
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -255,6 +353,17 @@ fn groups_array(doc: &mut DocumentMut) -> &mut ArrayOfTables {
         .or_insert(toml_edit::Item::ArrayOfTables(ArrayOfTables::new()))
         .as_array_of_tables_mut()
         .expect("`group` key must hold an array of tables")
+}
+
+fn profiles_array(doc: &mut DocumentMut) -> &mut ArrayOfTables {
+    doc["profile"]
+        .or_insert(toml_edit::Item::ArrayOfTables(ArrayOfTables::new()))
+        .as_array_of_tables_mut()
+        .expect("`profile` key must hold an array of tables")
+}
+
+fn no_such_profile(name: &str) -> StoreError {
+    StoreError::Validation(ConfigError::Invalid(format!("no profile named {name:?}")))
 }
 
 /// Fallible, unlike `groups_array`: `dsp`/`bands`/`duck` are all keys a user
@@ -355,16 +464,60 @@ fn group_table(g: &GroupConfig) -> Table {
     t["spatial"] = value(g.spatial);
     t["muted"] = value(g.muted);
     t["match_rules"] = value(string_array(&g.match_rules));
-    if !g.dsp.is_empty() {
+    write_dsp_stages(&mut t, &g.dsp);
+    write_duck(&mut t, g.duck.as_ref());
+    t
+}
+
+fn profile_table(p: &ProfileConfig) -> Table {
+    let mut t = Table::new();
+    t["name"] = value(p.name.as_str());
+    if let Some(h) = &p.hotkey {
+        t["hotkey"] = value(h.to_string());
+    }
+    t["master"] = value(p.master.value() as f64);
+    t["muted"] = value(p.muted);
+    if !p.groups.is_empty() {
         let mut arr = ArrayOfTables::new();
-        for stage in &g.dsp {
+        for g in &p.groups {
+            arr.push(profile_group_table(g));
+        }
+        t["group"] = Item::ArrayOfTables(arr);
+    }
+    t
+}
+
+fn profile_group_table(g: &ProfileGroupConfig) -> Table {
+    let mut t = Table::new();
+    t["name"] = value(g.name.as_str());
+    t["output_device"] = value(g.output_device.as_str());
+    t["gain"] = value(g.gain.value() as f64);
+    t["follow_master"] = value(g.follow_master);
+    t["spatial"] = value(g.spatial);
+    t["muted"] = value(g.muted);
+    write_dsp_stages(&mut t, &g.dsp);
+    write_duck(&mut t, g.duck.as_ref());
+    t
+}
+
+/// Shared by [`group_table`] and [`profile_group_table`] — both carry the
+/// same `[[.dsp]]` shape.
+fn write_dsp_stages(t: &mut Table, dsp: &[DspStageConfig]) {
+    if !dsp.is_empty() {
+        let mut arr = ArrayOfTables::new();
+        for stage in dsp {
             let mut st = dsp_stage_table(&stage.spec);
             st["bypassed"] = value(stage.bypassed);
             arr.push(st);
         }
         t["dsp"] = Item::ArrayOfTables(arr);
     }
-    if let Some(d) = &g.duck {
+}
+
+/// Shared by [`group_table`] and [`profile_group_table`] — both carry the
+/// same optional `.duck` shape.
+fn write_duck(t: &mut Table, duck: Option<&DuckSpecConfig>) {
+    if let Some(d) = duck {
         let mut dt = Table::new();
         dt["trigger"] = value(d.trigger.as_str());
         dt["amount_db"] = value(d.amount_db as f64);
@@ -373,7 +526,6 @@ fn group_table(g: &GroupConfig) -> Table {
         dt["release_ms"] = value(d.release_ms as f64);
         t["duck"] = Item::Table(dt);
     }
-    t
 }
 
 fn string_array(items: &[String]) -> Array {
@@ -384,6 +536,7 @@ fn string_array(items: &[String]) -> Array {
 mod tests {
     use super::*;
     use audio_core::Gain;
+    use engine::HotkeyChord;
 
     fn write_file(dir: &std::path::Path, text: &str) -> PathBuf {
         let path = dir.join("splitstream.toml");
@@ -828,5 +981,168 @@ dsp = [{ type = "limiter", ceiling_db = -1.0 }]
             DspSpec::Limiter { ceiling_db: -2.0 },
         )]);
         assert!(matches!(result, Err(StoreError::Validation(_))));
+    }
+
+    #[test]
+    fn set_dsp_chain_replaces_the_whole_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        store
+            .apply(&[ConfigEdit::AddDspStage(
+                "Game".into(),
+                DspSpec::Limiter { ceiling_db: -1.0 },
+            )])
+            .unwrap();
+
+        let new_chain = vec![engine::DspStageConfig {
+            spec: DspSpec::Eq { bands: vec![EqBandSpec { freq_hz: 500.0, gain_db: 2.0, q: 1.0 }] },
+            bypassed: true,
+        }];
+        let snapshot = store.apply(&[ConfigEdit::SetDspChain("Game".into(), new_chain)]).unwrap();
+
+        assert_eq!(snapshot.groups[0].dsp.len(), 1, "old limiter stage replaced, not appended to");
+        match &snapshot.groups[0].dsp[0].spec {
+            DspSpec::Eq { bands } => assert_eq!(bands[0].freq_hz, 500.0),
+            other => panic!("expected the replacement Eq stage, got {other:?}"),
+        }
+        assert!(snapshot.groups[0].dsp[0].bypassed);
+    }
+
+    fn sample_profile(name: &str) -> ProfileConfig {
+        ProfileConfig {
+            name: name.into(),
+            hotkey: Some(HotkeyChord::parse("Ctrl+Alt+1").unwrap()),
+            master: Gain::new(0.8).unwrap(),
+            muted: false,
+            groups: vec![ProfileGroupConfig {
+                name: "Game".into(),
+                gain: Gain::new(0.5).unwrap(),
+                follow_master: true,
+                output_device: "Headphones".into(),
+                dsp: Vec::new(),
+                duck: None,
+                spatial: true,
+                muted: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn set_profile_round_trips_through_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let snapshot = store.apply(&[ConfigEdit::SetProfile(sample_profile("Gaming"))]).unwrap();
+
+        assert_eq!(snapshot.profiles.len(), 1);
+        let p = &snapshot.profiles[0];
+        assert_eq!(p.name, "Gaming");
+        assert_eq!(p.hotkey, Some(HotkeyChord::parse("Ctrl+Alt+1").unwrap()));
+        assert_eq!(p.master, Gain::new(0.8).unwrap());
+        assert_eq!(p.groups[0].output_device, "Headphones");
+        assert!(p.groups[0].spatial);
+
+        // Re-applying with the same name upserts in place, not a duplicate.
+        let mut updated = sample_profile("Gaming");
+        updated.master = Gain::UNITY;
+        let snapshot = store.apply(&[ConfigEdit::SetProfile(updated)]).unwrap();
+        assert_eq!(snapshot.profiles.len(), 1, "SetProfile upserts by name");
+        assert_eq!(snapshot.profiles[0].master, Gain::UNITY);
+    }
+
+    #[test]
+    fn remove_profile_leaves_other_profiles_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        store
+            .apply(&[
+                ConfigEdit::SetProfile(sample_profile("Gaming")),
+                ConfigEdit::SetProfile(sample_profile("Music")),
+            ])
+            .unwrap();
+
+        let snapshot = store.apply(&[ConfigEdit::RemoveProfile("Gaming".into())]).unwrap();
+        assert_eq!(snapshot.profiles.len(), 1);
+        assert_eq!(snapshot.profiles[0].name, "Music");
+    }
+
+    #[test]
+    fn remove_profile_for_an_unknown_name_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let result = store.apply(&[ConfigEdit::RemoveProfile("Nonexistent".into())]);
+        assert!(matches!(result, Err(StoreError::Validation(_))));
+    }
+
+    #[test]
+    fn set_active_profile_then_clear_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let snapshot = store
+            .apply(&[ConfigEdit::SetActiveProfile(Some("Gaming".into()))])
+            .unwrap();
+        assert_eq!(snapshot.app.active_profile, Some("Gaming".to_string()));
+
+        let snapshot = store.apply(&[ConfigEdit::SetActiveProfile(None)]).unwrap();
+        assert_eq!(snapshot.app.active_profile, None);
+    }
+
+    #[test]
+    fn every_config_edit_variant_has_an_edit_path() {
+        // Regression for decision 12: the classifier is a plain `match` with
+        // no wildcard arm, so a new `ConfigEdit` variant is a compile error
+        // here until classified. This test pins the actual classification
+        // per group, not just that one exists.
+        let structural = [
+            ConfigEdit::SetGroupOutput("g".into(), "d".into()),
+            ConfigEdit::AddGroup(GroupConfig {
+                name: "g".into(),
+                output_device: "d".into(),
+                gain: Gain::UNITY,
+                follow_master: true,
+                match_rules: vec![],
+                dsp: Vec::new(),
+                duck: None,
+                spatial: false,
+                muted: false,
+            }),
+            ConfigEdit::RemoveGroup("g".into()),
+        ];
+        for edit in &structural {
+            assert_eq!(edit_path(edit), EditPath::Structural);
+        }
+
+        assert_eq!(edit_path(&ConfigEdit::SetSpatial("g".into(), true)), EditPath::Spatial);
+
+        let dsp_chain = [
+            ConfigEdit::AddDspStage("g".into(), DspSpec::Limiter { ceiling_db: -1.0 }),
+            ConfigEdit::RemoveDspStage("g".into(), 0),
+            ConfigEdit::SetEqBands("g".into(), 0, vec![]),
+            ConfigEdit::SetDspChain("g".into(), vec![]),
+        ];
+        for edit in &dsp_chain {
+            assert_eq!(edit_path(edit), EditPath::DspChain);
+        }
+
+        let param = [
+            ConfigEdit::SetGroupGain("g".into(), Gain::UNITY),
+            ConfigEdit::SetMaster(Gain::UNITY),
+            ConfigEdit::SetMuted(true),
+            ConfigEdit::SetProfile(sample_profile("Gaming")),
+            ConfigEdit::RemoveProfile("g".into()),
+            ConfigEdit::SetActiveProfile(None),
+        ];
+        for edit in &param {
+            assert_eq!(edit_path(edit), EditPath::Param);
+        }
     }
 }

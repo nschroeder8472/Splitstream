@@ -2,7 +2,7 @@
 feature: profiles
 requirement_doc: null
 created: 2026-07-22
-status: approved
+status: complete
 note: >
   Roadmap Priority 5 (.lattice/ux-gap-roadmap.md). Named profiles capturing
   per-group state, switchable from the tray, the settings window, and an
@@ -396,3 +396,63 @@ dirty-state semantics (decision 2), storage location (decision 3), whether
 **Gaps found while designing** -- no edit could replace a group's DSP chain
 (decision 9), and the structural/param choice lived only at call sites, which a
 mixed profile batch cannot use (decisions 10 and 12).
+
+## Implementation (2026-07-24)
+
+**Status: complete.** All four layers built inside-out, reviewed
+layer-by-layer, full workspace green (`cargo test --workspace`: 369 passed, 0
+failed; `cargo clippy --workspace --all-targets`: clean).
+
+**Key files**
+
+| File | Layer | What |
+|---|---|---|
+| `crates/engine/src/graph.rs` | orchestration | `ProfileConfig`, `ProfileGroupConfig`, `ConfigSnapshot.profiles`, `AppConfig.active_profile`, `HotkeyChord: Display` (gap, see below) |
+| `crates/control/src/config.rs` | control | `RawProfile`/`RawProfileGroup`, `convert_profile`, `active_profile` parsing |
+| `crates/control/src/store.rs` | control | `EditPath`/`edit_path`, `SetDspChain`/`SetProfile`/`RemoveProfile`/`SetActiveProfile` + writers, `profile_table`/`profile_group_table`, shared `write_dsp_stages`/`write_duck` (refactored out of `group_table`) |
+| `crates/control/src/profiles.rs` | control | `apply_profile`, `capture_profile`, `profile_is_modified` — all 8 L4 test contracts |
+| `crates/app/src/main.rs` | shell | `ShellAction::ApplyProfile`, `Dispatcher::apply_profile_action` |
+| `crates/app/src/hotkeys.rs` | shell | `spawn_hotkeys` generalized to N chords via `HotkeyAction` enum |
+| `crates/app/src/tray.rs` | shell | Profile submenu, `MenuIds.profiles: HashMap<MenuId, String>` |
+| `crates/app/src/ui.rs` | UI | `profile_bar`, `ProfileCommand`, `SettingsApp::handle_profile_command` |
+
+**Implementation decisions (not in the original L1-L4, found while building)**
+
+1. **`apply_profile` diffs against live state field-by-field rather than
+   unconditionally emitting all seven per-group edits.** The L3 pseudocode
+   read as "build the edit list, then classify the batch," but an
+   unconditional emit would always include `SetGroupOutput` (even when the
+   output device didn't change), which `edit_path` classifies `Structural`
+   — forcing a full rebuild on *every* switch, including a pure gain
+   change. Diffing target vs. current and emitting only the edits for
+   fields that actually differ is what makes decision 10 (`a-gain-only-
+   profile-emits-only-param-path-edits`) true, and it's also exactly what
+   makes `capture_then_apply_is_a_no_op` a real no-op rather than a batch
+   of redundant same-value writes.
+2. **`capture_profile` preserves an existing same-named profile's `hotkey`.**
+   The L4 signature (`capture_profile(snapshot, name) -> ProfileConfig`) has
+   no hotkey parameter, but `snapshot.profiles` already contains the prior
+   entry if one exists — looked up by name and copied forward. Without this,
+   clicking "Save" on a profile with a bound hotkey would silently clear the
+   binding every time.
+3. **`HotkeyChord` gained a `Display` impl** (`"Ctrl+Alt+1"`, inverse of
+   `parse`) — needed to write `hotkey = "..."` in `profile_table`'s TOML
+   writer; there was no existing formatter anywhere in the codebase.
+4. **`profile_bar` is reachable even with zero profiles configured** — L1
+   capability 1 says a config with none behaves byte-for-byte as today, but
+   capability 8 ("save current state as a new profile") needs a UI entry
+   point that exists *before* any profile does. The switcher-buttons row is
+   naturally empty in that case; the "Save As" field is always present.
+5. **Save/Revert/Delete act on the active profile only** — not a
+   per-profile context menu. Judgment call, not in L1-L4; consistent with
+   Save/Revert already being active-profile-scoped, and the simpler of the
+   two options. Deleting a different profile means switching to it first.
+
+## Not yet designed (unchanged)
+
+`external-controls.md` and `visual-identity.md` remain next in
+`ux-implementation-order.md`; `external-controls` depends on this feature's
+hotkey/tray infrastructure (merge point 6↔7 in that doc — build its
+`spawn_hotkeys(&[HotkeyBinding])`/`TrayModel` shape, not profiles' `(map,
+profiles, actions)` signature this session used, which is profiles-only and
+superseded per that doc's explicit instruction).

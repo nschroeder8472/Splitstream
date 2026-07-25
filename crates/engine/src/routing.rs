@@ -414,6 +414,7 @@ mod tests {
             master: audio_core::Gain::UNITY,
             muted: false,
             app: crate::graph::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![],
         };
         let handle = runtime::start(&snapshot, sys).unwrap();
@@ -581,6 +582,7 @@ mod tests {
             master: audio_core::Gain::UNITY,
             muted: false,
             app: crate::graph::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![],
         };
         let engine = runtime::start(&snapshot, sys).unwrap();
@@ -665,6 +667,7 @@ mod tests {
             master: audio_core::Gain::UNITY,
             muted: false,
             app: crate::graph::AppConfig::default(),
+            profiles: Vec::new(),
             groups: vec![],
         };
         let engine = runtime::start(&snapshot, sys).unwrap();

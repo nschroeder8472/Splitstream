@@ -120,6 +120,7 @@ mod tests {
             muted: false,
             groups: vec![],
             app: engine::AppConfig::default(),
+            profiles: Vec::new(),
         }
     }
 
