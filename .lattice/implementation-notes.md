@@ -322,33 +322,46 @@ impl EnvFollower {
 
 ---
 
-## 13. Undocumented COM (routing + endpoint hiding)
+## 13. Undocumented COM — setting the Windows default endpoint
 
-**Where:** `crates/win-audio/src/router.rs`, behind `#[cfg(feature = "policy-routing")]`.
-**Why:** no SDK headers exist. Declare vtables by hand with `windows::core::interface`. **Every GUID and method slot below MUST be verified against the EarTrumpet source (github.com/File-New-Project/EarTrumpet) before use — do not trust these from memory, wrong slot order = crash.**
+**Where:** `crates/win-audio/src/policy.rs` (no feature gate — double-audio-prevention
+capability 4 depends on it unconditionally).
+**Why:** Windows exposes no supported way to change the default playback device.
+**Superseded:** the old per-app-routing/endpoint-hiding sketch that lived here declared
+**2** methods and put `SetDefaultEndpoint` first. The real interface has **12** own
+vtable slots with `SetDefaultEndpoint` at **11** — calling the old sketch's first slot
+invokes `Unused1`, and a skipped slot shifts every later method: memory corruption, not
+an error code. The note carried its own "⚠ VERIFY" marker and was trusted anyway once
+already. Both GUIDs and the slot order below were re-derived 2026-07-26 from EarTrumpet's
+`Interop/MMDeviceAPI/IPolicyConfig.cs` and `PolicyConfigClient.cs`.
 
 ```rust
-// PATTERN (verify GUIDs + exact vtable order against EarTrumpet):
-use windows::core::{interface, IUnknown, GUID, HRESULT, PCWSTR};
-
-#[interface("f8679f50-850a-41cf-9c72-430f290290c8")]   // ⚠ VERIFY against EarTrumpet IPolicyConfig
-unsafe trait IPolicyConfig: IUnknown {
-    // ⚠ Slots 3..N: unused methods still occupy vtable slots — declare them ALL,
-    // in order, as `unsafe fn _slotN(&self) -> HRESULT;` placeholders. Skipping one
-    // shifts every later method = memory corruption, not an error code.
-    unsafe fn set_default_endpoint(&self, device_id: PCWSTR, role: u32) -> HRESULT;
-    unsafe fn set_endpoint_visibility(&self, device_id: PCWSTR, visible: i32) -> HRESULT;
+// VERIFIED 2026-07-26 against EarTrumpet source — this is the real layout, not a sketch.
+#[interface("f8679f50-850a-41cf-9c72-430f290290c8")]     // IPolicyConfig (Win7+)
+unsafe trait IPolicyConfigWin7: IUnknown {
+    unsafe fn _unused1(&self) -> HRESULT;                //  1..8: unused, MUST be declared
+    unsafe fn _unused2(&self) -> HRESULT;
+    unsafe fn _unused3(&self) -> HRESULT;
+    unsafe fn _unused4(&self) -> HRESULT;
+    unsafe fn _unused5(&self) -> HRESULT;
+    unsafe fn _unused6(&self) -> HRESULT;
+    unsafe fn _unused7(&self) -> HRESULT;
+    unsafe fn _unused8(&self) -> HRESULT;
+    unsafe fn _get_property_value(&self) -> HRESULT;     //  9
+    unsafe fn _set_property_value(&self) -> HRESULT;     // 10
+    unsafe fn set_default_endpoint(&self, id: PCWSTR, role: i32) -> HRESULT;  // 11 — the only one called
+    unsafe fn _set_endpoint_visibility(&self) -> HRESULT;// 12
 }
-
-// AudioPolicyConfig (per-app routing, Win10 1803+): activated via WinRT activation factory
-// name "Windows.Media.Internal.AudioPolicyConfig" — id format for SetPersistedDefaultAudioEndpoint
-// is the MMDevice id wrapped as "\\\\?\\SWD#MMDEVAPI#{id}#{GUID}" (EarTrumpet AudioPolicyConfigService).
-// Interface IID CHANGED between Windows builds (pre/post 21H2) — EarTrumpet carries TWO IIDs and
-// tries both. Replicate that: try new IID, fall back to old, else PolicyError::Unavailable.
-
-// EVERY call: HRESULT != S_OK → return PolicyError::Failed / Unavailable. NEVER panic, never retry
-// (coordinator handles degradation — one notice, skip further calls).
+// CPolicyConfigClient CLSID: 870af99c-171d-4f9e-af0d-e63df40c2bc9
+// Call once per role: eConsole, eMultimedia, eCommunications. Skipping eCommunications
+// leaves Discord-class apps rendering to the real device — the exact double this removes.
+// EVERY call: HRESULT != S_OK -> PortError::Backend. NEVER panic, never retry.
+// Every role is attempted even after one fails; the first error is returned at the end.
 ```
+
+**Gone with the tap-vs-transport reframing:** `IAudioPolicyConfigFactory` /
+`SetPersistedDefaultAudioEndpoint` (per-app redirect) and endpoint hiding. With the
+default pointed at one unheard sink, no per-app endpoint assignment is needed at all.
 
 ---
 

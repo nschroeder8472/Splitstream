@@ -27,7 +27,7 @@ use std::time::Duration;
 use eframe::egui;
 
 use audio_core::{db_to_linear, linear_to_db, DspSpec, EqBandSpec, Gain, GroupId, MeterLevel, OutputId};
-use control::ConfigEdit;
+use control::{groups_outputting_to_sink, lacks_catch_all, quit_would_strand, ConfigEdit, SinkStatus};
 use engine::ports::Endpoint;
 use engine::{
     AccentChoice, DuckSpecConfig, GroupConfig, MatchKind, MatchRule, ProfileConfig, RoutedSession, RoutingReader,
@@ -113,6 +113,10 @@ struct GroupColumnCtx<'a> {
     /// a clone of `SettingsApp.search`, threaded through rather than borrowed,
     /// so it doesn't hold `self` borrowed across the `&mut self` column calls.
     query: &'a str,
+    /// `[app] volume_bind` — which target the hardware volume keys currently
+    /// drive (double-audio-prevention capability 5). `Master` reads this off
+    /// its own `snapshot`; group columns get it threaded through here.
+    volume_bind: Option<&'a str>,
 }
 
 /// Read-only data `master_column` needs besides `self`/`ui` — bundled once the
@@ -154,6 +158,7 @@ struct Frame {
     available_devices: Vec<Endpoint>,
     default_output_name: Option<String>,
     rebuild_generation: u64,
+    sink_status: SinkStatus,
 }
 
 /// Which page `SettingsApp` is currently showing (responsive-ui-refinement
@@ -347,6 +352,7 @@ impl SettingsApp {
             available_devices: state.available_devices.clone(),
             default_output_name: state.default_output_name.clone(),
             rebuild_generation: state.rebuild_generation,
+            sink_status: state.sink_status.clone(),
         }
     }
 }
@@ -419,6 +425,7 @@ impl eframe::App for SettingsApp {
             available_devices,
             default_output_name,
             rebuild_generation,
+            sink_status,
         } = self.take_frame();
         clear_solo_on_rebuild(&mut self.soloed, &mut self.seen_generation, rebuild_generation);
 
@@ -463,6 +470,40 @@ impl eframe::App for SettingsApp {
                 }
 
                 ui.heading("Splitstream");
+
+                // Capability 3/6: the sink's state, and what to do about it,
+                // above everything else — while it is wrong the whole product
+                // is either doubling or silent, which no fader explains.
+                self.sink_banner(
+                    ui,
+                    &sink_status,
+                    snapshot.app.previous_default.as_deref(),
+                    &available_devices,
+                );
+                // Capability 2: with the default pointed at the sink, an app
+                // no rule matches is inaudible rather than merely unprocessed.
+                if lacks_catch_all(&snapshot) {
+                    let sem = theme::semantic(egui::Theme::from_dark_mode(ui.visuals().dark_mode));
+                    ui.colored_label(
+                        sem.warning,
+                        "No group has a \"*\" rule — apps that match nothing will be silent.",
+                    );
+                    ui.separator();
+                }
+                // A group pointed at the sink renders into the endpoint nobody
+                // listens to. It produces no error anywhere, just silence.
+                let on_sink = groups_outputting_to_sink(&snapshot, snapshot.app.sink_device.as_deref());
+                if !on_sink.is_empty() {
+                    let sem = theme::semantic(egui::Theme::from_dark_mode(ui.visuals().dark_mode));
+                    ui.colored_label(
+                        sem.warning,
+                        format!(
+                            "{} outputs to the sink device — that group is inaudible. Point it at a real device.",
+                            on_sink.join(", ")
+                        ),
+                    );
+                    ui.separator();
+                }
 
                 // Profile bar (profiles.md) — always reachable (even with
                 // zero profiles configured) so "save current state as a new
@@ -516,6 +557,7 @@ impl eframe::App for SettingsApp {
                     width,
                     fader_height: height,
                     query: &query,
+                    volume_bind: snapshot.app.volume_bind.as_deref(),
                 };
                 egui::ScrollArea::horizontal().show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -577,7 +619,12 @@ impl eframe::App for SettingsApp {
                 }
             }
             Screen::MasterSettings => {
-                self.master_settings_page(ui, &snapshot.app.excluded);
+                self.master_settings_page(
+                    ui,
+                    &snapshot.app.excluded,
+                    snapshot.app.sink_device.as_deref(),
+                    &available_devices,
+                );
             }
         });
     }
@@ -669,6 +716,10 @@ impl SettingsApp {
                     self.send(ShellAction::EditParams(vec![ConfigEdit::SetMuted(!snapshot.muted)]));
                 }
 
+                if let Some(edit) = volume_keys_toggle(ui, snapshot.app.volume_bind.as_deref(), MASTER_BIND, true) {
+                    self.send(ShellAction::EditParams(vec![edit]));
+                }
+
                 // Per-output device meters (level-meters.md): one row per
                 // distinct output device, labeled by name (positional against
                 // `EngineStats::output_peak`). These read silent under master
@@ -719,8 +770,18 @@ impl SettingsApp {
     /// to `ctx.fader_height`, "Routed Apps" footer as a drop zone
     /// (mixer-ui-redesign L2/L3).
     fn group_column(&mut self, ui: &mut egui::Ui, group: &GroupConfig, id: GroupId, ctx: &GroupColumnCtx) {
-        let GroupColumnCtx { routes, all_sessions, all_groups, excluded, devices, group_peak, width, fader_height, query } =
-            *ctx;
+        let GroupColumnCtx {
+            routes,
+            all_sessions,
+            all_groups,
+            excluded,
+            devices,
+            group_peak,
+            width,
+            fader_height,
+            query,
+            volume_bind,
+        } = *ctx;
         let name = group.name.clone();
 
         // Solo scope is global (decision 3): `self.soloed` is the one set for
@@ -764,14 +825,14 @@ impl SettingsApp {
 
                     ui.vertical(|ui| {
                         let mute_color = ui.visuals().error_fg_color;
-                        if toggle_button(ui, "M", group.muted, mute_color) {
+                        if toggle_button(ui, "M", group.muted, mute_color).clicked() {
                             self.send(ShellAction::EditParams(vec![ConfigEdit::SetGroupMute(
                                 name.clone(),
                                 !group.muted,
                             )]));
                         }
                         let solo_color = ui.visuals().warn_fg_color;
-                        if toggle_button(ui, "S", is_soloed, solo_color) {
+                        if toggle_button(ui, "S", is_soloed, solo_color).clicked() {
                             let on = !is_soloed;
                             if on {
                                 self.soloed.insert(name.clone());
@@ -779,6 +840,9 @@ impl SettingsApp {
                                 self.soloed.remove(&name);
                             }
                             self.send(ShellAction::SetSolo(name.clone(), on));
+                        }
+                        if let Some(edit) = volume_keys_toggle(ui, volume_bind, &name, false) {
+                            self.send(ShellAction::EditParams(vec![edit]));
                         }
                     });
                 });
@@ -889,13 +953,22 @@ impl SettingsApp {
     /// that emits the whole remaining list (`SetExcluded`'s CRUD-collapse
     /// shape, decision 5). Unlike `GroupSettings`, this screen can never go
     /// stale — Master always exists.
-    fn master_settings_page(&mut self, ui: &mut egui::Ui, excluded: &[String]) {
+    fn master_settings_page(
+        &mut self,
+        ui: &mut egui::Ui,
+        excluded: &[String],
+        sink_device: Option<&str>,
+        devices: &[Endpoint],
+    ) {
         ui.horizontal(|ui| {
             if ui.button("⬅ Back").clicked() {
                 self.screen = Screen::Mixer;
             }
             ui.heading("Master Settings");
         });
+        ui.separator();
+
+        self.sink_picker(ui, sink_device, devices);
         ui.separator();
 
         ui.label("Apps excluded from routing (play straight through Windows):");
@@ -916,6 +989,115 @@ impl SettingsApp {
             remaining.remove(i);
             self.send(ShellAction::EditParams(vec![ConfigEdit::SetExcluded(remaining)]));
         }
+    }
+
+    /// Renders `SinkStatus` and the one action that resolves it
+    /// (double-audio-prevention capability 3/6). Nothing is shown while the
+    /// sink is `Active` — a banner that never goes away stops being read.
+    ///
+    /// Each message names the *audible consequence*, not the internal state:
+    /// every failure in this area so far has been silent, and "apps are heard
+    /// twice" is what the user can actually check.
+    fn sink_banner(
+        &mut self,
+        ui: &mut egui::Ui,
+        status: &SinkStatus,
+        previous_default: Option<&str>,
+        devices: &[Endpoint],
+    ) {
+        let sem = theme::semantic(egui::Theme::from_dark_mode(ui.visuals().dark_mode));
+        match status {
+            SinkStatus::Active { sink } => {
+                // Normal operation is silent. The one exception: the sink is
+                // in effect but nothing is recorded to hand back, so quitting
+                // would leave the machine on an endpoint nobody can hear with
+                // no way out from inside the app. Splitstream cannot know
+                // which device the user wants back — a manual default and a
+                // previous exit that lost the record look identical from here
+                // — so it asks rather than guessing.
+                if quit_would_strand(previous_default, status) {
+                    ui.colored_label(
+                        sem.warning,
+                        format!(
+                            "{sink:?} is Windows' default, but Splitstream has no record of what it \
+                             replaced — quitting would leave this machine silent."
+                        ),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Restore this device on quit:");
+                        let mut pick = String::new();
+                        let choices: Vec<Endpoint> =
+                            devices.iter().filter(|d| &d.name != sink).cloned().collect();
+                        if output_device_combo(ui, "strand-restore", &mut pick, &choices) {
+                            self.send(ShellAction::EditParams(vec![ConfigEdit::SetPreviousDefault(
+                                Some(pick),
+                            )]));
+                        }
+                    });
+                    ui.separator();
+                }
+                return;
+            }
+            SinkStatus::NotConfigured => {
+                ui.colored_label(
+                    sem.warning,
+                    "No sink device set — routed apps are heard twice, once raw and once through Splitstream.",
+                );
+                if ui.button("Choose a sink device…").clicked() {
+                    self.screen = Screen::MasterSettings;
+                }
+            }
+            SinkStatus::Missing { configured } => {
+                ui.colored_label(
+                    sem.warning,
+                    format!("Sink device {configured:?} isn't available — routed apps are heard twice."),
+                );
+                if ui.button("Pick a different sink device…").clicked() {
+                    self.screen = Screen::MasterSettings;
+                }
+            }
+            SinkStatus::NotDefault { sink, current_default } => {
+                let playing_through = current_default.as_deref().unwrap_or("another device");
+                ui.colored_label(
+                    sem.warning,
+                    format!("Windows is still playing to {playing_through:?}, so routed apps are heard twice."),
+                );
+                // The restore promise belongs on the button, not in the label:
+                // at this point nothing has been displaced yet, so as a
+                // statement about the current state it would simply be untrue.
+                // As the consequence of clicking, it is exactly what the user
+                // needs to know before agreeing.
+                let take = ui
+                    .button(format!("Make {sink:?} the default output"))
+                    .on_hover_text(format!(
+                        "Windows will play everything through {sink:?} while Splitstream runs. \
+                         Quitting puts {playing_through:?} back."
+                    ));
+                if take.clicked() {
+                    self.send(ShellAction::TakeDefaultOutput);
+                }
+            }
+        }
+        ui.separator();
+    }
+
+    /// The sink picker (`[app] sink_device`). Dropdown-backed like every other
+    /// device field here, so there is no draft state to keep.
+    fn sink_picker(&mut self, ui: &mut egui::Ui, sink_device: Option<&str>, devices: &[Endpoint]) {
+        ui.label("Sink device — where routed apps are parked so only Splitstream is heard:");
+        ui.weak("VB-CABLE's \"CABLE Input\" is the usual choice. It must not be any group's output.");
+        let mut current = sink_device.unwrap_or_default().to_string();
+        ui.horizontal(|ui| {
+            if output_device_combo(ui, "sink-device", &mut current, devices) {
+                self.send(ShellAction::EditParams(vec![ConfigEdit::SetSinkDevice(Some(current))]));
+            }
+            // Without this the `None` arm of `SetSinkDevice` is reachable only
+            // by hand-editing the TOML — a combo box can pick a different
+            // device but can never pick "no device".
+            if sink_device.is_some() && ui.small_button("Clear").clicked() {
+                self.send(ShellAction::EditParams(vec![ConfigEdit::SetSinkDevice(None)]));
+            }
+        });
     }
 
     /// Per-group DSP chain: one row per configured stage (bypass + remove),
@@ -1421,7 +1603,63 @@ fn speaker_mute_button(ui: &mut egui::Ui, muted: bool) -> bool {
 /// emoji-range icon; `speaker_mute_button`'s custom paint isn't needed for a
 /// letter. Returns whether clicked this frame — holds no state of its own,
 /// caller flips its own bool/set.
-fn toggle_button(ui: &mut egui::Ui, label: &str, active: bool, tint: egui::Color32) -> bool {
+/// The value `[app] volume_bind` carries for the master fader — `Dispatcher::
+/// bound_target` resolves this exact string to `VolumeTarget::Master`, so the
+/// UI must not spell it differently.
+const MASTER_BIND: &str = "master";
+
+/// "The volume keys drive this column" (double-audio-prevention capability 5).
+/// Exactly one target can hold it, so clicking an unlit one moves the binding
+/// rather than adding a second; clicking the lit one unbinds entirely.
+/// Returns the edit to send, or `None` if it wasn't clicked.
+fn volume_keys_toggle(
+    ui: &mut egui::Ui,
+    volume_bind: Option<&str>,
+    target: &str,
+    is_master: bool,
+) -> Option<ConfigEdit> {
+    // `[app] volume_bind` addresses master and groups in one string space, so
+    // a group literally named "master" is indistinguishable from the master
+    // fader — `bound_target` resolves the value to `VolumeTarget::Master`
+    // either way, and both toggles would light up together. Renaming the
+    // sentinel would break every existing config that already uses it, so the
+    // ambiguous column is told plainly that it can't hold the binding.
+    if !is_master && target == MASTER_BIND {
+        ui.add_enabled(false, egui::Button::new("K")).on_disabled_hover_text(
+            "A group named \"master\" can't take the volume keys — that name already \
+             addresses the master fader. Rename the group to use this.",
+        );
+        return None;
+    }
+
+    let bound = volume_bind == Some(target);
+    let tint = ui.visuals().selection.bg_fill;
+    let hint = if bound {
+        "The volume keys drive this — click to unbind".to_string()
+    } else {
+        format!("Make the volume keys drive {target}")
+    };
+    if !toggle_button(ui, "K", bound, tint).on_hover_text(hint).clicked() {
+        return None;
+    }
+    Some(volume_bind_edit(volume_bind, target))
+}
+
+/// Which edit a click on the volume-keys toggle produces. Split out from the
+/// widget so the "exactly one target holds the binding" rule is testable
+/// without a live egui frame — clicking an unlit toggle *moves* the binding
+/// rather than adding a second, and clicking the lit one clears it.
+fn volume_bind_edit(volume_bind: Option<&str>, target: &str) -> ConfigEdit {
+    if volume_bind == Some(target) {
+        ConfigEdit::SetVolumeBind(None)
+    } else {
+        ConfigEdit::SetVolumeBind(Some(target.to_string()))
+    }
+}
+
+/// Returns the `Response`, not a bare `clicked()` bool, so a caller can hang
+/// a tooltip on it — "K" needs one, "M"/"S" don't.
+fn toggle_button(ui: &mut egui::Ui, label: &str, active: bool, tint: egui::Color32) -> egui::Response {
     let text = if active {
         egui::RichText::new(label).strong().color(egui::Color32::WHITE)
     } else {
@@ -1431,7 +1669,7 @@ fn toggle_button(ui: &mut egui::Ui, label: &str, active: bool, tint: egui::Color
     if active {
         button = button.fill(tint);
     }
-    ui.add(button).clicked()
+    ui.add(button)
 }
 
 /// Chip icon slot, in points. Fixed so the tile->icon swap never shifts
@@ -2287,6 +2525,27 @@ mod tests {
     #[test]
     fn split_rules_of_blank_text_is_empty() {
         assert!(split_rules("   ").is_empty());
+    }
+
+    #[test]
+    fn clicking_an_unbound_columns_volume_keys_toggle_moves_the_binding_to_it() {
+        let edit = volume_bind_edit(Some("Game"), "Chat");
+
+        assert!(matches!(edit, ConfigEdit::SetVolumeBind(Some(name)) if name == "Chat"));
+    }
+
+    #[test]
+    fn clicking_the_bound_columns_volume_keys_toggle_clears_the_binding() {
+        let edit = volume_bind_edit(Some("Game"), "Game");
+
+        assert!(matches!(edit, ConfigEdit::SetVolumeBind(None)));
+    }
+
+    #[test]
+    fn clicking_a_volume_keys_toggle_with_nothing_bound_binds_that_column() {
+        let edit = volume_bind_edit(None, MASTER_BIND);
+
+        assert!(matches!(edit, ConfigEdit::SetVolumeBind(Some(name)) if name == "master"));
     }
 
     #[test]

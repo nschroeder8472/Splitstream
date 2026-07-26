@@ -2,10 +2,23 @@
 feature: session-mute-on-capture
 requirement_doc: Splitstream-Engineering-Spec.md
 created: 2026-07-22
-status: complete
+status: superseded
+superseded_by: double-audio-prevention.md
 ---
 
 # Session Mute on Capture
+
+> **SUPERSEDED 2026-07-26 — the code described below no longer exists.** MT1
+> (measured 2026-07-25) showed that muting a captured app's session silences
+> the `PROCESS_LOOPBACK` tap as well: same sample cadence, every frame zeroed
+> (peak 0.0814 unmuted vs 0.0 muted). The tap sits *after* session-level
+> processing, so this mechanism was void rather than merely buggy. The design
+> below is sound given its premise; the premise is what was falsified. Every
+> piece of it — `SessionPort::set_muted`, `WasapiSessions::set_muted`,
+> routing's mute diff and shutdown sweep, the mock hooks — was deleted by
+> [double-audio-prevention](double-audio-prevention.md), which removes the
+> double structurally instead: one unheard sink as the Windows default, so
+> apps never render anywhere audible in the first place.
 
 > `ActivateAudioInterfaceAsync`/`PROCESS_LOOPBACK` (process-loopback-capture) taps a process's audio — it does not redirect or silence the original stream. Found live: a matched app's audio plays twice whenever the group's output device is also Windows' current default (the untouched original session + Splitstream's own processed copy), and the original copy's volume is completely unaffected by any in-app gain/DSP control. Fix: mute the source session's own Windows volume (`ISimpleAudioVolume::SetMute`) for the duration Splitstream has it captured; unmute on release (rule change, session end, Splitstream shutdown/crash-safety).
 

@@ -64,6 +64,13 @@ struct RawAppConfig {
     /// capability 1). Absent = empty, today's behaviour exactly.
     #[serde(default)]
     excluded: Vec<String>,
+    /// Endpoint routed apps are parked on (double-audio-prevention).
+    #[serde(default)]
+    sink_device: Option<String>,
+    #[serde(default)]
+    manage_default: bool,
+    #[serde(default)]
+    previous_default: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -409,6 +416,9 @@ pub(crate) fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
             theme: parse_theme(raw.app.theme)?,
             accent: parse_accent(raw.app.accent)?,
             excluded: raw.app.excluded,
+            sink_device: raw.app.sink_device,
+            manage_default: raw.app.manage_default,
+            previous_default: raw.app.previous_default,
         },
         profiles,
     })

@@ -132,8 +132,16 @@ pub fn spawn_tray(
 /// `DefaultDeviceChanged` is internal plumbing (external-controls.md flow E)
 /// consumed by the dispatcher, not a user-facing notice — filtered here so
 /// it never reaches `describe_notice`/the tooltip.
+/// `DeviceRemoved` is silent for the same reason plus one of its own: it
+/// carries only a raw endpoint id, never a friendly name, and the removals a
+/// user cares about already arrive as `DeviceLost`/`FallbackApplied` with the
+/// audio consequence attached. A vanished *sink* is explained by the settings
+/// window's own banner, where there is room to say what it means.
 fn evt_is_silent(evt: &EngineEvent) -> bool {
-    matches!(evt, EngineEvent::DefaultDeviceChanged(_))
+    matches!(
+        evt,
+        EngineEvent::DefaultDeviceChanged(_) | EngineEvent::DeviceRemoved(_)
+    )
 }
 
 fn describe_notice(evt: &EngineEvent) -> String {
@@ -143,7 +151,8 @@ fn describe_notice(evt: &EngineEvent) -> String {
         EngineEvent::DeviceAvailable(ep) => format!("Splitstream — device available: {}", ep.name),
         EngineEvent::DeviceLost { .. } => "Splitstream — output device lost".to_string(),
         EngineEvent::RoutingDegraded { reason } => format!("Splitstream — routing degraded: {reason}"),
-        EngineEvent::DefaultDeviceChanged(_) => String::new(), // filtered above; kept for exhaustiveness
+        // Both filtered by `evt_is_silent` above; kept for exhaustiveness.
+        EngineEvent::DefaultDeviceChanged(_) | EngineEvent::DeviceRemoved(_) => String::new(),
     }
 }
 

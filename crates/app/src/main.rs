@@ -27,11 +27,11 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 
-use control::{group_rules, ConfigEdit, ConfigStore};
-use engine::ports::{AudioSystem, SessionPort, VolumeEvent};
+use control::{group_rules, resolve_sink_status, ConfigEdit, ConfigStore, SinkStatus};
+use engine::ports::{AudioSystem, EndpointId, SessionPort, VolumeEvent};
 use engine::{
-    start_volume_bind, AccentChoice, CaptureControl, ConfigSnapshot, EngineEvent, EngineHandle, MirrorAction,
-    RoutingHandle, VolumeBindHandle,
+    start_volume_bind, AccentChoice, AppConfig, CaptureControl, ConfigSnapshot, EngineEvent, EngineHandle,
+    MirrorAction, RoutingHandle, VolumeBindHandle,
 };
 use win_audio::WasapiSystem;
 
@@ -94,6 +94,16 @@ pub enum ShellAction {
     /// tray/hotkeys/UI. Carries nothing: the dispatcher re-queries the
     /// current default itself rather than trust a possibly-stale payload.
     DefaultDeviceChanged,
+    /// A device appeared or disappeared (double-audio-prevention flow A/F) —
+    /// internal plumbing, forwarded from `EngineEvent::DeviceAvailable`/
+    /// `DeviceRemoved`. Carries nothing for the same reason
+    /// `DefaultDeviceChanged` doesn't: the dispatcher re-enumerates rather
+    /// than trusting a payload that may already be stale.
+    DevicesChanged,
+    /// The user accepted "make Splitstream's sink the Windows default output"
+    /// (flow B). Opt-in and explicit — Splitstream never takes the default
+    /// unasked.
+    TakeDefaultOutput,
     ShowSettings,
     Quit,
 }
@@ -104,6 +114,118 @@ pub enum ShellAction {
 /// more virtual-bus classification step to gate on).
 fn needs_onboarding(snapshot: &ConfigSnapshot) -> bool {
     snapshot.groups.is_empty()
+}
+
+/// What prompted a possible (re-)assertion of the sink as the Windows default.
+/// The distinction is the whole of flow E: a default change made by the user
+/// or by another audio tool is surfaced, never fought — two programs each
+/// re-asserting would ping-pong forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssertTrigger {
+    Startup,
+    /// The user clicked "make the sink the default output" (flow B step 2).
+    UserRequest,
+    ExternalDefaultChange,
+}
+
+/// Everything one takeover of the Windows default involves: the edits that
+/// record what is being displaced, and the device to install.
+///
+/// The two are returned **together** on purpose. Taking the default and
+/// writing down what it was are not separate steps a caller may pick from:
+/// flow C restores `previous_default` and clears it, so a takeover that skips
+/// the recording leaves the *next* quit with nothing to restore and the
+/// machine parked on a sink nobody can hear. That is exactly what shipped —
+/// the user's one-time click recorded, the every-start re-assertion did not,
+/// so run 1 behaved and every run after it ended silent.
+///
+/// No `PartialEq`: `ConfigEdit` has none, and tests are clearer asserting on
+/// the two fields separately anyway.
+#[derive(Debug)]
+struct SinkTakeover {
+    edits: Vec<ConfigEdit>,
+    sink: String,
+}
+
+/// Flow B (both the opt-in click and step 3's every-start re-assertion) and
+/// flow E. `None` means do nothing at all.
+///
+/// Says yes only for a startup or an explicit user request, only while the
+/// user has opted in, and only when the sink exists but isn't already the
+/// default. An external default change never says yes — Splitstream does not
+/// fight the user or another audio tool for the default device.
+fn plan_sink_takeover(
+    app: &AppConfig,
+    status: &SinkStatus,
+    trigger: AssertTrigger,
+    current_default: Option<&str>,
+) -> Option<SinkTakeover> {
+    if trigger == AssertTrigger::ExternalDefaultChange {
+        return None;
+    }
+    if trigger == AssertTrigger::Startup && !app.manage_default {
+        return None;
+    }
+    let SinkStatus::NotDefault { sink, .. } = status else {
+        return None;
+    };
+    Some(SinkTakeover {
+        edits: take_default_edits(app, current_default),
+        sink: sink.clone(),
+    })
+}
+
+/// Flow B: the edits recording that Splitstream has taken the default.
+///
+/// `previous_default` is written **only when the key is empty** (flow B rule
+/// 2). A value already sitting there was left by an unclean exit and still
+/// names the user's true pre-Splitstream device, so overwriting it — with the
+/// sink, most likely — would lose the only way back (flow D).
+fn take_default_edits(app: &AppConfig, current_default: Option<&str>) -> Vec<ConfigEdit> {
+    let mut edits = vec![ConfigEdit::SetManageDefault(true)];
+    let already_recorded = app.previous_default.is_some();
+    // Recording the sink as the thing to restore *to* would make a clean quit
+    // a no-op and strand the user on a silent device.
+    let is_the_sink = current_default.is_some() && current_default == app.sink_device.as_deref();
+    if !already_recorded && !is_the_sink {
+        if let Some(name) = current_default {
+            edits.push(ConfigEdit::SetPreviousDefault(Some(name.to_string())));
+        }
+    }
+    edits
+}
+
+/// Flow C: the edits a clean quit writes once the restore attempt has
+/// resolved.
+///
+/// A **failed** restore writes nothing. The recorded device is the user's only
+/// remaining route back to their own default — clearing it after a failure
+/// leaves the machine pointed at an endpoint nobody can hear, with
+/// `manage_default` still true so the next start re-takes the sink, and no
+/// record anywhere of what to go back to. That is the worst state this feature
+/// can produce, and it is one `if` away.
+fn post_restore_edits(restore_succeeded: bool) -> Vec<ConfigEdit> {
+    if restore_succeeded {
+        vec![ConfigEdit::SetPreviousDefault(None)]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The gain and mute a bound target currently holds — what flow G step 5
+/// pushes outward so the Windows slider and OSD start from the newly selected
+/// group's level rather than the previous one's. `None` when the binding names
+/// a group that no longer exists, which is nothing to mirror rather than an
+/// error.
+fn bound_target_values(snapshot: &ConfigSnapshot, target: &VolumeTarget) -> Option<(audio_core::Gain, bool)> {
+    match target {
+        VolumeTarget::Master => Some((snapshot.master, snapshot.muted)),
+        VolumeTarget::Group(name) => snapshot
+            .groups
+            .iter()
+            .find(|g| &g.name == name)
+            .map(|g| (g.gain, g.muted)),
+    }
 }
 
 const VOLUME_STEP_DB: f32 = 3.0;
@@ -344,6 +466,126 @@ impl Dispatcher {
         if new_tray_model != old_tray_model {
             self.tray_handle.rebuild(new_tray_model);
         }
+        // Flow A: `[app] sink_device` is one of the three inputs, so any
+        // snapshot change can move the status — including a hand-edit of the
+        // config file.
+        self.refresh_sink_status();
+    }
+
+    /// Flow A: recompute `SinkStatus` from the three facts that define it and
+    /// publish it for the UI. Pure work under the lock; the device list is
+    /// whatever `handle_devices_changed` last installed, never re-enumerated
+    /// here (`enumerate()` is a blocking COM call, and this runs on every
+    /// param edit — including every frame of a fader drag).
+    fn refresh_sink_status(&self) {
+        let mut ui = self.ui.lock().unwrap();
+        let names: Vec<String> = ui.available_devices.iter().map(|e| e.name.clone()).collect();
+        ui.sink_status = resolve_sink_status(
+            self.current.app.sink_device.as_deref(),
+            &names,
+            self.default_output_name.as_deref(),
+        );
+    }
+
+    /// Flow F (and flow A's device-list input): a device appeared or vanished.
+    /// `enumerate()` blocks on COM, so it runs *outside* every lock and the
+    /// result is assigned under a short one — the recurring "blocking call
+    /// under a shared lock" shape this codebase has hit four times.
+    fn handle_devices_changed(&mut self) {
+        let Ok(endpoints) = self.sys.enumerate() else {
+            return; // transient enumeration failure: keep the last known list
+        };
+        self.ui.lock().unwrap().available_devices = endpoints;
+        self.refresh_sink_status();
+    }
+
+    /// Flow B: the user accepted taking the default. Records the outgoing
+    /// default first (only-if-empty), then installs the sink — that order
+    /// means a failure between the two leaves a recoverable config rather
+    /// than a moved default nobody remembers the way back from.
+    fn handle_take_default_output(&mut self) {
+        self.take_sink_as_default(AssertTrigger::UserRequest);
+    }
+
+    /// Flow B, both entry points: record what is about to be displaced, then
+    /// install the sink. One method rather than two call sites, because the
+    /// two halves must never come apart — see [`SinkTakeover`].
+    ///
+    /// The edits are deliberately **not** rolled back if the install fails:
+    /// `previous_default` then names the device that is still the default, so
+    /// the quit-time restore is a harmless no-op, while `manage_default`
+    /// staying true means the next start retries. The banner keeps reporting
+    /// `NotDefault` either way, which is the honest answer (capability 6).
+    fn take_sink_as_default(&mut self, trigger: AssertTrigger) {
+        let status = self.ui.lock().unwrap().sink_status.clone();
+        let Some(takeover) = plan_sink_takeover(
+            &self.current.app,
+            &status,
+            trigger,
+            self.default_output_name.as_deref(),
+        ) else {
+            return;
+        };
+        tracing::info!(
+            sink = takeover.sink,
+            displacing = self.default_output_name.as_deref().unwrap_or("<unknown>"),
+            ?trigger,
+            "taking the Windows default output"
+        );
+        self.apply_params(&takeover.edits);
+        let _took = self.set_default_output_by_name(&takeover.sink);
+    }
+
+    /// Installs the named device as the Windows default for all three roles —
+    /// used both to take the sink (flow B) and to hand the user's own device
+    /// back (flow C). Best-effort and loudly reported (capability 6): never a
+    /// panic, never a retry.
+    ///
+    /// Reports whether it actually worked. Callers that record state around
+    /// this **must** branch on it: an unknown device name and a failed COM
+    /// call are both real outcomes here, and treating either as success is
+    /// what turns a recoverable state into a silent machine.
+    fn set_default_output_by_name(&self, device_name: &str) -> bool {
+        let Some(id) = self.endpoint_id_for(device_name) else {
+            eprintln!("cannot set default output: no device named {device_name:?}");
+            return false;
+        };
+        match self.sys.set_default_output(&id) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("setting the default output to {device_name:?} failed: {e:?}");
+                false
+            }
+        }
+    }
+
+    /// Flow C: hand back the default device Splitstream displaced, and clear
+    /// the record of it **only if that worked** (see [`post_restore_edits`]).
+    /// No-op when Splitstream never took the default.
+    fn restore_previous_default(&mut self) {
+        let Some(previous) = self.current.app.previous_default.clone() else {
+            return;
+        };
+        tracing::info!(previous, "restoring the default output device");
+        let restored = self.set_default_output_by_name(&previous);
+        if !restored {
+            tracing::warn!(
+                previous,
+                "could not restore the previous default device — keeping the record so the next \
+                 start can still put it back"
+            );
+        }
+        self.apply_params(&post_restore_edits(restored));
+    }
+
+    /// Friendly name -> `EndpointId`. Config stores device *names* (the same
+    /// vocabulary as every group's `output_device`), while the port speaks ids.
+    fn endpoint_id_for(&self, name: &str) -> Option<EndpointId> {
+        let ui = self.ui.lock().unwrap();
+        ui.available_devices
+            .iter()
+            .find(|e| e.name == name)
+            .map(|e| e.id.clone())
     }
 
     /// `[app] volume_bind` resolved to a target, or `None` when unbound.
@@ -548,6 +790,16 @@ impl Dispatcher {
         self.volume_bind.rebind();
         let suspended = self.compute_suspended();
         self.volume_bind.set_suspended(suspended);
+
+        // Double-audio-prevention flow E. Our own `set_default_output` echoes
+        // back through this same path; so does a genuine user or OS change.
+        // Both are treated identically — recompute and surface, never
+        // re-assert. `take_sink_as_default` is called rather than skipped so
+        // the rule lives in code at the one place a future reader would be
+        // tempted to break it: two tools each re-taking the default would
+        // ping-pong, and fighting the user is hostile besides.
+        self.refresh_sink_status();
+        self.take_sink_as_default(AssertTrigger::ExternalDefaultChange);
     }
 
     fn focus_window(&self) {
@@ -639,9 +891,27 @@ impl Dispatcher {
                 }
                 self.set_current(new_snapshot);
                 self.push_bound_target_changes(edits);
+                if edits.iter().any(|e| matches!(e, ConfigEdit::SetVolumeBind(_))) {
+                    self.push_new_bind_outward();
+                }
             }
             Err(e) => eprintln!("param edit rejected: {e:?}"),
         }
+    }
+
+    /// Flow G step 5: the volume keys now drive a *different* target, so push
+    /// that target's current gain and mute outward immediately. Without this
+    /// the endpoint slider still sits at the previously-selected group's
+    /// level, and the first key press after switching would jump the newly
+    /// selected group to it. Runs after `set_current`, so `bound_target()`
+    /// already resolves to the new selection.
+    fn push_new_bind_outward(&self) {
+        let Some(target) = self.bound_target() else { return };
+        let Some((gain, muted)) = bound_target_values(&self.current, &target) else {
+            return;
+        };
+        self.push_target_volume_if_bound(&target, gain);
+        self.push_target_mute_if_bound(&target, muted);
     }
 
     /// Add/remove-stage edits: write to `ConfigStore` first (so the group's
@@ -810,6 +1080,8 @@ impl Dispatcher {
             ShellAction::ToggleGroupMute(name) => self.handle_toggle_group_mute(&name),
             ShellAction::PushToMute(pressed) => self.handle_push_to_mute(pressed),
             ShellAction::DefaultDeviceChanged => self.handle_default_device_changed(),
+            ShellAction::DevicesChanged => self.handle_devices_changed(),
+            ShellAction::TakeDefaultOutput => self.handle_take_default_output(),
             ShellAction::ShowSettings => self.focus_window(),
             ShellAction::Quit => return Outcome::Quit,
         }
@@ -891,7 +1163,11 @@ fn edits_to_mixer_commands(edits: &[ConfigEdit], current: &ConfigSnapshot) -> Ve
             | ConfigEdit::SetActiveProfile(..)
             | ConfigEdit::SetTheme(..)
             | ConfigEdit::SetAccent(..)
-            | ConfigEdit::SetExcluded(..) => None,
+            | ConfigEdit::SetExcluded(..)
+            | ConfigEdit::SetSinkDevice(..)
+            | ConfigEdit::SetManageDefault(..)
+            | ConfigEdit::SetPreviousDefault(..)
+            | ConfigEdit::SetVolumeBind(..) => None,
         })
         .collect()
 }
@@ -1053,6 +1329,12 @@ fn run_startup_and_dispatch(
                 if matches!(evt, EngineEvent::DefaultDeviceChanged(_)) {
                     let _ = actions_tx.send(ShellAction::DefaultDeviceChanged);
                 }
+                // Double-audio-prevention flow A/F: the sink is never a group
+                // output, so its arrival/removal reaches the app layer only
+                // through these two unconditional announcements.
+                if matches!(evt, EngineEvent::DeviceAvailable(_) | EngineEvent::DeviceRemoved(_)) {
+                    let _ = actions_tx.send(ShellAction::DevicesChanged);
+                }
                 if unified_tx.send(evt).is_err() {
                     return;
                 }
@@ -1089,6 +1371,9 @@ fn run_startup_and_dispatch(
         default_output_name: default_output_name.clone(),
         all_sessions: routing.all_sessions(),
         rebuild_generation: 0,
+        // Replaced by the dispatcher's first `refresh_sink_status` below,
+        // once it exists to compute one.
+        sink_status: control::SinkStatus::NotConfigured,
     }));
 
     let (tray_events_tx, tray_events_rx) = mpsc::channel::<EngineEvent>();
@@ -1160,6 +1445,13 @@ fn run_startup_and_dispatch(
         let suspended = dispatcher.compute_suspended();
         dispatcher.volume_bind.set_suspended(suspended);
     }
+    // Double-audio-prevention: publish the first `SinkStatus` (flow A), then
+    // re-assert the sink if the user has opted in (flow B step 3). A
+    // `previous_default` already sitting in the config at this point was left
+    // by an unclean exit — deliberately left untouched (flow D) so the next
+    // clean quit still restores the user's true pre-Splitstream device.
+    dispatcher.refresh_sink_status();
+    dispatcher.take_sink_as_default(AssertTrigger::Startup);
     // Temporary diagnostic (audio-flow-control follow-up): these counters
     // already exist on EngineStats but nothing logs or displays them, so a
     // flow-control regression (drops/xruns) is indistinguishable from a
@@ -1207,6 +1499,12 @@ fn run_startup_and_dispatch(
     }
 
     drop(watcher);
+    // Flow C, before anything else is torn down: put the user's own default
+    // device back and clear the key, so quitting never leaves the machine
+    // pointed at an endpoint nobody can hear. A `previous_default` that is
+    // still set on the next start therefore means the exit was unclean (flow
+    // D), which is precisely the signal that recovery relies on.
+    dispatcher.restore_previous_default();
     dispatcher.tray_handle.shutdown();
     hotkey_handle.shutdown();
     dispatcher.volume_bind.shutdown();
@@ -1254,6 +1552,252 @@ mod tests {
             app: engine::AppConfig::default(),
             profiles: Vec::new(),
         }
+    }
+
+    fn app_with_sink(sink: &str) -> AppConfig {
+        AppConfig {
+            sink_device: Some(sink.into()),
+            manage_default: true,
+            ..AppConfig::default()
+        }
+    }
+
+    // --- double-audio-prevention flows B/D: taking the default -------------
+
+    #[test]
+    fn taking_the_default_records_the_previous_one() {
+        let app = app_with_sink("CABLE Input");
+
+        let edits = take_default_edits(&app, Some("Headphones"));
+
+        assert!(edits.iter().any(|e| matches!(e, ConfigEdit::SetManageDefault(true))));
+        assert!(edits.iter().any(|e| matches!(
+            e,
+            ConfigEdit::SetPreviousDefault(Some(name)) if name == "Headphones"
+        )));
+    }
+
+    /// Flow B rule 2 / flow D: a `previous_default` already on disk was left
+    /// by an unclean exit and still names the user's true pre-Splitstream
+    /// device. Overwriting it — with the sink, most likely — throws away the
+    /// only way back.
+    #[test]
+    fn taking_the_default_twice_does_not_overwrite_the_recorded_previous() {
+        let app = AppConfig {
+            previous_default: Some("Headphones".into()),
+            ..app_with_sink("CABLE Input")
+        };
+
+        let edits = take_default_edits(&app, Some("CABLE Input"));
+
+        assert!(!edits
+            .iter()
+            .any(|e| matches!(e, ConfigEdit::SetPreviousDefault(_))));
+    }
+
+    /// A start that inherits the default from an unclean exit must leave the
+    /// recorded device intact — same rule as above, viewed from flow D. Pins
+    /// the *whole* edit list rather than just the absence of one variant, so
+    /// nothing can be added here that touches the record by another route.
+    #[test]
+    fn a_start_finding_previous_default_already_set_leaves_it_intact() {
+        let app = AppConfig {
+            previous_default: Some("Speakers".into()),
+            ..app_with_sink("CABLE Input")
+        };
+
+        let edits = take_default_edits(&app, Some("Headphones"));
+
+        assert_eq!(edits.len(), 1);
+        assert!(matches!(edits[0], ConfigEdit::SetManageDefault(true)));
+    }
+
+    // --- flow C: what a clean quit does about the displaced default --------
+
+    #[test]
+    fn a_successful_restore_clears_the_recorded_previous_default() {
+        let edits = post_restore_edits(true);
+
+        assert_eq!(edits.len(), 1);
+        assert!(matches!(edits[0], ConfigEdit::SetPreviousDefault(None)));
+    }
+
+    /// The record is the user's only remaining route back to their own default
+    /// device. Clearing it after a failed restore leaves the machine pointed at
+    /// an endpoint nobody can hear, `manage_default` still true so the next
+    /// start re-takes the sink, and nothing anywhere naming what to go back to.
+    #[test]
+    fn a_failed_restore_keeps_the_recorded_previous_default() {
+        let edits = post_restore_edits(false);
+
+        assert!(edits.is_empty());
+    }
+
+    /// Recording the sink as the device to restore *to* would make a clean
+    /// quit a no-op and strand the machine on an endpoint nobody can hear.
+    #[test]
+    fn taking_the_default_never_records_the_sink_itself_as_the_previous() {
+        let app = app_with_sink("CABLE Input");
+
+        let edits = take_default_edits(&app, Some("CABLE Input"));
+
+        assert!(!edits
+            .iter()
+            .any(|e| matches!(e, ConfigEdit::SetPreviousDefault(_))));
+    }
+
+    // --- flow B / flow E: when to take the default, and what it records ---
+
+    fn not_default(sink: &str, current: &str) -> SinkStatus {
+        SinkStatus::NotDefault {
+            sink: sink.into(),
+            current_default: Some(current.into()),
+        }
+    }
+
+    /// **Regression, found on real hardware 2026-07-26.** The every-start
+    /// re-assertion used to install the sink without recording what it
+    /// displaced. Flow C clears `previous_default` on each clean quit, so from
+    /// the second run onward there was nothing to restore and every quit left
+    /// the machine parked on a sink nobody can hear.
+    #[test]
+    fn a_startup_takeover_records_the_default_it_displaces() {
+        let app = app_with_sink("CABLE Input");
+        let status = not_default("CABLE Input", "Headphones");
+
+        let takeover = plan_sink_takeover(&app, &status, AssertTrigger::Startup, Some("Headphones"))
+            .expect("a start that opted in must take the sink");
+
+        assert_eq!(takeover.sink, "CABLE Input");
+        assert!(
+            takeover.edits.iter().any(|e| matches!(
+                e,
+                ConfigEdit::SetPreviousDefault(Some(name)) if name == "Headphones"
+            )),
+            "taking the default without recording it strands the next quit"
+        );
+    }
+
+    /// The invariant behind [`SinkTakeover`], stated once so no future call
+    /// site can take the default and skip the record: whenever a takeover is
+    /// planned and nothing is on file yet, it carries the recording edit.
+    #[test]
+    fn every_planned_takeover_records_the_previous_default_when_none_is_on_file() {
+        let app = app_with_sink("CABLE Input");
+        let status = not_default("CABLE Input", "Headphones");
+
+        for trigger in [AssertTrigger::Startup, AssertTrigger::UserRequest] {
+            let takeover = plan_sink_takeover(&app, &status, trigger, Some("Headphones"))
+                .unwrap_or_else(|| panic!("{trigger:?} should plan a takeover"));
+
+            assert!(
+                takeover.edits.iter().any(|e| matches!(e, ConfigEdit::SetPreviousDefault(Some(_)))),
+                "{trigger:?} planned a takeover with no way back recorded"
+            );
+        }
+    }
+
+    #[test]
+    fn a_user_request_takes_the_sink_even_before_opting_in() {
+        let app = AppConfig {
+            manage_default: false,
+            ..app_with_sink("CABLE Input")
+        };
+        let status = not_default("CABLE Input", "Headphones");
+
+        let takeover = plan_sink_takeover(&app, &status, AssertTrigger::UserRequest, Some("Headphones"));
+
+        assert!(takeover.is_some(), "the click *is* the opt-in");
+    }
+
+    /// Flow E: a default change made by the user, or by another audio tool
+    /// doing the same thing, is surfaced and left alone. Re-asserting would
+    /// ping-pong forever.
+    #[test]
+    fn an_external_default_change_is_surfaced_and_never_re_asserted() {
+        let app = app_with_sink("CABLE Input");
+        let status = not_default("CABLE Input", "Headphones");
+
+        let takeover =
+            plan_sink_takeover(&app, &status, AssertTrigger::ExternalDefaultChange, Some("Headphones"));
+
+        assert!(takeover.is_none());
+    }
+
+    /// Our own `set_default_output` echoes back through the same
+    /// default-changed path. It needs no special casing: the status it
+    /// produces is `Active`, and nothing is taken against `Active`.
+    #[test]
+    fn our_own_default_change_is_suppressed_as_an_echo() {
+        let app = app_with_sink("CABLE Input");
+        let status = SinkStatus::Active { sink: "CABLE Input".into() };
+
+        for trigger in [
+            AssertTrigger::Startup,
+            AssertTrigger::UserRequest,
+            AssertTrigger::ExternalDefaultChange,
+        ] {
+            assert!(plan_sink_takeover(&app, &status, trigger, Some("CABLE Input")).is_none());
+        }
+    }
+
+    #[test]
+    fn a_start_does_not_take_the_default_the_user_never_opted_into() {
+        let app = AppConfig {
+            manage_default: false,
+            ..app_with_sink("CABLE Input")
+        };
+        let status = not_default("CABLE Input", "Headphones");
+
+        assert!(plan_sink_takeover(&app, &status, AssertTrigger::Startup, Some("Headphones")).is_none());
+    }
+
+    /// Flow F: a sink that isn't present can't be installed as the default —
+    /// the status is surfaced instead, and no COM call is attempted.
+    #[test]
+    fn sink_removal_mid_session_reports_missing_without_re_taking() {
+        let app = app_with_sink("CABLE Input");
+        let status = SinkStatus::Missing { configured: "CABLE Input".into() };
+
+        for trigger in [AssertTrigger::Startup, AssertTrigger::UserRequest] {
+            assert!(plan_sink_takeover(&app, &status, trigger, Some("Headphones")).is_none());
+        }
+    }
+
+    // --- flow G step 5: selection re-syncs the endpoint slider -------------
+
+    /// Without this push, the endpoint's slider still sits at the
+    /// previously-selected group's level, and the first volume key press
+    /// after switching jumps the newly selected group straight to it.
+    #[test]
+    fn selecting_a_group_pushes_its_current_gain_outward() {
+        let mut snapshot = snapshot_with_group("Game");
+        let quiet = ui::fader_db_to_gain(-12.0);
+        snapshot.groups[0].gain = quiet;
+        snapshot.groups[0].muted = true;
+
+        let values = bound_target_values(&snapshot, &VolumeTarget::Group("Game".into()));
+
+        assert_eq!(values, Some((quiet, true)));
+    }
+
+    #[test]
+    fn selecting_master_pushes_the_master_gain_outward() {
+        let mut snapshot = snapshot_with_group("Game");
+        snapshot.master = ui::fader_db_to_gain(-6.0);
+
+        let values = bound_target_values(&snapshot, &VolumeTarget::Master);
+
+        assert_eq!(values, Some((snapshot.master, false)));
+    }
+
+    #[test]
+    fn a_binding_naming_a_missing_group_pushes_nothing() {
+        let snapshot = snapshot_with_group("Game");
+
+        let values = bound_target_values(&snapshot, &VolumeTarget::Group("Gone".into()));
+
+        assert_eq!(values, None);
     }
 
     #[test]

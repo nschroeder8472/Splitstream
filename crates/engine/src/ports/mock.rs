@@ -1,7 +1,7 @@
 //! Fake `AudioSystem` + ports. This is why the port traits live in `engine`,
 //! not `win-audio`: the whole graph runs on any platform against these fakes.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::f32::consts::TAU;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -44,6 +44,13 @@ pub struct MockSystem {
     /// `open_default_endpoint_volume` errors, matching the real trait's
     /// default body. Set via `enable_endpoint_volume`.
     endpoint_volume: Mutex<Option<MockEndpointVolumePort>>,
+    /// Every id `set_default_output` has been asked to install, in order
+    /// (double-audio-prevention L4) — lets flows B/C/D round-trip without
+    /// hardware.
+    default_output_calls: Mutex<Vec<EndpointId>>,
+    /// Makes `set_default_output` error, simulating the undocumented COM call
+    /// failing (capability 6: surfaced, never panicked).
+    failing_set_default_output: AtomicBool,
 }
 
 impl MockSystem {
@@ -57,6 +64,8 @@ impl MockSystem {
             dying_pids: Mutex::new(std::collections::HashSet::new()),
             open_counts: Mutex::new(HashMap::new()),
             endpoint_volume: Mutex::new(None),
+            default_output_calls: Mutex::new(Vec::new()),
+            failing_set_default_output: AtomicBool::new(false),
         }
     }
 
@@ -70,10 +79,24 @@ impl MockSystem {
             .ok_or_else(|| PortError::NotFound(id.clone()))
     }
 
-    /// Test hook: override which endpoint `default_output()` reports (defaults to
-    /// the first `Physical` endpoint in the list).
-    pub fn set_default_output(&self, id: EndpointId) {
+    /// Test hook: seed which endpoint `default_output()` reports (defaults to
+    /// the first endpoint in the list). Deliberately *not* named
+    /// `set_default_output` — that is now a real `AudioSystem` method, and an
+    /// inherent method of the same name would silently shadow it at every
+    /// call site.
+    pub fn seed_default_output(&self, id: EndpointId) {
         *self.default_output.lock().unwrap() = Some(id);
+    }
+
+    /// Test hook: every id `set_default_output` has been asked to install, in
+    /// order (double-audio-prevention flows B/C/D).
+    pub fn default_output_calls(&self) -> Vec<EndpointId> {
+        self.default_output_calls.lock().unwrap().clone()
+    }
+
+    /// Test hook: make `set_default_output` error until cleared.
+    pub fn fail_set_default_output(&self) {
+        self.failing_set_default_output.store(true, Ordering::Relaxed);
     }
 
     /// Test hook: push a `DeviceEvent` to whatever `Receiver` `subscribe_device_events`
@@ -206,6 +229,21 @@ impl AudioSystem for MockSystem {
             Some(port) => Ok(Box::new(port)),
             None => Err(PortError::Backend("mock: no endpoint volume port configured".into())),
         }
+    }
+
+    /// Opts in to the real method (rather than inheriting the erroring default
+    /// body) so double-audio-prevention's take/restore flows round-trip
+    /// against `default_output()` with no hardware. An id this mock doesn't
+    /// have is rejected — a device that isn't there can't become the default,
+    /// and a mock that never says no makes that case untestable.
+    fn set_default_output(&self, id: &EndpointId) -> Result<(), PortError> {
+        if self.failing_set_default_output.load(Ordering::Relaxed) {
+            return Err(PortError::Backend("mock: set_default_output denied".into()));
+        }
+        self.find(id)?;
+        self.default_output_calls.lock().unwrap().push(id.clone());
+        *self.default_output.lock().unwrap() = Some(id.clone());
+        Ok(())
     }
 }
 
@@ -507,12 +545,6 @@ impl SinkDevice {
 struct SessionPortState {
     sessions: Mutex<Vec<SessionInfo>>,
     events: Mutex<Option<mpsc::Sender<SessionEvent>>>,
-    /// Pids `set_muted` has been called with `true` for, per this mock's own
-    /// bookkeeping — cleared again on `set_muted(pid, false)`.
-    muted: Mutex<HashSet<u32>>,
-    /// Pids `set_muted` should fail for (session-mute-on-capture L3 flow E:
-    /// isolated, best-effort failure) — same shape as `MockSystem::failing_pids`.
-    failing_mute: Mutex<HashSet<u32>>,
 }
 
 /// Fake `SessionPort`. Test hooks (`add_session`/`remove_session`/`emit_event`)
@@ -547,16 +579,6 @@ impl MockSessionPort {
             let _ = tx.send(event);
         }
     }
-
-    /// Test hook: pids currently muted per this mock's own bookkeeping.
-    pub fn muted_pids(&self) -> HashSet<u32> {
-        self.0.muted.lock().unwrap().clone()
-    }
-
-    /// Test hook: make `set_muted(pid, _)` fail until cleared.
-    pub fn fail_mute(&self, pid: u32) {
-        self.0.failing_mute.lock().unwrap().insert(pid);
-    }
 }
 
 impl SessionPort for MockSessionPort {
@@ -568,19 +590,6 @@ impl SessionPort for MockSessionPort {
         let (tx, rx) = mpsc::channel();
         *self.0.events.lock().unwrap() = Some(tx);
         rx
-    }
-
-    fn set_muted(&self, pid: u32, muted: bool) -> Result<(), PortError> {
-        if self.0.failing_mute.lock().unwrap().contains(&pid) {
-            return Err(PortError::Backend(format!("mock: set_muted denied for pid {pid}")));
-        }
-        let mut set = self.0.muted.lock().unwrap();
-        if muted {
-            set.insert(pid);
-        } else {
-            set.remove(&pid);
-        }
-        Ok(())
     }
 }
 
@@ -689,6 +698,37 @@ mod tests {
     }
 
     #[test]
+    fn set_default_output_moves_what_default_output_reports() {
+        let sys = MockSystem::new(vec![endpoint("out-1"), endpoint("sink")]);
+
+        sys.set_default_output(&EndpointId("sink".into())).unwrap();
+
+        assert_eq!(sys.default_output().unwrap().id, EndpointId("sink".into()));
+        assert_eq!(sys.default_output_calls(), vec![EndpointId("sink".into())]);
+    }
+
+    #[test]
+    fn set_default_output_failure_is_surfaced_not_panicked() {
+        let sys = MockSystem::new(vec![endpoint("out-1"), endpoint("sink")]);
+        sys.fail_set_default_output();
+
+        let result = sys.set_default_output(&EndpointId("sink".into()));
+
+        assert!(result.is_err());
+        assert_eq!(sys.default_output().unwrap().id, EndpointId("out-1".into()));
+    }
+
+    #[test]
+    fn set_default_output_rejects_an_endpoint_that_is_not_present() {
+        let sys = MockSystem::new(vec![endpoint("out-1")]);
+
+        let result = sys.set_default_output(&EndpointId("sink".into()));
+
+        assert!(matches!(result, Err(PortError::NotFound(_))));
+        assert!(sys.default_output_calls().is_empty());
+    }
+
+    #[test]
     fn open_process_capture_succeeds_for_any_pid_by_default() {
         let sys = MockSystem::new(vec![]);
         assert!(sys.open_process_capture(1234, false).is_ok());
@@ -743,7 +783,7 @@ mod tests {
     #[test]
     fn default_output_honors_explicit_override() {
         let sys = MockSystem::new(vec![endpoint("out-1"), endpoint("out-2")]);
-        sys.set_default_output(EndpointId("out-2".into()));
+        sys.seed_default_output(EndpointId("out-2".into()));
         assert_eq!(sys.default_output().unwrap().id, EndpointId("out-2".into()));
     }
 

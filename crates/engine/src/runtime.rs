@@ -121,6 +121,17 @@ pub enum EngineEvent {
         on: EndpointId,
     },
     DeviceAvailable(Endpoint),
+    /// An endpoint disappeared from the system — the counterpart to
+    /// `DeviceAvailable`, and like it, sent for *every* removal regardless of
+    /// whether any group was using the device. `DeviceLost` below is the
+    /// narrower, audio-path signal ("these groups have nowhere to render");
+    /// this one just says the device list changed.
+    ///
+    /// Added for double-audio-prevention flow F: the sink endpoint is
+    /// deliberately never a group output, so its removal produces no
+    /// `DeviceLost`/`FallbackApplied` at all and was previously invisible to
+    /// the app layer.
+    DeviceRemoved(EndpointId),
     DeviceLost {
         groups: Vec<GroupId>,
     },
@@ -1949,10 +1960,15 @@ fn supervisor_loop(
         }
 
         let mut added_endpoints: Vec<Endpoint> = Vec::new();
+        // Kept separate from `dead_endpoints`, which also collects *faulted*
+        // outputs: a fault can be a format change on a device that never left,
+        // so announcing `DeviceRemoved` from that set would report removals
+        // that didn't happen. Only an actual OS removal notification lands here.
+        let mut removed_endpoints: Vec<EndpointId> = Vec::new();
         if let Some(rx) = &device_events {
             while let Ok(evt) = rx.try_recv() {
                 match evt {
-                    DeviceEvent::Removed(id) => dead_endpoints.push(id),
+                    DeviceEvent::Removed(id) => removed_endpoints.push(id),
                     DeviceEvent::Added(endpoint) => added_endpoints.push(endpoint),
                     DeviceEvent::DefaultChanged(id) => {
                         let _ = persistent.events_tx.send(EngineEvent::DefaultDeviceChanged(id));
@@ -1969,6 +1985,18 @@ fn supervisor_loop(
         // in one batch means a duplicate `EngineEvent::DeviceAvailable` to
         // the app layer (harmless but noisy — the restore path itself was
         // already idempotent via `overrides`).
+        // Announced before the recovery pass below, and unconditionally —
+        // same contract as `DeviceAvailable` in `handle_device_added`: the app
+        // layer's device list changed whether or not any group was affected.
+        removed_endpoints.sort_by(|a, b| a.0.cmp(&b.0));
+        removed_endpoints.dedup();
+        for removed in &removed_endpoints {
+            let _ = persistent
+                .events_tx
+                .send(EngineEvent::DeviceRemoved(removed.clone()));
+        }
+        dead_endpoints.extend(removed_endpoints);
+
         dead_endpoints.sort_by(|a, b| a.0.cmp(&b.0));
         dead_endpoints.dedup();
         for dead in dead_endpoints {
@@ -3175,7 +3203,7 @@ mod tests {
     #[test]
     fn device_removal_falls_back_to_default_output_and_keeps_engine_running() {
         let sys = Arc::new(MockSystem::new(two_output_endpoints()));
-        sys.set_default_output(EndpointId("out-2".into()));
+        sys.seed_default_output(EndpointId("out-2".into()));
         let mut handle = start(&snapshot(), Arc::clone(&sys) as Arc<dyn AudioSystem>).unwrap();
         let events = handle.take_events();
         // Supervisor subscribes to device events at the top of its loop, just
@@ -3185,6 +3213,13 @@ mod tests {
 
         sys.remove_endpoint(&EndpointId("out-1".into()));
         sys.emit_device_event(DeviceEvent::Removed(EndpointId("out-1".into())));
+
+        // `Removed` always fires DeviceRemoved first (the device list changed,
+        // independent of recovery), mirroring `Added`/DeviceAvailable below.
+        let removed = events
+            .recv_timeout(Duration::from_millis(1000))
+            .expect("expected a DeviceRemoved event");
+        assert!(matches!(removed, EngineEvent::DeviceRemoved(_)));
 
         let evt = events
             .recv_timeout(Duration::from_millis(1000))
@@ -3217,6 +3252,11 @@ mod tests {
         sys.remove_endpoint(&EndpointId("out-1".into()));
         sys.emit_device_event(DeviceEvent::Removed(EndpointId("out-1".into())));
 
+        let removed = events
+            .recv_timeout(Duration::from_millis(1000))
+            .expect("expected a DeviceRemoved event");
+        assert!(matches!(removed, EngineEvent::DeviceRemoved(_)));
+
         let evt = events
             .recv_timeout(Duration::from_millis(1000))
             .expect("expected a DeviceLost event");
@@ -3226,6 +3266,29 @@ mod tests {
         // "removing an in-use output device never kills the engine").
         handle.apply_params(vec![]).unwrap();
         assert!(handle.stats().ring_fill.is_empty());
+        handle.shutdown().unwrap();
+    }
+
+    /// double-audio-prevention flow F: the sink endpoint is deliberately never
+    /// a group output, so its removal reaches neither `handle_endpoint_lost`'s
+    /// fallback path nor `DeviceLost`. Without an unconditional announcement
+    /// the app layer would never learn the sink vanished.
+    #[test]
+    fn removing_an_endpoint_no_group_uses_still_announces_it() {
+        let sys = Arc::new(MockSystem::new(two_output_endpoints()));
+        let mut handle = start(&snapshot(), Arc::clone(&sys) as Arc<dyn AudioSystem>).unwrap();
+        let events = handle.take_events();
+        sleep(Duration::from_millis(50));
+
+        // out-2 is present but no group renders to it — the sink's situation.
+        sys.remove_endpoint(&EndpointId("out-2".into()));
+        sys.emit_device_event(DeviceEvent::Removed(EndpointId("out-2".into())));
+
+        let evt = events
+            .recv_timeout(Duration::from_millis(1000))
+            .expect("expected a DeviceRemoved event");
+        assert!(matches!(evt, EngineEvent::DeviceRemoved(id) if id == EndpointId("out-2".into())));
+
         handle.shutdown().unwrap();
     }
 
@@ -3241,6 +3304,9 @@ mod tests {
 
         sys.remove_endpoint(&EndpointId("out-1".into()));
         sys.emit_device_event(DeviceEvent::Removed(EndpointId("out-1".into())));
+        events
+            .recv_timeout(Duration::from_millis(1000))
+            .expect("expected a DeviceRemoved event");
         events
             .recv_timeout(Duration::from_millis(1000))
             .expect("expected a DeviceLost event");
