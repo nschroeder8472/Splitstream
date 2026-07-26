@@ -11,8 +11,8 @@ pub use graph::{
     AccentChoice, AppConfig, ConfigSnapshot, DspStageConfig, DuckSpecConfig, GraphPlan, GroupConfig,
     HotkeyChord, HotkeyKey, HotkeyMap, ProfileConfig, ProfileGroupConfig, ThemeChoice,
 };
-pub use routing::{start_routing, RoutingHandle, RoutingReader};
-pub use rules::{match_session, GlobPattern, GroupRules, MatchRule, SessionInfo};
+pub use routing::{start_routing, RoutedSession, RoutingHandle, RoutingReader};
+pub use rules::{match_session, GlobPattern, GroupRules, Match, MatchKind, MatchRule, SessionInfo};
 pub use runtime::{
     start, CaptureControl, EngineError, EngineEvent, EngineHandle, EngineStats, Epoch, StatsReader,
 };

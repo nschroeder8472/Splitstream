@@ -60,6 +60,10 @@ struct RawAppConfig {
     theme: Option<String>,
     #[serde(default)]
     accent: Option<String>,
+    /// Process file names no group may claim (routing-truthfulness.md
+    /// capability 1). Absent = empty, today's behaviour exactly.
+    #[serde(default)]
+    excluded: Vec<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -404,6 +408,7 @@ pub(crate) fn parse(text: &str) -> Result<ConfigSnapshot, ConfigError> {
             volume_bind: raw.app.volume_bind,
             theme: parse_theme(raw.app.theme)?,
             accent: parse_accent(raw.app.accent)?,
+            excluded: raw.app.excluded,
         },
         profiles,
     })
@@ -473,6 +478,11 @@ pub struct ConfigDelta {
     /// `MixerCommand` (unlike `params`, building a `Render` needs the
     /// group's current topology, same reason `dsp_chains` isn't in `params`).
     pub spatial: Option<Vec<(GroupId, bool)>>,
+    /// `[app] excluded` changes (routing-truthfulness.md) — `Some` carries
+    /// the new whole list, same shape as `rules`. Routing needs both rules
+    /// and the exclusion list together (`RoutingHandle::update_rules`'s
+    /// signature), so a caller reacts to either field the same way.
+    pub excluded: Option<Vec<String>>,
 }
 
 impl ConfigDelta {
@@ -482,6 +492,7 @@ impl ConfigDelta {
             && self.rules.is_none()
             && self.dsp_chains.is_none()
             && self.spatial.is_none()
+            && self.excluded.is_none()
     }
 }
 
@@ -522,6 +533,7 @@ pub fn diff(old: &ConfigSnapshot, new: &ConfigSnapshot) -> ConfigDelta {
     if old.master != new.master {
         params.push(MixerCommand::SetMaster(new.master));
     }
+    let excluded = (old.app.excluded != new.app.excluded).then(|| new.app.excluded.clone());
 
     for (i, (o, n)) in old.groups.iter().zip(new.groups.iter()).enumerate() {
         if o.output_device != n.output_device {
@@ -595,6 +607,7 @@ pub fn diff(old: &ConfigSnapshot, new: &ConfigSnapshot) -> ConfigDelta {
         rules: rules_changed.then(|| group_rules(new)),
         dsp_chains: (!dsp_chains.is_empty()).then_some(dsp_chains),
         spatial: (!spatial.is_empty()).then_some(spatial),
+        excluded,
     }
 }
 
@@ -1115,6 +1128,30 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].group, GroupId(0));
         assert_eq!(rules[0].rules, vec![MatchRule::ExactName("game.exe".into())]);
+    }
+
+    #[test]
+    fn diff_reports_excluded_for_an_app_excluded_only_change() {
+        let mut a = ConfigSnapshot {
+            schema_version: 2,
+            master: Gain::UNITY,
+            muted: false,
+            app: engine::AppConfig::default(),
+            profiles: Vec::new(),
+            groups: vec![group("Game", "Out", 1.0, true)],
+        };
+        let mut b = a.clone();
+        b.app.excluded = vec!["game.exe".to_string()];
+
+        let delta = diff(&a, &b);
+        assert!(!delta.structural);
+        assert!(delta.params.is_empty());
+        assert!(delta.rules.is_none());
+        assert_eq!(delta.excluded, Some(vec!["game.exe".to_string()]));
+
+        a.app.excluded = vec!["game.exe".to_string()];
+        b.app.excluded = vec!["game.exe".to_string()];
+        assert!(diff(&a, &b).is_unchanged());
     }
 
     #[test]

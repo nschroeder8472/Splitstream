@@ -81,6 +81,11 @@ pub enum ConfigEdit {
     /// `[app] accent` (visual-identity.md capability 5) — same shape as
     /// [`ConfigEdit::SetTheme`].
     SetAccent(AccentChoice),
+    /// `[app] excluded` (routing-truthfulness.md capability 1) — whole-list
+    /// replace, never add/remove (this codebase's CRUD-collapse rule,
+    /// `SetEqBands`/`SetDspChain`), so it's immune to index races between
+    /// frames.
+    SetExcluded(Vec<String>),
 }
 
 /// Which apply path an edit requires (profiles.md decision 12 — revises the
@@ -118,7 +123,8 @@ pub fn edit_path(edit: &ConfigEdit) -> EditPath {
         | ConfigEdit::RemoveProfile(..)
         | ConfigEdit::SetActiveProfile(..)
         | ConfigEdit::SetTheme(..)
-        | ConfigEdit::SetAccent(..) => EditPath::Param,
+        | ConfigEdit::SetAccent(..)
+        | ConfigEdit::SetExcluded(..) => EditPath::Param,
         ConfigEdit::SetGroupOutput(..) | ConfigEdit::AddGroup(..) | ConfigEdit::RemoveGroup(..) => {
             EditPath::Structural
         }
@@ -357,13 +363,16 @@ fn apply_edit(doc: &mut DocumentMut, edit: &ConfigEdit) -> Result<(), StoreError
         ConfigEdit::SetAccent(accent) => {
             app_table(doc)?["accent"] = value(accent_str(*accent));
         }
+        ConfigEdit::SetExcluded(excluded) => {
+            app_table(doc)?["excluded"] = value(string_array(excluded));
+        }
     }
     Ok(())
 }
 
 /// The `[app]` table, inserting an empty one if absent. Shared by every
 /// `[app]`-scoped edit (`SetAutostart`, `SetActiveProfile`, `SetTheme`,
-/// `SetAccent`) — previously each redid this lookup inline.
+/// `SetAccent`, `SetExcluded`) — previously each redid this lookup inline.
 fn app_table(doc: &mut DocumentMut) -> Result<&mut Table, StoreError> {
     doc["app"]
         .or_insert(Item::Table(Table::new()))
@@ -1238,9 +1247,44 @@ dsp = [{ type = "limiter", ceiling_db = -1.0 }]
             ConfigEdit::SetActiveProfile(None),
             ConfigEdit::SetTheme(ThemeChoice::Dark),
             ConfigEdit::SetAccent(AccentChoice::Teal),
+            ConfigEdit::SetExcluded(vec!["game.exe".into()]),
         ];
         for edit in &param {
             assert_eq!(edit_path(edit), EditPath::Param);
         }
+    }
+
+    #[test]
+    fn set_excluded_is_classified_as_a_param_edit() {
+        assert_eq!(edit_path(&ConfigEdit::SetExcluded(vec!["game.exe".into()])), EditPath::Param);
+    }
+
+    #[test]
+    fn set_excluded_creates_the_app_table_when_absent_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let snapshot = store
+            .apply(&[ConfigEdit::SetExcluded(vec!["game.exe".into(), "other.exe".into()])])
+            .unwrap();
+
+        assert_eq!(snapshot.app.excluded, vec!["game.exe".to_string(), "other.exe".to_string()]);
+    }
+
+    #[test]
+    fn removing_one_exclusion_emits_the_whole_remaining_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+        store
+            .apply(&[ConfigEdit::SetExcluded(vec!["game.exe".into(), "other.exe".into()])])
+            .unwrap();
+
+        // The UI computes the remaining list and replaces wholesale — this
+        // codebase's CRUD-collapse rule (no dedicated "remove one" variant).
+        let snapshot = store.apply(&[ConfigEdit::SetExcluded(vec!["other.exe".into()])]).unwrap();
+
+        assert_eq!(snapshot.app.excluded, vec!["other.exe".to_string()]);
     }
 }

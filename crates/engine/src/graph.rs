@@ -130,6 +130,11 @@ pub struct AppConfig {
     pub theme: ThemeChoice,
     /// Brand accent preset (visual-identity.md capability 5).
     pub accent: AccentChoice,
+    /// Process file names no group may claim (routing-truthfulness.md
+    /// capability 1) — checked ahead of every match rule, including a `*`
+    /// catch-all. Empty or absent = today's behaviour exactly; the TOML key
+    /// is written only on first use.
+    pub excluded: Vec<String>,
 }
 
 /// Theme mode (visual-identity.md decision 1). `System` follows the OS

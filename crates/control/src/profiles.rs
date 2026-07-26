@@ -179,6 +179,22 @@ mod tests {
     }
 
     #[test]
+    fn profiles_neither_capture_nor_apply_exclusions() {
+        // routing-truthfulness.md flow J: exclusions are routing identity, not
+        // a mixing parameter, same class as `match_rules` (decision 8) — a
+        // profile switch must never touch `app.excluded`. `ProfileConfig` has
+        // no `excluded` field to read from, so this holds by construction;
+        // pinned here so a future profile-scope change can't quietly break it.
+        let mut snap = snapshot(vec![group("Game", "Speakers", 0.8)], vec![]);
+        snap.app.excluded = vec!["excluded.exe".into()];
+        let captured = capture_profile(&snap, "Gaming");
+        snap.profiles.push(captured);
+
+        let edits = apply_profile(&snap, "Gaming");
+        assert!(!edits.iter().any(|e| matches!(e, ConfigEdit::SetExcluded(..))));
+    }
+
+    #[test]
     fn apply_skips_entries_for_groups_that_no_longer_exist() {
         let profile = ProfileConfig {
             name: "Gaming".into(),

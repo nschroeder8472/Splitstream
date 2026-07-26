@@ -30,8 +30,8 @@ use audio_core::{db_to_linear, linear_to_db, DspSpec, EqBandSpec, Gain, GroupId,
 use control::ConfigEdit;
 use engine::ports::Endpoint;
 use engine::{
-    AccentChoice, DuckSpecConfig, GroupConfig, MatchRule, ProfileConfig, RoutingReader, SessionInfo, StatsReader,
-    ThemeChoice,
+    AccentChoice, DuckSpecConfig, GroupConfig, MatchKind, MatchRule, ProfileConfig, RoutedSession, RoutingReader,
+    SessionInfo, StatsReader, ThemeChoice,
 };
 
 use crate::event_pump::UiState;
@@ -94,9 +94,13 @@ fn fader_height(available_height: f32) -> f32 {
 /// `RenderFaultCtx`). All borrows/`Copy` values, so trivially `Copy`.
 #[derive(Clone, Copy)]
 struct GroupColumnCtx<'a> {
-    routes: &'a [(GroupId, Vec<SessionInfo>)],
+    routes: &'a [(GroupId, Vec<RoutedSession>)],
     all_sessions: &'a [SessionInfo],
     all_groups: &'a [GroupConfig],
+    /// Process file names no group may claim (routing-truthfulness.md) —
+    /// threaded through so `handle_drop` can resolve a drag without the
+    /// column needing the whole snapshot.
+    excluded: &'a [String],
     devices: &'a [Endpoint],
     /// Per-group meter readings this frame (level-meters.md), keyed by
     /// `GroupId`, polled from `StatsReader` in `ui()`.
@@ -119,7 +123,7 @@ struct GroupColumnCtx<'a> {
 #[derive(Clone, Copy)]
 struct MasterColumnCtx<'a> {
     snapshot: &'a engine::ConfigSnapshot,
-    routes: &'a [(GroupId, Vec<SessionInfo>)],
+    routes: &'a [(GroupId, Vec<RoutedSession>)],
     all_sessions: &'a [SessionInfo],
     output_peak: &'a [(OutputId, MeterLevel)],
     /// Friendly device name per `OutputId` (level-meters.md) — from
@@ -142,7 +146,7 @@ struct MasterColumnCtx<'a> {
 /// whole instead of decomposed into its five separately-cloned fields.
 struct Frame {
     snapshot: engine::ConfigSnapshot,
-    routes: Vec<(GroupId, Vec<SessionInfo>)>,
+    routes: Vec<(GroupId, Vec<RoutedSession>)>,
     all_sessions: Vec<SessionInfo>,
     degraded: bool,
     stats: engine::EngineStats,
@@ -161,6 +165,11 @@ struct Frame {
 enum Screen {
     Mixer,
     GroupSettings(String),
+    /// The exclusion list (routing-truthfulness.md L3 flow I) — reached by a
+    /// gear on Master's header, mirroring `GroupSettings`. Master always
+    /// exists, so unlike `GroupSettings` this variant can never go stale and
+    /// needs no `screen_is_stale` fallback.
+    MasterSettings,
 }
 
 #[derive(Default)]
@@ -501,6 +510,7 @@ impl eframe::App for SettingsApp {
                     routes: &routes,
                     all_sessions: &all_sessions,
                     all_groups: &snapshot.groups,
+                    excluded: &snapshot.app.excluded,
                     devices: &available_devices,
                     group_peak: &stats.group_peak,
                     width,
@@ -566,6 +576,9 @@ impl eframe::App for SettingsApp {
                     self.group_settings_page(ui, group, &snapshot.groups, rate);
                 }
             }
+            Screen::MasterSettings => {
+                self.master_settings_page(ui, &snapshot.app.excluded);
+            }
         });
     }
 }
@@ -627,20 +640,26 @@ impl SettingsApp {
         }
     }
 
-    /// Master column (`RoughAppUI.png`): name (no gear — nothing left to
-    /// hide behind one once mute moves here, responsive-ui-refinement
-    /// decision), vertical fader sized to `fader_height`, speaker-icon mute
-    /// button directly under the fader, "Routed Apps" footer = the
-    /// *unassigned*-session pool (mixer-ui-redesign L2 decision — Master's
-    /// footer, not a separate strip). Dropping a chip here unassigns it
-    /// (drag-assign target `None`).
+    /// Master column (`RoughAppUI.png`): name + gear (routing-truthfulness.md
+    /// L3 flow I — reverses responsive-ui-refinement's "Master has no gear"
+    /// decision now that the exclusion list gives it something to hide behind),
+    /// vertical fader sized to `fader_height`, speaker-icon mute button
+    /// directly under the fader, "Not Routed" footer = the *unassigned*
+    /// (never-matched or excluded) session pool (mixer-ui-redesign L2
+    /// decision — Master's footer, not a separate strip). Dropping a chip
+    /// here unassigns it (drag-assign target `None`).
     fn master_column(&mut self, ui: &mut egui::Ui, ctx: &MasterColumnCtx) {
         let MasterColumnCtx { snapshot, routes, all_sessions, output_peak, output_names, width, height, query } =
             *ctx;
         ui.group(|ui| {
             ui.set_width(width);
             ui.vertical_centered(|ui| {
-                ui.strong("Master Volume");
+                ui.horizontal(|ui| {
+                    ui.strong("Master Volume");
+                    if ui.small_button("⚙").clicked() {
+                        self.screen = Screen::MasterSettings;
+                    }
+                });
 
                 if let Some(g) = fader(ui, snapshot.master, "master", height) {
                     self.send(ShellAction::EditParams(vec![ConfigEdit::SetMaster(g)]));
@@ -669,8 +688,9 @@ impl SettingsApp {
                     }
                 }
 
-                ui.label("Routed Apps");
+                ui.label("Not Routed");
                 let unassigned = unassigned_sessions(all_sessions, routes);
+                let no_provenance = HashMap::new();
                 let zone_ctx = ChipZoneCtx {
                     sessions: &unassigned,
                     query,
@@ -678,11 +698,14 @@ impl SettingsApp {
                     current_group: None,
                     groups: &snapshot.groups,
                     any_sessions: !all_sessions.is_empty(),
+                    kinds: &no_provenance,
                 };
                 match session_drop_zone(ui, &zone_ctx, &mut self.icons) {
-                    Some(ChipAction::Dropped(pid)) => self.handle_drop(pid, None, all_sessions, &snapshot.groups),
+                    Some(ChipAction::Dropped(pid)) => {
+                        self.handle_drop(pid, None, all_sessions, &snapshot.groups, &snapshot.app.excluded)
+                    }
                     Some(ChipAction::Assign { pid, target }) => {
-                        self.handle_drop(pid, target.as_deref(), all_sessions, &snapshot.groups)
+                        self.handle_drop(pid, target.as_deref(), all_sessions, &snapshot.groups, &snapshot.app.excluded)
                     }
                     None => {}
                 }
@@ -696,7 +719,7 @@ impl SettingsApp {
     /// to `ctx.fader_height`, "Routed Apps" footer as a drop zone
     /// (mixer-ui-redesign L2/L3).
     fn group_column(&mut self, ui: &mut egui::Ui, group: &GroupConfig, id: GroupId, ctx: &GroupColumnCtx) {
-        let GroupColumnCtx { routes, all_sessions, all_groups, devices, group_peak, width, fader_height, query } =
+        let GroupColumnCtx { routes, all_sessions, all_groups, excluded, devices, group_peak, width, fader_height, query } =
             *ctx;
         let name = group.name.clone();
 
@@ -761,7 +784,9 @@ impl SettingsApp {
                 });
 
                 ui.label("Routed Apps");
-                let sessions = routed_sessions(routes, id);
+                let routed = routed_sessions(routes, id);
+                let sessions: Vec<SessionInfo> = routed.iter().map(|r| r.info.clone()).collect();
+                let kinds: HashMap<u32, MatchKind> = routed.iter().map(|r| (r.info.pid, r.kind)).collect();
                 let zone_ctx = ChipZoneCtx {
                     sessions: &sessions,
                     query,
@@ -769,11 +794,14 @@ impl SettingsApp {
                     current_group: Some(&name),
                     groups: all_groups,
                     any_sessions: !all_sessions.is_empty(),
+                    kinds: &kinds,
                 };
                 match session_drop_zone(ui, &zone_ctx, &mut self.icons) {
-                    Some(ChipAction::Dropped(pid)) => self.handle_drop(pid, Some(&name), all_sessions, all_groups),
+                    Some(ChipAction::Dropped(pid)) => {
+                        self.handle_drop(pid, Some(&name), all_sessions, all_groups, excluded)
+                    }
                     Some(ChipAction::Assign { pid, target }) => {
-                        self.handle_drop(pid, target.as_deref(), all_sessions, all_groups)
+                        self.handle_drop(pid, target.as_deref(), all_sessions, all_groups, excluded)
                     }
                     None => {}
                 }
@@ -782,14 +810,22 @@ impl SettingsApp {
     }
 
     /// Resolves a dropped chip's pid to its process file name and sends the
-    /// resulting `ConfigEdit::SetRules` batch — shared by the master
-    /// (unassign, `target: None`) and every group column (assign) drop zone.
-    fn handle_drop(&self, pid: u32, target: Option<&str>, all_sessions: &[SessionInfo], groups: &[GroupConfig]) {
+    /// resulting `ConfigEdit::SetRules`/`SetExcluded` batch — shared by the
+    /// master (unassign, `target: None`) and every group column (assign) drop
+    /// zone.
+    fn handle_drop(
+        &self,
+        pid: u32,
+        target: Option<&str>,
+        all_sessions: &[SessionInfo],
+        groups: &[GroupConfig],
+        excluded: &[String],
+    ) {
         let Some(info) = all_sessions.iter().find(|s| s.pid == pid) else {
             return;
         };
         let file_name = session_file_name(info);
-        let edits = resolve_drag_assign(&file_name, target, groups);
+        let edits = resolve_drag_assign(&file_name, target, groups, excluded);
         if !edits.is_empty() {
             self.send(ShellAction::EditParams(edits));
         }
@@ -844,6 +880,41 @@ impl SettingsApp {
             // L3 flow D — navigate back immediately in the same click rather
             // than waiting for next frame's stale-screen fallback to catch it.
             self.screen = Screen::Mixer;
+        }
+    }
+
+    /// Master settings page (routing-truthfulness.md L3 flow I) — mirrors
+    /// `group_settings_page`: full-width, `Back` returns to the mixer. Holds
+    /// the exclusion list and nothing else; each entry gets a remove control
+    /// that emits the whole remaining list (`SetExcluded`'s CRUD-collapse
+    /// shape, decision 5). Unlike `GroupSettings`, this screen can never go
+    /// stale — Master always exists.
+    fn master_settings_page(&mut self, ui: &mut egui::Ui, excluded: &[String]) {
+        ui.horizontal(|ui| {
+            if ui.button("⬅ Back").clicked() {
+                self.screen = Screen::Mixer;
+            }
+            ui.heading("Master Settings");
+        });
+        ui.separator();
+
+        ui.label("Apps excluded from routing (play straight through Windows):");
+        if excluded.is_empty() {
+            ui.weak("Nothing excluded yet — drag a chip onto Master to exclude it.");
+        }
+        let mut remove: Option<usize> = None;
+        for (i, name) in excluded.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(name);
+                if ui.small_button("✕").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some(i) = remove {
+            let mut remaining = excluded.to_vec();
+            remaining.remove(i);
+            self.send(ShellAction::EditParams(vec![ConfigEdit::SetExcluded(remaining)]));
         }
     }
 
@@ -1740,6 +1811,11 @@ struct ChipZoneCtx<'a> {
     groups: &'a [GroupConfig],
     /// Whether any session exists anywhere — drives `NothingPlaying`.
     any_sessions: bool,
+    /// How each pid matched (routing-truthfulness.md capability 4) — empty
+    /// for the master (unassigned) pool, since nothing there is matched.
+    /// Chips absent from this map (or mapped to `MatchKind::Name`) render no
+    /// marker.
+    kinds: &'a HashMap<u32, MatchKind>,
 }
 
 /// Free-text filter plus clear button; `true` when the query changed this
@@ -1897,10 +1973,23 @@ fn session_drop_zone(ui: &mut egui::Ui, ctx: &ChipZoneCtx, icons: &mut IconCache
         }
         for session in &shown {
             let id = egui::Id::new(("session-chip", session.pid));
+            // Flow D — the gesture is prevented, not failed: an unreadable
+            // process path can't be dragged or assigned at all (capability 3),
+            // rather than accepting the drag and silently discarding it.
+            if !is_draggable(session) {
+                ui.horizontal(|ui| {
+                    chip_icon(ui, icons, session);
+                    ui.label(chip_label(session));
+                })
+                .response
+                .on_hover_text("Splitstream can't read this app's executable path, so it can't be routed.");
+                continue;
+            }
             let response = ui
                 .dnd_drag_source(id, DragSession(session.pid), |ui| {
                     ui.horizontal(|ui| {
                         chip_icon(ui, icons, session);
+                        chip_provenance_marker(ui, ctx.kinds.get(&session.pid).copied());
                         ui.label(chip_label(session));
                     });
                 })
@@ -1924,22 +2013,46 @@ fn session_drop_zone(ui: &mut egui::Ui, ctx: &ChipZoneCtx, icons: &mut IconCache
 /// (not raw `display_name` — usually empty, see `chip_label`'s doc) for a
 /// stable render order (`routes` is grouping-order from a `HashMap`
 /// upstream, not display order).
-fn routed_sessions(routes: &[(GroupId, Vec<SessionInfo>)], group: GroupId) -> Vec<SessionInfo> {
-    let mut sessions: Vec<SessionInfo> = routes
+fn routed_sessions(routes: &[(GroupId, Vec<RoutedSession>)], group: GroupId) -> Vec<RoutedSession> {
+    let mut sessions: Vec<RoutedSession> = routes
         .iter()
         .find(|(g, _)| *g == group)
         .map(|(_, sessions)| sessions.clone())
         .unwrap_or_default();
-    sessions.sort_by_key(chip_label);
+    sessions.sort_by_key(|r| chip_label(&r.info));
     sessions
 }
 
 /// Pure — every live session not currently routed to any group (Master's
-/// footer, mixer-ui-redesign L3 flow A).
-fn unassigned_sessions(all: &[SessionInfo], routes: &[(GroupId, Vec<SessionInfo>)]) -> Vec<SessionInfo> {
+/// footer, mixer-ui-redesign L3 flow A) — includes both never-matched and
+/// excluded sessions (routing-truthfulness.md), which are indistinguishable
+/// from here since both simply have no entry in `routes`.
+fn unassigned_sessions(all: &[SessionInfo], routes: &[(GroupId, Vec<RoutedSession>)]) -> Vec<SessionInfo> {
     let routed_pids: std::collections::HashSet<u32> =
-        routes.iter().flat_map(|(_, sessions)| sessions.iter().map(|s| s.pid)).collect();
+        routes.iter().flat_map(|(_, sessions)| sessions.iter().map(|r| r.info.pid)).collect();
     all.iter().filter(|s| !routed_pids.contains(&s.pid)).cloned().collect()
+}
+
+/// Pure — a session can be dragged/assigned only if Splitstream can read its
+/// process file name (routing-truthfulness.md capability 3/Flow D). An
+/// unreadable path resolves to an empty file name, and `match_session`'s own
+/// `ExactName("")` guard means assigning one would produce a rule that can
+/// never match anyway — better to prevent the gesture than accept a no-op.
+fn is_draggable(session: &SessionInfo) -> bool {
+    !session_file_name(session).is_empty()
+}
+
+/// Visible marker for *how* a chip's session matched (routing-truthfulness.md
+/// capability 4). `Name` is the default match and renders nothing — every
+/// tier behaves identically under drag (Flow A), so this is purely
+/// explanatory, never load-bearing.
+fn chip_provenance_marker(ui: &mut egui::Ui, kind: Option<MatchKind>) {
+    let (glyph, tooltip) = match kind {
+        None | Some(MatchKind::Name) => return,
+        Some(MatchKind::Pattern) => ("≈", "Matched by a pattern rule in this group"),
+        Some(MatchKind::CatchAll) => ("*", "Caught by this group's catch-all rule"),
+    };
+    ui.weak(glyph).on_hover_text(tooltip);
 }
 
 /// Pure — the process image file name `match_session` itself matches
@@ -1999,11 +2112,14 @@ fn empty_reason(zone: ZoneKind, any_sessions: bool, zone_had_chips: bool, search
     }
 }
 
-/// Text for an empty zone. `query` is only read for `NoMatches`.
+/// Text for an empty zone. `query` is only read for `NoMatches`. `AllRouted`
+/// now teaches the unassign gesture (routing-truthfulness.md Flow F/B18) —
+/// previously permanently reachable on a default (`*` catch-all) install with
+/// no way out; the exclusion tier makes the pool reachable in both directions.
 fn empty_message(reason: EmptyReason, query: &str) -> String {
     match reason {
         EmptyReason::NothingPlaying => "No apps are playing audio.".to_string(),
-        EmptyReason::AllRouted => "All apps are routed.".to_string(),
+        EmptyReason::AllRouted => "All apps are routed. Drag one here to stop routing it.".to_string(),
         EmptyReason::GroupEmpty => "Drag an app here, or right-click an app to assign it.".to_string(),
         EmptyReason::NoMatches => format!("No apps match \"{query}\"."),
     }
@@ -2021,16 +2137,51 @@ fn session_matches(session: &SessionInfo, query: &str) -> bool {
 }
 
 /// Pure — resolves a drag-drop onto `target` (`Some(group name)` = assign,
-/// `None` = drop on Master = unassign) into the minimal `ConfigEdit::SetRules`
-/// batch: target gains an `ExactName(session_file_name)` entry if it doesn't
+/// `None` = drop on Master = unassign) into the minimal edit batch
+/// (routing-truthfulness.md). An empty `session_file_name` (an unreadable
+/// process path) yields no edits at all (B10) — the caller also refuses the
+/// gesture up front (`is_draggable`), this is defense in depth.
+///
+/// **Unassign** never touches `match_rules` (decision 6) — it only adds an
+/// exclusion, so it works regardless of whether the session got there via an
+/// exact rule, a glob, or the `*` catch-all (capability 1). A session already
+/// excluded is a no-op (idempotent).
+///
+/// **Assign** clears any existing exclusion first (Flow B step 1, an
+/// idempotent no-op if it wasn't excluded), then behaves exactly as before:
+/// the target gains an `ExactName(session_file_name)` entry if it doesn't
 /// already have one, every other group loses any `ExactName` entry equal to
 /// it (case-insensitive, matching `match_session`'s own comparison). Glob
 /// rules are never touched — only exact assignments are drag-managed.
 /// Groups whose rules don't actually change are omitted from the batch.
-fn resolve_drag_assign(session_file_name: &str, target: Option<&str>, groups: &[GroupConfig]) -> Vec<ConfigEdit> {
+fn resolve_drag_assign(
+    session_file_name: &str,
+    target: Option<&str>,
+    groups: &[GroupConfig],
+    excluded: &[String],
+) -> Vec<ConfigEdit> {
+    if session_file_name.is_empty() {
+        return Vec::new();
+    }
+    let is_excluded = excluded.iter().any(|e| e.eq_ignore_ascii_case(session_file_name));
+
+    let Some(target) = target else {
+        if is_excluded {
+            return Vec::new();
+        }
+        let mut new_excluded = excluded.to_vec();
+        new_excluded.push(session_file_name.to_string());
+        return vec![ConfigEdit::SetExcluded(new_excluded)];
+    };
+
     let mut edits = Vec::new();
+    if is_excluded {
+        let new_excluded: Vec<String> =
+            excluded.iter().filter(|e| !e.eq_ignore_ascii_case(session_file_name)).cloned().collect();
+        edits.push(ConfigEdit::SetExcluded(new_excluded));
+    }
     for g in groups {
-        let is_target = target == Some(g.name.as_str());
+        let is_target = target == g.name;
         let has_exact = g.match_rules.iter().any(|r| is_exact_match_for(r, session_file_name));
         match (is_target, has_exact) {
             (true, false) => {
@@ -2073,6 +2224,10 @@ mod tests {
         }
     }
 
+    fn routed(pid: u32, name: &str, kind: MatchKind) -> RoutedSession {
+        RoutedSession { info: session(pid, name), kind }
+    }
+
     fn group(name: &str, rules: &[&str]) -> GroupConfig {
         GroupConfig {
             name: name.into(),
@@ -2092,16 +2247,16 @@ mod tests {
 
     #[test]
     fn routed_sessions_returns_sorted_sessions_for_the_matching_group() {
-        let routes = vec![(GroupId(0), vec![session(1, "b.exe"), session(2, "a.exe")])];
+        let routes = vec![(GroupId(0), vec![routed(1, "b.exe", MatchKind::Name), routed(2, "a.exe", MatchKind::Name)])];
         assert_eq!(
             routed_sessions(&routes, GroupId(0)),
-            vec![session(2, "a.exe"), session(1, "b.exe")]
+            vec![routed(2, "a.exe", MatchKind::Name), routed(1, "b.exe", MatchKind::Name)]
         );
     }
 
     #[test]
     fn routed_sessions_is_empty_for_a_group_with_no_entry() {
-        let routes = vec![(GroupId(0), vec![session(1, "a.exe")])];
+        let routes = vec![(GroupId(0), vec![routed(1, "a.exe", MatchKind::Name)])];
         assert!(routed_sessions(&routes, GroupId(1)).is_empty());
     }
 
@@ -2109,8 +2264,8 @@ mod tests {
     fn unassigned_sessions_excludes_every_pid_present_in_any_route() {
         let all = vec![session(1, "a.exe"), session(2, "b.exe"), session(3, "c.exe")];
         let routes = vec![
-            (GroupId(0), vec![session(1, "a.exe")]),
-            (GroupId(1), vec![session(3, "c.exe")]),
+            (GroupId(0), vec![routed(1, "a.exe", MatchKind::Name)]),
+            (GroupId(1), vec![routed(3, "c.exe", MatchKind::Name)]),
         ];
         assert_eq!(unassigned_sessions(&all, &routes), vec![session(2, "b.exe")]);
     }
@@ -2172,7 +2327,7 @@ mod tests {
     #[test]
     fn resolve_drag_assign_onto_a_group_with_no_prior_rule_adds_an_exact_name() {
         let groups = vec![group("Game", &[])];
-        let edits = resolve_drag_assign("game.exe", Some("Game"), &groups);
+        let edits = resolve_drag_assign("game.exe", Some("Game"), &groups, &[]);
         assert_eq!(edits.len(), 1);
         assert!(matches!(&edits[0], ConfigEdit::SetRules(name, rules)
             if name == "Game" && rules == &vec!["game.exe".to_string()]));
@@ -2181,14 +2336,14 @@ mod tests {
     #[test]
     fn resolve_drag_assign_onto_a_group_that_already_has_it_is_a_no_op() {
         let groups = vec![group("Game", &["game.exe"])];
-        let edits = resolve_drag_assign("game.exe", Some("Game"), &groups);
+        let edits = resolve_drag_assign("game.exe", Some("Game"), &groups, &[]);
         assert!(edits.is_empty());
     }
 
     #[test]
     fn resolve_drag_assign_moves_the_session_between_two_groups_in_one_batch() {
         let groups = vec![group("Music", &["game.exe"]), group("Game", &[])];
-        let mut edits = resolve_drag_assign("game.exe", Some("Game"), &groups);
+        let mut edits = resolve_drag_assign("game.exe", Some("Game"), &groups, &[]);
         edits.sort_by_key(|e| match e {
             ConfigEdit::SetRules(name, _) => name.clone(),
             _ => String::new(),
@@ -2200,29 +2355,97 @@ mod tests {
 
     #[test]
     fn resolve_drag_assign_to_master_unassigns_from_whichever_group_holds_it() {
+        // Unassign no longer strips `match_rules` (decision 6) — it adds an
+        // exclusion instead, regardless of how the session was routed.
         let groups = vec![group("Game", &["game.exe"])];
-        let edits = resolve_drag_assign("game.exe", None, &groups);
+        let edits = resolve_drag_assign("game.exe", None, &groups, &[]);
         assert_eq!(edits.len(), 1);
-        assert!(matches!(&edits[0], ConfigEdit::SetRules(name, rules) if name == "Game" && rules.is_empty()));
+        assert!(matches!(&edits[0], ConfigEdit::SetExcluded(list) if list == &vec!["game.exe".to_string()]));
     }
 
     #[test]
-    fn resolve_drag_assign_never_touches_glob_rules() {
-        // "steam.exe" is currently routed here purely via the glob match —
-        // there is no *exact* rule for it. Unassigning (target: None) must
-        // have nothing to remove: the glob rule is left standing, not
-        // stripped just because the session appears to leave the group.
+    fn unassign_emits_one_exclusion_edit_and_no_rule_edits() {
+        let groups = vec![group("Game", &["game.exe"]), group("Music", &[])];
+        let edits = resolve_drag_assign("game.exe", None, &groups, &[]);
+        assert_eq!(edits.len(), 1);
+        assert!(matches!(&edits[0], ConfigEdit::SetExcluded(list) if list == &vec!["game.exe".to_string()]));
+    }
+
+    #[test]
+    fn unassigning_a_glob_matched_session_is_no_longer_a_no_op() {
+        // Replaces the old `resolve_drag_assign_never_touches_glob_rules` —
+        // this codebase's B9 fix, deliberately reversing that decision
+        // (routing-truthfulness.md decision 2/8). "steam.exe" is routed here
+        // purely via the glob match, with no exact rule of its own; unassign
+        // must still work, via the new exclusion tier rather than touching
+        // the glob rule (which is left standing — decision 6).
         let groups = vec![group("Game", &["*steam*"])];
-        let edits = resolve_drag_assign("steam.exe", None, &groups);
+        let edits = resolve_drag_assign("steam.exe", None, &groups, &[]);
+        assert_eq!(edits.len(), 1);
+        assert!(matches!(&edits[0], ConfigEdit::SetExcluded(list) if list == &vec!["steam.exe".to_string()]));
+    }
+
+    #[test]
+    fn unassigning_an_already_excluded_session_is_a_no_op() {
+        let groups = vec![group("Game", &["game.exe"])];
+        let edits = resolve_drag_assign("game.exe", None, &groups, &["GAME.EXE".to_string()]);
         assert!(edits.is_empty());
     }
 
     #[test]
-    fn resolve_drag_assign_is_case_insensitive() {
-        let groups = vec![group("Game", &["GAME.EXE"])];
-        let edits = resolve_drag_assign("game.exe", None, &groups);
-        assert_eq!(edits.len(), 1);
-        assert!(matches!(&edits[0], ConfigEdit::SetRules(_, rules) if rules.is_empty()));
+    fn assign_from_master_clears_the_exclusion_and_adds_the_exact_name() {
+        let groups = vec![group("Game", &[])];
+        let mut edits = resolve_drag_assign("game.exe", Some("Game"), &groups, &["game.exe".to_string()]);
+        edits.sort_by_key(|e| matches!(e, ConfigEdit::SetExcluded(..)));
+        assert_eq!(edits.len(), 2);
+        assert!(edits.iter().any(|e| matches!(e, ConfigEdit::SetExcluded(list) if list.is_empty())));
+        assert!(edits.iter().any(
+            |e| matches!(e, ConfigEdit::SetRules(name, rules) if name == "Game" && rules == &vec!["game.exe".to_string()])
+        ));
+    }
+
+    #[test]
+    fn assign_then_unassign_then_assign_leaves_match_rules_unchanged() {
+        let groups = vec![group("Game", &[])];
+
+        let assign_edits = resolve_drag_assign("game.exe", Some("Game"), &groups, &[]);
+        assert_eq!(assign_edits.len(), 1);
+        assert!(matches!(&assign_edits[0], ConfigEdit::SetRules(name, rules)
+            if name == "Game" && rules == &vec!["game.exe".to_string()]));
+        let groups_after_assign = vec![group("Game", &["game.exe"])];
+
+        let unassign_edits = resolve_drag_assign("game.exe", None, &groups_after_assign, &[]);
+        assert_eq!(unassign_edits.len(), 1);
+        assert!(matches!(&unassign_edits[0], ConfigEdit::SetExcluded(list) if list == &vec!["game.exe".to_string()]));
+
+        // Re-assigning clears the exclusion; `match_rules` was never touched
+        // by the unassign step, so it's still exactly what it was — no
+        // `SetRules` edit fires here at all.
+        let reassign_edits =
+            resolve_drag_assign("game.exe", Some("Game"), &groups_after_assign, &["game.exe".to_string()]);
+        assert_eq!(reassign_edits.len(), 1);
+        assert!(matches!(&reassign_edits[0], ConfigEdit::SetExcluded(list) if list.is_empty()));
+    }
+
+    #[test]
+    fn a_drag_with_an_empty_file_name_produces_no_edits() {
+        let groups = vec![group("Game", &[])];
+        assert!(resolve_drag_assign("", Some("Game"), &groups, &[]).is_empty());
+        assert!(resolve_drag_assign("", None, &groups, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_session_with_no_readable_path_is_not_draggable() {
+        assert!(!is_draggable(&session(1, "")));
+        assert!(is_draggable(&session(1, "game.exe")));
+    }
+
+    #[test]
+    fn an_all_routed_pool_teaches_the_unassign_gesture() {
+        assert_eq!(
+            empty_message(EmptyReason::AllRouted, ""),
+            "All apps are routed. Drag one here to stop routing it."
+        );
     }
 
     #[test]
