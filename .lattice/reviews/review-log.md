@@ -144,3 +144,10 @@
 - **Result**: 0 critical, 0 warning, 1 suggestion, 1 borderline (collaborative-judgment)
 - **Key findings**: a stale-but-not-misleading test name (`resolve_drag_assign_to_master_unassigns_from_whichever_group_holds_it` — unassign is now stateless w.r.t. groups). Borderline: a bare `*` catch-all still matches an empty/unreadable file name (`wildcard_match` unchanged) — capability 3's "never produces a routing rule" wording reads stronger than what's delivered for that tier, though pre-existing and out of the blueprint's stated scope, not a regression.
 - **Strengths**: crate-boundary-aware layering kept every intermediate implementation step buildable; `resolve_drag_assign`'s empty-name early return plus the UI's `is_draggable` gate is real defense-in-depth, not duplicated logic; ~30 new/adapted tests track the blueprint's L4 contract table closely, full workspace build+test+clippy clean on forced recompile.
+
+## 2026-07-25 — B5/B6 CPU chore (spin_sleep removal + sinc tap reduction)
+- **Scope**: 4 files across engine/audio-core (Cargo.toml, runtime.rs sleep sites, resample.rs constants) — 119 workspace tests, no test files in delta
+- **Atoms**: clean-code only (single layer, no domain/trust-boundary/test-file touch)
+- **Result**: 0 critical, 1 warning — **fixed same session**
+- **Key findings**: a doc comment on `B4_BLOCK` still cited "256-tap sinc" after `SINC_LEN` dropped to 64 alongside it — fixed inline.
+- **Strengths**: all 3 `spin_sleep` call sites removed together with the dependency (grep-verified none left in code), and the new `SINC_LEN`/`OVERSAMPLING_FACTOR` comment cites the audit's actual measured benchmark numbers instead of a bare magic-number change.

@@ -356,6 +356,15 @@ support the same flags as a normal one. **Reduced to: replace `spin_sleep` with
 B5 + B6 together are ~5 lines and 2 constants — a chore, not a design. B5 still
 recovers essentially all of the reported ~3.8% CPU.
 
+**Status: fixed 2026-07-25.** `spin_sleep` replaced with `std::thread::sleep`
+at both call sites (`pid_capture_loop`, `supervisor_loop`) and the dependency
+dropped from `crates/engine/Cargo.toml`. `SINC_LEN` 256->64,
+`OVERSAMPLING_FACTOR` 128->32 in `crates/audio-core/src/resample.rs`.
+`cargo test --workspace` still 119 pass / 0 fail; `cargo clippy --workspace
+--all-targets` clean. Not yet measured on real hardware (would confirm the
+~3.8% CPU drop the addendum predicts) — B5/B6 pending real-hardware
+confirmation, same as MT1/MT3 above.
+
 ---
 
 ## Manual tests needed

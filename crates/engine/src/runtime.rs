@@ -807,7 +807,7 @@ impl CaptureControl {
         let mut failed = Vec::new();
         let mut opened = Vec::new();
         for pid in to_open {
-            let Ok(port) = self.sys.open_process_capture(pid, false) else {
+            let Ok(port) = self.sys.open_process_capture(pid, true) else {
                 failed.push(pid);
                 continue;
             };
@@ -873,7 +873,6 @@ fn pid_capture_loop(
     // frames was ~53% of a single ~10ms/48kHz interval, chronically
     // under-reading what the source actually produced.
     let mut buf = vec![0.0f32; capture_buf_samples(poll_interval, sample_rate, channels)];
-    let sleeper = spin_sleep::SpinSleeper::default();
 
     while !stop.load(Ordering::Relaxed) {
         match port.read(&mut buf) {
@@ -893,7 +892,7 @@ fn pid_capture_loop(
             }
             Err(_) => return, // this pid's stream is done — other pids/groups keep running
         }
-        sleeper.sleep(poll_interval);
+        std::thread::sleep(poll_interval);
     }
 }
 
@@ -1879,7 +1878,6 @@ fn supervisor_loop(
     let device_events = sys.subscribe_device_events().ok();
     let mut drift = DriftController::new(&[], DriftConfig::default());
     let mut known_outputs: Vec<OutputId> = Vec::new();
-    let sleeper = spin_sleep::SpinSleeper::default();
 
     while !stop.load(Ordering::Relaxed) {
         // Off-RT drop of chains retired by a `SwapChain` apply (notes §7) —
@@ -1900,7 +1898,7 @@ fn supervisor_loop(
             })
         };
         let Some(snap) = snapshot else {
-            sleeper.sleep(default_tick);
+            std::thread::sleep(default_tick);
             continue;
         };
 
@@ -1983,7 +1981,7 @@ fn supervisor_loop(
             handle_device_added(&persistent, &sys, &running, endpoint);
         }
 
-        sleeper.sleep(default_tick);
+        std::thread::sleep(default_tick);
     }
 }
 
@@ -3512,7 +3510,7 @@ mod tests {
     }
 
     /// `block` is a realistic `max_block_frames`, not a token 8: `Src` wraps a
-    /// 256-tap sinc (`resample.rs`'s `SINC_LEN`), so at a block of 8 the
+    /// 64-tap sinc (`resample.rs`'s `SINC_LEN`), so at a block of 8 the
     /// resampler spends dozens of chunks filling its delay line and emits
     /// nothing — which would make both B4 tests below pass vacuously.
     const B4_BLOCK: usize = 512;
