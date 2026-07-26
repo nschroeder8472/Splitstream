@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use audio_core::GroupId;
+use control::SinkStatus;
 use engine::ports::Endpoint;
 use engine::{ConfigSnapshot, EngineEvent, EngineStats, RoutedSession, SessionInfo};
 
@@ -34,8 +35,11 @@ pub struct UiState {
     /// True until at least one group exists — `main::needs_onboarding`'s
     /// result, kept live by `Dispatcher::set_current`.
     pub first_run: bool,
-    /// Snapshot of `AudioSystem::enumerate()` taken at startup, for the
-    /// onboarding panel's output-device picker.
+    /// `AudioSystem::enumerate()`'s result — taken at startup and refreshed
+    /// by `Dispatcher::handle_devices_changed` on every device arrival or
+    /// removal (double-audio-prevention flow A/F, which needs the sink's
+    /// presence to stay current; previously this was startup-only and every
+    /// picker built on it went stale).
     pub available_devices: Vec<Endpoint>,
     /// `AudioSystem::default_output()`'s friendly name at startup, if any —
     /// the onboarding panel's prefilled `output_device` pick.
@@ -49,6 +53,12 @@ pub struct UiState {
     /// can drop its session-only solo set (per-group-mute-solo.md decision
     /// 8). The UI must not infer this from snapshot diffs.
     pub rebuild_generation: u64,
+    /// Whether the configured sink is present and in effect
+    /// (double-audio-prevention capability 3/6). Derived by the dispatcher —
+    /// the UI renders it and never recomputes it, since two of its three
+    /// inputs (the live device list, the current default) are the
+    /// dispatcher's to know.
+    pub sink_status: SinkStatus,
 }
 
 pub struct PumpHandle {
@@ -113,6 +123,7 @@ mod tests {
             default_output_name: None,
             all_sessions: vec![],
             rebuild_generation: 0,
+            sink_status: SinkStatus::NotConfigured,
         }))
     }
 

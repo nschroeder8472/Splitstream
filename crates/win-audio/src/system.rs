@@ -64,6 +64,10 @@ impl AudioSystem for WasapiSystem {
     fn open_default_endpoint_volume(&self) -> Result<Box<dyn EndpointVolumePort>, PortError> {
         Ok(Box::new(crate::endpoint_volume::open()?))
     }
+
+    fn set_default_output(&self, id: &EndpointId) -> Result<(), PortError> {
+        crate::policy::set_default_endpoint_all_roles(&id.0)
+    }
 }
 
 #[cfg(test)]

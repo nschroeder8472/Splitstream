@@ -10,7 +10,7 @@
 //! WASAPI redirect to per-process loopback capture means there is nothing
 //! left to hide or redirect; a matched session's audio is captured directly.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -184,7 +184,7 @@ pub fn start_routing(
     for s in &initial_sessions {
         state.live_sessions.insert(s.pid, s.clone());
     }
-    let initially_degraded = reconcile(&mut state, &capture, session.as_ref(), &events);
+    let initially_degraded = reconcile(&mut state, &capture, &events);
 
     let session_events = session.take_events();
     let degraded = Arc::new(AtomicBool::new(initially_degraded));
@@ -194,7 +194,7 @@ pub fn start_routing(
     let (commands_tx, commands_rx) = mpsc::channel();
 
     let ctx = CoordinatorCtx {
-        session,
+        _session: session,
         capture,
         session_events,
         commands: commands_rx,
@@ -252,18 +252,12 @@ fn compute_desired(
 /// whether *any* group had a pid fail to open this pass — the caller stores
 /// that as the new (non-sticky) degraded signal.
 ///
-/// Also owns the session-mute-on-capture lifecycle (L3 flows A/B): diffs the
-/// full applied-pid set before/after this pass — a pid newly present gets
-/// muted, a pid newly absent gets unmuted. Mute only ever follows a
-/// *confirmed* capture success, since `state.applied` already excludes
-/// anything that failed to open this pass.
-fn reconcile(
-    state: &mut State,
-    capture: &CaptureControl,
-    session: &dyn SessionPort,
-    events: &Sender<EngineEvent>,
-) -> bool {
-    let before: HashSet<u32> = state.applied.values().flatten().map(|(pid, _)| *pid).collect();
+/// Owns no session-mute lifecycle: muting a captured app's session silences
+/// the `PROCESS_LOOPBACK` tap itself (measured 2026-07-25, MT1), so
+/// session-mute-on-capture's whole mechanism was void, not merely buggy.
+/// Double-audio is prevented by pointing the Windows default at an unheard
+/// sink instead (double-audio-prevention), which touches nothing here.
+fn reconcile(state: &mut State, capture: &CaptureControl, events: &Sender<EngineEvent>) -> bool {
     let desired = compute_desired(&state.rules, &state.excluded, &state.live_sessions, state.self_pid);
     let mut any_failure = false;
 
@@ -286,18 +280,6 @@ fn reconcile(
             // `state.applied` as it was (stale but harmless, no consumer
             // reads it once the engine is down).
             Err(_) => any_failure = true,
-        }
-    }
-
-    let after: HashSet<u32> = state.applied.values().flatten().map(|(pid, _)| *pid).collect();
-    for pid in after.difference(&before) {
-        if let Err(e) = session.set_muted(*pid, true) {
-            tracing::warn!(pid, ?e, "routing: failed to mute captured session");
-        }
-    }
-    for pid in before.difference(&after) {
-        if let Err(e) = session.set_muted(*pid, false) {
-            tracing::warn!(pid, ?e, "routing: failed to unmute released session");
         }
     }
 
@@ -339,12 +321,13 @@ fn compute_routes(state: &State) -> Vec<(GroupId, Vec<RoutedSession>)> {
 /// parameter list crossed the too-many-arguments threshold (operational
 /// learnings: extract at that point, not later).
 struct CoordinatorCtx {
-    /// Held alive for the whole coordinator lifetime (dropping it would
-    /// silently unregister the real WASAPI session-notification callback,
-    /// same gotcha `win-audio`'s COM notification wrappers document) — and,
-    /// since session-mute-on-capture, actively called every reconcile pass
-    /// (mute/unmute diff) and once more after the loop exits (shutdown sweep).
-    session: Box<dyn SessionPort>,
+    /// Held alive for the whole coordinator lifetime, and for that reason
+    /// only: dropping it would silently unregister the real WASAPI
+    /// session-notification callback (the same gotcha `win-audio`'s COM
+    /// notification wrappers document), and the `session_events` receiver
+    /// below would go quiet. Never called after `take_events` — the
+    /// mute/unmute lifecycle that used to call it is gone (see `reconcile`).
+    _session: Box<dyn SessionPort>,
     capture: CaptureControl,
     session_events: Receiver<SessionEvent>,
     commands: Receiver<Command>,
@@ -387,23 +370,12 @@ fn coordinator_loop(mut state: State, ctx: CoordinatorCtx) {
             }
         }
 
-        let any_failure = reconcile(&mut state, &ctx.capture, ctx.session.as_ref(), &ctx.events);
+        let any_failure = reconcile(&mut state, &ctx.capture, &ctx.events);
         ctx.degraded.store(any_failure, Ordering::Relaxed);
         *ctx.routes.lock().unwrap() = compute_routes(&state);
         *ctx.all_sessions.lock().unwrap() = compute_all_sessions(&state);
 
         thread::sleep(RECONCILE_TICK);
-    }
-
-    // Clean-shutdown safety (L3 flow D): unmute every pid still captured when
-    // the coordinator stops, since a still-running app's session never fires
-    // `SessionEvent::Ended`. `RoutingHandle::shutdown()`'s thread-join blocks
-    // until this finishes — synchronous for free, no new API.
-    let still_applied: HashSet<u32> = state.applied.values().flatten().map(|(pid, _)| *pid).collect();
-    for pid in still_applied {
-        if let Err(e) = ctx.session.set_muted(pid, false) {
-            tracing::warn!(pid, ?e, "routing: failed to unmute session on shutdown");
-        }
     }
 }
 
@@ -635,101 +607,4 @@ mod tests {
         engine.shutdown().unwrap();
     }
 
-    #[test]
-    fn a_newly_captured_pid_gets_muted() {
-        let (capture, engine) = test_capture();
-        let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
-        let (tx, _rx) = mpsc::channel();
-
-        let handle = start_routing(game_rules(), vec![], 0, Box::new(sessions.clone()), capture, tx).unwrap();
-
-        assert!(sessions.muted_pids().contains(&100));
-        handle.shutdown();
-        engine.shutdown().unwrap();
-    }
-
-    #[test]
-    fn a_released_pid_gets_unmuted() {
-        let (capture, engine) = test_capture();
-        let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
-        let (tx, _rx) = mpsc::channel();
-
-        let handle = start_routing(game_rules(), vec![], 0, Box::new(sessions.clone()), capture, tx).unwrap();
-        assert!(sessions.muted_pids().contains(&100));
-
-        sessions.emit_event(SessionEvent::Ended(100));
-        let deadline = std::time::Instant::now() + StdDuration::from_secs(2);
-        while sessions.muted_pids().contains(&100) && std::time::Instant::now() < deadline {
-            thread::sleep(StdDuration::from_millis(20));
-        }
-        assert!(!sessions.muted_pids().contains(&100));
-        handle.shutdown();
-        engine.shutdown().unwrap();
-    }
-
-    #[test]
-    fn shutdown_unmutes_every_still_captured_pid() {
-        let (capture, engine) = test_capture();
-        let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
-        let (tx, _rx) = mpsc::channel();
-
-        let handle = start_routing(game_rules(), vec![], 0, Box::new(sessions.clone()), capture, tx).unwrap();
-        assert!(sessions.muted_pids().contains(&100));
-
-        handle.shutdown();
-        assert!(
-            sessions.muted_pids().is_empty(),
-            "clean shutdown must unmute every session still captured when the coordinator stops"
-        );
-        engine.shutdown().unwrap();
-    }
-
-    #[test]
-    fn a_pid_that_fails_to_capture_is_never_muted() {
-        let sys_inner = Arc::new(MockSystem::new(vec![]));
-        sys_inner.fail_process_capture(100);
-        let sys: Arc<dyn crate::ports::AudioSystem> = sys_inner;
-        let snapshot = crate::graph::ConfigSnapshot {
-            schema_version: 2,
-            master: audio_core::Gain::UNITY,
-            muted: false,
-            app: crate::graph::AppConfig::default(),
-            profiles: Vec::new(),
-            groups: vec![],
-        };
-        let engine = runtime::start(&snapshot, sys).unwrap();
-        let capture = engine.capture_control();
-
-        let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
-        let (tx, _rx) = mpsc::channel();
-
-        let handle = start_routing(game_rules(), vec![], 0, Box::new(sessions.clone()), capture, tx).unwrap();
-
-        assert!(handle.is_degraded());
-        assert!(
-            !sessions.muted_pids().contains(&100),
-            "a pid that failed to open must never be muted"
-        );
-        handle.shutdown();
-        engine.shutdown().unwrap();
-    }
-
-    #[test]
-    fn a_mute_failure_is_isolated_and_does_not_mark_routing_degraded() {
-        let (capture, engine) = test_capture();
-        let sessions = MockSessionPort::new(vec![session(100, "game.exe")]);
-        sessions.fail_mute(100);
-        let (tx, _rx) = mpsc::channel();
-
-        let handle = start_routing(game_rules(), vec![], 0, Box::new(sessions.clone()), capture, tx).unwrap();
-
-        assert!(!handle.is_degraded(), "a mute failure is cosmetic, not a routing degradation");
-        assert_eq!(
-            handle.current_routes(),
-            vec![(GroupId(0), vec![routed(100, "game.exe", MatchKind::Name)])],
-            "capture itself must succeed even though mute failed"
-        );
-        handle.shutdown();
-        engine.shutdown().unwrap();
-    }
 }

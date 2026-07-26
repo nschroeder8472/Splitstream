@@ -2,7 +2,7 @@
 feature: double-audio-prevention
 requirement_doc: Splitstream-Engineering-Spec.md
 created: 2026-07-25
-status: approved
+status: complete
 note: >
   Replaces session-mute-on-capture, whose mechanism was disproved on real
   hardware (MT1, 2026-07-25). Origin is a live user bug report — routed apps
@@ -209,7 +209,7 @@ upgrade — it replaces *only* the sink, behind the same seam, and is far smalle
 than Sonar's multi-device driver. Nothing else in the design changes when it
 arrives.
 
-### Open question — MT9 (blocking Level 2, not Level 1)
+### Open question — MT9 (blocking Level 2, not Level 1) — **RESOLVED 2026-07-26: inert, see Open Questions**
 
 **Does the sink endpoint's own volume/mute affect what `PROCESS_LOOPBACK`
 captures?** MT1 proved *session*-level volume does. Endpoint volume is applied
@@ -372,9 +372,9 @@ drift-and-recovery is unaffected — the sink is never a group *output*.
 
 `compute_suspended` becomes effectively always-false: it exists to suspend when
 the bound group's output *is* the default, and no group outputs to the sink.
-Gated by MT9 — if the sink's endpoint volume passes through to the tap, this
-flow attenuates twice and the design must pin the sink at 100% and source key
-input differently. Flow shape unchanged; only compensation differs.
+Was gated by MT9. **Resolved 2026-07-26 by measurement: the sink's endpoint
+volume does not reach the tap**, so this flow stands exactly as written — no
+double attenuation, nothing to pin, no compensation to add.
 
 **Flow H — already-running apps.** Windows migrates shared-mode streams opened
 against the default endpoint when the default changes; apps that opened a
@@ -602,6 +602,24 @@ machine is audible only through Splitstream while it owns the default; one
 undocumented COM surface returns, narrowly; unrouted apps depend on a `*`
 catch-all existing.
 
+## Key Files
+
+| File | Layer | Role |
+|---|---|---|
+| `crates/control/src/sink.rs` | `control` — pure | NEW. `SinkStatus` + `resolve_sink_status`. No device access, no I/O |
+| `crates/win-audio/src/policy.rs` | `win-audio` — infrastructure | NEW. `IPolicyConfigWin7` (12 slots) + `set_default_endpoint_all_roles` |
+| `crates/engine/src/ports/mod.rs` | `engine` — ports | `AudioSystem::set_default_output` added (default body errors); `SessionPort::set_muted` removed |
+| `crates/engine/src/ports/mock.rs` | test infra | `MockSystem` opts in to `set_default_output`; `MockSessionPort` mute hooks removed |
+| `crates/engine/src/routing.rs` | `engine` — application | Mute diff, shutdown sweep and `reconcile`'s `session` param removed |
+| `crates/engine/src/runtime.rs` | `engine` | `EngineEvent::DeviceRemoved` added (see decision below) |
+| `crates/engine/src/graph.rs` | `engine` — config types | `AppConfig` + `sink_device` / `manage_default` / `previous_default` |
+| `crates/control/src/config.rs` | `control` | Parses the three new `[app]` keys |
+| `crates/control/src/store.rs` | `control` | Four new `EditPath::Param` edits; `set_optional_app_key` extracted |
+| `crates/app/src/main.rs` | `app` — shell | Flows B/C/D/E/F/G; pure decisions `take_default_edits`, `sink_to_assert`, `bound_target_values`, `lacks_catch_all`, `groups_outputting_to_sink` |
+| `crates/app/src/ui.rs` | `app` — UI | Sink banner, sink picker, per-column `K` volume-keys toggle |
+| `crates/app/src/event_pump.rs` | `app` | `UiState.sink_status`; `available_devices` now refreshed, not startup-only |
+| `.lattice/implementation-notes.md` §13 | notes | Rewritten: the 2-method `IPolicyConfig` sketch replaced with the verified 12-slot layout |
+
 ## Decisions Log
 
 <!-- Add new at bottom. Never remove. -->
@@ -621,6 +639,19 @@ catch-all existing.
 | 2026-07-26 | **Design approved at Level 4. Status set to `approved` — ready for implementation.** | All four level sections persisted. Drift check against `Splitstream-Engineering-Spec.md` complete: 5 overrides + 3 additions, body text edited in every named section plus a `## Links` entry (user confirmed). Two open items carried into implementation (MT9, MT10), neither blocking — both refine compensation/setup detail, not contracts. | — |
 | 2026-07-26 | **Volume keys drive the *selected* group, not a statically configured one** (capability 5). | Sonar gets per-channel keyboard control by having per-channel devices; with one sink Splitstream needs the binding to follow UI selection instead. Existing machinery already fits: `VolumeTarget::{Master, Group(String)}` and the whole mirror path exist (external-controls), so this is a change of *what selects the target*, not new transport. Bonus: `compute_suspended` (main.rs:363) suspends the mirror when the bound group's output device is the default — with the default now always the sink and no group outputting to it, that condition goes dead and the mirror becomes always-live. The architecture retires an existing wart. | A fixed configured group (today's behavior — one group gets keys, others need the UI). |
 
+| 2026-07-26 | **`IPolicyConfig`'s IID, 12-slot vtable order and `CPolicyConfigClient`'s CLSID all verified against EarTrumpet's live source at implementation time**, as Level 4 required. IID and slot order from `Interop/MMDeviceAPI/IPolicyConfig.cs`; CLSID from `PolicyConfigClient.cs` (not in the first file — Level 4 had flagged it as unverified). Both matched the design's values exactly. | The one thing in this design that fails as memory corruption rather than an error code. This repo has already trusted an in-repo sketch of this exact interface once and been wrong. | Trusting Level 4's recorded values without re-fetching. |
+| 2026-07-26 | **`EngineEvent::DeviceRemoved` added** — fired unconditionally from the supervisor's `DeviceEvent::Removed`, mirroring `DeviceAvailable`. Relay forwards add+remove to a new `ShellAction::DevicesChanged`; the dispatcher re-enumerates and refreshes both `UiState.available_devices` and `SinkStatus`. | **Level 2's claim that the observation plumbing was already complete was wrong for removals.** `handle_endpoint_lost` returns early when the removed endpoint is not an output any group uses — and the sink is *by design* never a group output, so its removal produced no event at all. Flow F's stated trigger could not fire. Also fixes `available_devices` having been a startup-only snapshot since it was introduced, which would have kept `SinkStatus` from ever reaching `Missing` even with an event. | Polling `enumerate()` on the dispatcher's 50 ms tick (a COM call 20x/second on a tick that does only in-memory work); accepting flow F as non-functional and recording it as a known gap. |
+| 2026-07-26 | **`take_default_edits` refuses to record the sink as `previous_default`.** | Taking the default while the sink already *is* the default would record the sink as the device to restore to — making a clean quit a no-op and leaving the machine on an endpoint nobody can hear. Not in the contract; the guard costs one condition and the failure mode it prevents is the worst one this feature can produce. | Trusting that the UI only ever offers the action from `NotDefault`. |
+| 2026-07-26 | **A group whose `output_device` is the sink is warned about in the mixer.** | Two independent device pickers can resolve to one endpoint — the exact shape of the 2026-07-21 operational learning about onboarding's `bus_endpoint`/`output_device` collision. No feedback loop results (routing's self-exclusion prevents capturing our own render), which is precisely why nothing else would surface it: the group just goes silent. | Leaving it to the picker's help text, which is already there and is not enforcement. |
+| 2026-07-26 | **`AssertTrigger` enum with two call sites, one of which always answers "no".** | Flow E's "never re-assert" rule would otherwise exist only as the *absence* of a call — invisible to a reader and trivially broken by a future edit. Making the trigger a value puts the rule in code at the one place someone would be tempted to add a re-assertion. | Documenting the rule in a comment on `handle_default_device_changed`. |
+| 2026-07-26 | **`MockSystem`'s existing inherent `set_default_output` test hook renamed `seed_default_output`; the trait method rejects an endpoint it does not have.** | An inherent method of the same name silently shadows the trait method at every call site, with no error. And a mock that accepts any id could not express "the sink is not installed", which is exactly the condition flow F exists to observe (the 2026-07-25 learning about doubles that never say no). | Leaving both and relying on call sites to disambiguate. |
+| 2026-07-26 | **Implementation complete.** Full workspace build, 474 tests, clippy clean. Not yet validated on real hardware: the `#[ignore]`d vtable-slot proof, MT9 and MT10. | — | — |
+
+| 2026-07-26 | **Post-completion fix 1 (review):** `set_default_output_by_name` returns success; flow C clears `previous_default` only when the restore actually worked (`post_restore_edits`). | It returned `()` and swallowed both failure modes, so a failed restore erased the only record of the user's real device while `manage_default` stayed true. The doc comment asserted the opposite behaviour, which made the wrong code read as deliberate. | Leaving it best-effort like its sibling COM helpers (correct for them; wrong the moment a caller records state around the outcome). |
+| 2026-07-26 | **Post-completion fix 2 (found on hardware):** `sink_to_assert` replaced by `plan_sink_takeover`, returning the recording edits and the sink **together** as a `SinkTakeover`; all three call sites funnel through `take_sink_as_default(trigger)`. `AssertTrigger` gained `UserRequest`. | L3 flow B pairs "record what is displaced" with "take" only in step 2 (the one-time click). Step 3's every-start re-assertion took without recording, so from the *second* run onward `previous_default` was empty and every clean quit left the machine on the sink — silent. Implemented faithfully to the design; the design is where the pairing was lost. Fix makes a takeover-without-record unrepresentable rather than adding a second call. **Confirmed on hardware over three consecutive take/restore cycles.** | Adding the missing `apply_params` call at the startup site (leaves the same trap for the next call site added). |
+| 2026-07-26 | **Post-completion fix 3:** `control::sink::quit_would_strand` + a banner that names the situation and asks which device to restore to. | Starting while the sink is *already* the default with nothing recorded (a manual default, or the state fix 2's bug used to leave behind) plans no takeover, records nothing, and quitting strands the machine silent with no in-app way out. The two causes are indistinguishable from inside the app, so it asks instead of guessing a device. Not a `SinkStatus` variant: the status is a pure function of the three device facts, this also depends on what has been recorded. | Guessing a restore target (inventing an answer); silently doing nothing (the state the user actually hit). |
+| 2026-07-26 | **Real-hardware validation: vtable slot 11 PASSED, MT9 resolved (inert), MT10 half-resolved (shared-mode migrates).** 482 tests, clippy clean. | Slot 11 confirmed against a live `IPolicyConfig` — the corruption class no unit test can reach. MT9 removes flow G's last conditional. MT10's remaining half is documentation scope only. | — |
+
 ## Constraints
 
 Inherited (binding): `win-audio` is the only crate touching `windows-rs`/COM;
@@ -632,21 +663,77 @@ be used to silence a captured app — MT1 proves it silences the capture.
 
 ## Open Questions
 
-- **MT9** (blocking Level 2) — does the sink endpoint's own volume/mute pass
-  through to `PROCESS_LOOPBACK`? Determines whether the sink's volume slider is
-  an inert free control surface (capability 5 reads it as a plain number) or a
-  real attenuation the group-gain mirror would square. Procedure in Grounding.
-- **Unrouted-app silence** (Level 1 capability 2) — with the default pointed at
-  the sink, an app matching no rule is *inaudible*, not merely unprocessed.
-  The `*` catch-all is the intended answer, but first-run must guarantee one
-  exists and the UI must make its absence obvious. Interacts with the
-  2026-07-25 finding that a `*` catch-all makes Master's unassigned pool
-  permanently empty — re-walk that seam before Level 2 closes.
-- **Default-device restore on unclean exit** — clean-shutdown-only is the
-  proposed posture (inherited from session-mute-on-capture), but the failure
-  mode is worse here: a crash leaves the machine's default pointed at a sink,
-  i.e. fully silent, versus merely one app muted. Revisit whether persisted
-  recovery is warranted this time rather than inheriting the old scope call.
+All remaining questions are **real-hardware measurements**. Nothing in the code
+is blocked on them; each refines compensation or setup detail, not a contract.
+
+- **Vtable-slot proof** — `policy::tests::set_default_endpoint_is_vtable_slot_11`,
+  `#[ignore]`d. A wrong slot is memory corruption rather than an error code, and
+  no unit test can reach it. IID, slot order and CLSID were all verified against
+  EarTrumpet's live source at implementation time, so this is confirmation rather
+  than discovery — but it is the confirmation that matters most.
+  Run: `cargo test -p win-audio -- --ignored --nocapture set_default_endpoint_is_vtable_slot_11`
+  (moves the default playback device and restores it).
+- **MT10 — PARTIALLY MEASURED 2026-07-26. Shared-mode streams migrate;
+  explicit-device apps still unmeasured.** With music playing audibly through
+  `Headphones (2- FiiO K11)`, switching the Windows default to VB-CABLE
+  mid-playback silenced it — i.e. Vivaldi's stream followed the default to the
+  new endpoint, no restart needed.
+
+  That covers the dominant case and it is the good outcome. What it does *not*
+  cover is the case the test exists to find: an app that opened a specific
+  device explicitly (games, DAWs) rather than the default. Those are expected
+  not to migrate and to keep playing to the old device until restarted, and a
+  browser cannot stand in for them — shared-mode-follows-default was always the
+  likely half.
+
+  **Consequence if the remaining half comes back "does not migrate":** setup
+  guidance gains one line ("restart your apps once after switching"). No code
+  either way — this is documentation scope, which is why it never blocked
+  implementation.
+
+### Resolved during implementation
+
+- **MT9 — MEASURED 2026-07-26, conclusive: the sink's endpoint volume is
+  INERT with respect to `PROCESS_LOOPBACK`.** Case 2 of the two the design
+  named. `open_and_read_a_real_process` against Vivaldi (pid 43848, whole
+  process tree) rendering into VB-CABLE as the Windows default, three passes
+  per condition:
+
+  | Sink endpoint volume | Peaks | Mean |
+  |---|---|---|
+  | 100% | 0.506, 0.525, 0.496 | 0.509 |
+  | 30% | 0.513, 0.489, 0.488 | 0.497 |
+
+  2.4% apart — *smaller than the source's own spread inside the 100% run*
+  (0.496–0.525, ~6%). Pass-through would have read near 0.15. The slider was
+  confirmed to have actually applied rather than being silently ignored
+  (`open_and_read_real_endpoint_volume` read back `level=0.29999998
+  muted=false`), which is what separates a real negative from a null result —
+  the same discipline MT1 forced.
+
+  **Consequences:** flow G stands exactly as designed — no double attenuation,
+  no squared response, no compensation to add. The sink's volume slider is a
+  free control surface Splitstream reads as a plain number, which is what the
+  volume-key binding wants, and `compute_suspended` going effectively
+  always-false holds. Measured against VB-CABLE; the mechanism (the tap is
+  per-process, ahead of the per-device post-mix stage) is why it generalises,
+  but a future own-driver sink is worth re-measuring rather than assuming.
+
+
+- **Unrouted-app silence** (capability 2) — resolved. First-run onboarding
+  already creates the catch-all (`match_rules: ["*"]` on the "Main" group), so
+  the `control`-side guarantee needed no change; the gap was a *later* edit
+  removing it. `lacks_catch_all` + a mixer warning covers that. The feared
+  interaction with the 2026-07-25 "a `*` catch-all makes Master's unassigned
+  pool permanently empty" finding does not bite: routing-truthfulness's
+  exclusion tier is what unassignment resolves to now, and it is checked ahead
+  of every rule including `*`.
+- **Default-device restore on unclean exit** — resolved as **persisted
+  recovery**, not the inherited clean-shutdown-only posture. `previous_default`
+  is written only when empty and cleared only on a clean restore, so a value
+  surviving a restart *is* the signal that the last exit was unclean, and the
+  user's true pre-Splitstream device is still recoverable. One config key; the
+  failure mode it covers is a fully silent machine.
 
 ## Superseded
 

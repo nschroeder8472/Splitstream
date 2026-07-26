@@ -1,5 +1,4 @@
 # Review Log
-
 ## History
 - 2026-07-22 level-meters (full implementation) — 0 critical/1 warning/3 suggestion, warning fixed; `OutputId`-order mislabeling after a parked group fixed with a real name map
 - 2026-07-22 responsive-ui-refinement — 1 critical/warning borderline/0/1, both fixed; concave speaker-cone polygon (epaint convex-only) split into two convex calls
@@ -11,20 +10,8 @@
 - 2026-07-21 simple-launch (control+app infra) — 0/1/2, blocking-call-under-shared-lock + duplicated `write_atomic` fixed
 - 2026-07-19 engine-core (P0-P1) — 0/2/5, all fixed; `build_running_graph` SRP split + `mixer_loop` param-count cleanup
 - 2026-07-19 channel-mixdown — 0/1/0, unguarded FL/FR/FC fold arms fixed, real-hardware validated
-
-## 2026-07-20 — drift-and-recovery (P2), full implementation
-- **Scope**: 12 files across engine/win-audio, application+infrastructure layers
-- **Atoms**: clean-code, architecture, secure-coding, test-quality (DDD skipped — no domain files touched)
-- **Result**: 1 critical, 0 warning, 1 suggestion — both fixed same session
-- **Key findings**: `OnDeviceAdded` called `IMMDeviceEnumerator::GetDevice` synchronously inside the `IMMNotificationClient` callback — MSDN-documented deadlock risk on the OS's shared notification thread; fixed by deferring the describe work to a spawned worker thread. `handle_device_added` lacked the duplicate-notification guard `handle_endpoint_lost` has; fixed by deduping `added_endpoints` by id per supervisor tick, same pattern as the existing `dead_endpoints` dedup.
-- **Strengths**: engine layer matched the approved L4 blueprint exactly; 87 tests passing including real-hardware validation of `default_output()` against live WASAPI; clean RAII unregister-on-drop for the COM notification lifetime
-
-## 2026-07-20 — drift-and-recovery (P2), follow-up review of uncommitted diff
-- **Scope**: 13 files (11 modified + clock.rs/monitor.rs new) across engine/win-audio, same P2 feature re-reviewed pre-commit
-- **Atoms**: clean-code, architecture, secure-coding, test-quality (DDD skipped — no domain files touched)
-- **Result**: 0 critical, 1 warning, 4 suggestion — none fixed yet (all polish-level, left for author)
-- **Key findings**: `render_loop` carries 7 raw params while sibling `capture_loop` was refactored to a context struct in this same diff for exactly that reason; fixed-`sleep` before emitting mock device events in supervisor integration tests is a latent CI-flakiness seed; multi-fault-per-tick triggers N sequential rebuilds instead of batching (undocumented, unlike the codebase's other accepted rebuild race)
-- **Strengths**: `cargo check`/`cargo test --workspace`/`cargo clippy` all clean (44/44 engine tests passing); drift PI loop stays pure and unit-tested via synthetic curves; COM callback correctly defers to a worker thread, matching this project's own documented deadlock learning
+- 2026-07-20 drift-and-recovery (P2) — 1/0/1, both fixed same session
+- 2026-07-20 drift-and-recovery (P2), follow-up diff — 0/1/4, none fixed (all polish-level, left for author)
 
 ## 2026-07-20 — session-routing (P3), full implementation
 - **Scope**: 16 files (12 modified + 4 new) across engine/control/win-audio/app, application+infrastructure+shell layers
@@ -151,3 +138,10 @@
 - **Result**: 0 critical, 1 warning — **fixed same session**
 - **Key findings**: a doc comment on `B4_BLOCK` still cited "256-tap sinc" after `SINC_LEN` dropped to 64 alongside it — fixed inline.
 - **Strengths**: all 3 `spin_sleep` call sites removed together with the dependency (grep-verified none left in code), and the new `SINC_LEN`/`OVERSAMPLING_FACTOR` comment cites the audit's actual measured benchmark numbers instead of a bare magic-number change.
+
+## 2026-07-26 — double-audio-prevention, full implementation
+- **Scope**: 19 files across engine/win-audio/control/app + 2 new (`control/sink.rs`, `win-audio/policy.rs`); ~1127 insertions/318 deletions, 476 workspace tests
+- **Atoms**: clean-code, architecture, secure-coding, test-quality (all layers, new COM/FFI, inline tests; DDD light — `SinkStatus` is a derived value object, no domain folder touched)
+- **Result**: 1 critical, 2 warning, 4 suggestion — **all 7 fixed same session**
+- **Key findings**: `restore_previous_default` cleared the persisted `previous_default` key even when the restore failed, because `set_default_output_by_name` returned `()` and swallowed both failure modes — erasing the user's only route back while `manage_default` stayed true, i.e. a permanently silent machine, the exact state flow D exists to prevent. Its doc comment asserted the opposite behaviour. Root cause: flow C was the one flow whose decision was never extracted into a pure function, so L4's own `clean_quit_restores_the_previous_default_and_clears_the_key` contract was never written and nothing was green-or-red about it.
+- **Strengths**: `policy.rs`'s undocumented-COM surface is tight and correct — IID, all 12 vtable slots and the CLSID re-derived from EarTrumpet's live source rather than the in-repo sketch that caused a prior failure, UTF-16 buffer outlives every call, all three roles attempted without an early `?`, and no config string ever reaches COM raw (device names resolve to enumerated `EndpointId`s first).

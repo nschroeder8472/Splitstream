@@ -135,6 +135,20 @@ pub struct AppConfig {
     /// catch-all. Empty or absent = today's behaviour exactly; the TOML key
     /// is written only on first use.
     pub excluded: Vec<String>,
+    /// Friendly name of the endpoint routed apps are parked on
+    /// (double-audio-prevention capability 1) — VB-CABLE in v1. Every app
+    /// renders here, nobody listens here, and only Splitstream's processed
+    /// copy reaches a real device. `None` = not configured yet.
+    pub sink_device: Option<String>,
+    /// The user opted in to Splitstream owning the Windows default output
+    /// (L3 flow B). While true, every start re-asserts the sink.
+    pub manage_default: bool,
+    /// The default endpoint in effect before Splitstream took it. Written
+    /// only when empty (flow B rule 2) and cleared on a clean restore (flow
+    /// C), so a value still present at startup means the previous exit was
+    /// unclean and the true pre-Splitstream device is still recoverable
+    /// (flow D).
+    pub previous_default: Option<String>,
 }
 
 /// Theme mode (visual-identity.md decision 1). `System` follows the OS

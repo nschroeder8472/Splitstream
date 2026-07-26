@@ -99,6 +99,21 @@ pub trait AudioSystem: Send + Sync {
     fn open_default_endpoint_volume(&self) -> Result<Box<dyn EndpointVolumePort>, PortError> {
         Err(PortError::Backend("endpoint volume not supported by this backend".into()))
     }
+
+    /// Makes `id` the Windows default render endpoint for **all three roles**
+    /// (`eConsole`, `eMultimedia`, `eCommunications`) — double-audio-prevention
+    /// L4. Leaving communications behind would let Discord-class apps keep
+    /// rendering to the real device and double there, which is the exact bug
+    /// this exists to remove.
+    ///
+    /// Default body errors so mocks and future backends need no change unless
+    /// they opt in (the `open_default_endpoint_volume` precedent). This is a
+    /// *capability* method, not a constraint-reporting one — contrast
+    /// [`RenderPort::free_frames`], which must have no default body.
+    fn set_default_output(&self, id: &EndpointId) -> Result<(), PortError> {
+        let _ = id;
+        Err(PortError::Backend("set_default_output not supported by this backend".into()))
+    }
 }
 
 /// A volume change the binding did **not** cause — the adapter filters its own
@@ -147,12 +162,6 @@ pub trait SessionPort: Send {
     fn enumerate(&mut self) -> Result<Vec<SessionInfo>, PortError>;
     /// Single-consume, same pattern as `EngineHandle::take_events`.
     fn take_events(&mut self) -> Receiver<SessionEvent>;
-    /// Best-effort — pid not currently found among live sessions (already
-    /// exited) is `Ok(())`, not an error (session-mute-on-capture L3 flow E:
-    /// failures are isolated, caller logs and moves on, never blocks
-    /// reconcile). `&self`, not `&mut self` — same "this is really an OS RPC
-    /// call" reasoning as `AudioSystem`'s methods; no persistent state needed.
-    fn set_muted(&self, pid: u32, muted: bool) -> Result<(), PortError>;
 }
 
 /// Polled ~period/2 (spec Appendix A) — loopback event mode is historically unreliable.

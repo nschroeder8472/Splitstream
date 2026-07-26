@@ -86,6 +86,23 @@ pub enum ConfigEdit {
     /// `SetEqBands`/`SetDspChain`), so it's immune to index races between
     /// frames.
     SetExcluded(Vec<String>),
+    /// `[app] sink_device` (double-audio-prevention capability 1) — which
+    /// endpoint routed apps are parked on. Same shape as `volume_bind`:
+    /// `None` clears the key.
+    SetSinkDevice(Option<String>),
+    /// `[app] manage_default` (L3 flow B) — the user opted in to Splitstream
+    /// owning the Windows default output.
+    SetManageDefault(bool),
+    /// `[app] previous_default` (L3 flows B/C/D) — the default in effect
+    /// before Splitstream took it. Written only when empty, cleared on a
+    /// clean restore; a value surviving a restart means the last exit was
+    /// unclean.
+    SetPreviousDefault(Option<String>),
+    /// `[app] volume_bind` (double-audio-prevention capability 5) — which
+    /// target the hardware volume keys drive. The key already existed and
+    /// already persists; only the UI affordance for setting it is new, so
+    /// selection survives a restart with no new state.
+    SetVolumeBind(Option<String>),
 }
 
 /// Which apply path an edit requires (profiles.md decision 12 — revises the
@@ -124,7 +141,11 @@ pub fn edit_path(edit: &ConfigEdit) -> EditPath {
         | ConfigEdit::SetActiveProfile(..)
         | ConfigEdit::SetTheme(..)
         | ConfigEdit::SetAccent(..)
-        | ConfigEdit::SetExcluded(..) => EditPath::Param,
+        | ConfigEdit::SetExcluded(..)
+        | ConfigEdit::SetSinkDevice(..)
+        | ConfigEdit::SetManageDefault(..)
+        | ConfigEdit::SetPreviousDefault(..)
+        | ConfigEdit::SetVolumeBind(..) => EditPath::Param,
         ConfigEdit::SetGroupOutput(..) | ConfigEdit::AddGroup(..) | ConfigEdit::RemoveGroup(..) => {
             EditPath::Structural
         }
@@ -349,13 +370,7 @@ fn apply_edit(doc: &mut DocumentMut, edit: &ConfigEdit) -> Result<(), StoreError
             profiles.remove(index);
         }
         ConfigEdit::SetActiveProfile(name) => {
-            let app = app_table(doc)?;
-            match name {
-                Some(n) => app["active_profile"] = value(n.as_str()),
-                None => {
-                    app.remove("active_profile");
-                }
-            }
+            set_optional_app_key(doc, "active_profile", name.as_deref())?;
         }
         ConfigEdit::SetTheme(theme) => {
             app_table(doc)?["theme"] = value(theme_str(*theme));
@@ -366,18 +381,49 @@ fn apply_edit(doc: &mut DocumentMut, edit: &ConfigEdit) -> Result<(), StoreError
         ConfigEdit::SetExcluded(excluded) => {
             app_table(doc)?["excluded"] = value(string_array(excluded));
         }
+        ConfigEdit::SetSinkDevice(name) => {
+            set_optional_app_key(doc, "sink_device", name.as_deref())?;
+        }
+        ConfigEdit::SetManageDefault(on) => {
+            app_table(doc)?["manage_default"] = value(*on);
+        }
+        ConfigEdit::SetPreviousDefault(name) => {
+            set_optional_app_key(doc, "previous_default", name.as_deref())?;
+        }
+        ConfigEdit::SetVolumeBind(target) => {
+            set_optional_app_key(doc, "volume_bind", target.as_deref())?;
+        }
     }
     Ok(())
 }
 
 /// The `[app]` table, inserting an empty one if absent. Shared by every
-/// `[app]`-scoped edit (`SetAutostart`, `SetActiveProfile`, `SetTheme`,
-/// `SetAccent`, `SetExcluded`) — previously each redid this lookup inline.
+/// `[app]`-scoped edit — previously each redid this lookup inline.
 fn app_table(doc: &mut DocumentMut) -> Result<&mut Table, StoreError> {
     doc["app"]
         .or_insert(Item::Table(Table::new()))
         .as_table_mut()
         .ok_or_else(malformed_app_shape)
+}
+
+/// Writes an `Option<String>`-shaped `[app]` key, removing it entirely when
+/// `None` so a cleared value round-trips as absent rather than as an empty
+/// string. Four keys now share this shape (`active_profile`, `sink_device`,
+/// `previous_default`, `volume_bind`), past the point where repeating it
+/// inline is the cheaper option.
+fn set_optional_app_key(
+    doc: &mut DocumentMut,
+    key: &str,
+    new_value: Option<&str>,
+) -> Result<(), StoreError> {
+    let app = app_table(doc)?;
+    match new_value {
+        Some(v) => app[key] = value(v),
+        None => {
+            app.remove(key);
+        }
+    }
+    Ok(())
 }
 
 /// Inverse of `control::config::parse_theme` — kept next to the write path
@@ -991,6 +1037,56 @@ output_device = "Speakers"
     }
 
     #[test]
+    fn sink_device_and_manage_default_round_trip_through_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let snapshot = store
+            .apply(&[
+                ConfigEdit::SetSinkDevice(Some("CABLE Input".into())),
+                ConfigEdit::SetManageDefault(true),
+            ])
+            .unwrap();
+
+        assert_eq!(snapshot.app.sink_device, Some("CABLE Input".to_string()));
+        assert!(snapshot.app.manage_default);
+    }
+
+    /// Flow C clears the key on a clean restore — and a cleared key must read
+    /// back as absent, not as an empty string, or flow D's "a value survived
+    /// the restart" test for an unclean exit fires on every clean one.
+    #[test]
+    fn clearing_previous_default_removes_the_key_rather_than_emptying_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+        store
+            .apply(&[ConfigEdit::SetPreviousDefault(Some("Headphones".into()))])
+            .unwrap();
+
+        let snapshot = store.apply(&[ConfigEdit::SetPreviousDefault(None)]).unwrap();
+
+        assert_eq!(snapshot.app.previous_default, None);
+        assert!(!fs::read_to_string(&path).unwrap().contains("previous_default"));
+    }
+
+    #[test]
+    fn set_volume_bind_round_trips_and_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), BASE);
+        let mut store = ConfigStore::open(&path).unwrap();
+
+        let snapshot = store
+            .apply(&[ConfigEdit::SetVolumeBind(Some("Game".into()))])
+            .unwrap();
+        assert_eq!(snapshot.app.volume_bind, Some("Game".to_string()));
+
+        let snapshot = store.apply(&[ConfigEdit::SetVolumeBind(None)]).unwrap();
+        assert_eq!(snapshot.app.volume_bind, None);
+    }
+
+    #[test]
     fn set_theme_creates_the_app_table_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_file(dir.path(), BASE);
@@ -1248,6 +1344,10 @@ dsp = [{ type = "limiter", ceiling_db = -1.0 }]
             ConfigEdit::SetTheme(ThemeChoice::Dark),
             ConfigEdit::SetAccent(AccentChoice::Teal),
             ConfigEdit::SetExcluded(vec!["game.exe".into()]),
+            ConfigEdit::SetSinkDevice(Some("CABLE Input".into())),
+            ConfigEdit::SetManageDefault(true),
+            ConfigEdit::SetPreviousDefault(Some("Headphones".into())),
+            ConfigEdit::SetVolumeBind(Some("Game".into())),
         ];
         for edit in &param {
             assert_eq!(edit_path(edit), EditPath::Param);
