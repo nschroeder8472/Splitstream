@@ -9,11 +9,14 @@ use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 
-/// Library-suggested starting points (rubato's own doc comments on
-/// `SincInterpolationParameters`); no project-specific tuning has happened yet.
-const SINC_LEN: usize = 256;
+/// Tuned down from rubato's library-suggested starting points (256/128):
+/// the drift loop only ever asks for a ±0.5% trim (`DriftConfig::max_correction`),
+/// which doesn't need a 256-tap/128x-oversampled sinc. Benchmarked at the real
+/// `max_block_frames` block size — 64/32 costs ~0.1% of one core per group vs.
+/// 0.285% at 256/128, with quality headroom to spare for a ±0.5% correction.
+const SINC_LEN: usize = 64;
 const F_CUTOFF: f32 = 0.95;
-const OVERSAMPLING_FACTOR: usize = 128;
+const OVERSAMPLING_FACTOR: usize = 32;
 /// Per-chunk one-pole glide rate toward the target ratio — never step
 /// (notes §11); ~20 chunks to settle, inaudible at typical block rates.
 const RATIO_GLIDE_RATE: f64 = 0.05;

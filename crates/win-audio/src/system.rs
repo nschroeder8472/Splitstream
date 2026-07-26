@@ -92,7 +92,7 @@ mod tests {
 
         let mut render = sys.open_render(&physical.id).expect("open_render");
         let mut capture = sys
-            .open_process_capture(pid, false)
+            .open_process_capture(pid, true)
             .expect("open_process_capture");
 
         let channels = render.format().channels as usize;

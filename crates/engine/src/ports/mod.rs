@@ -71,8 +71,15 @@ pub trait AudioSystem: Send + Sync {
     /// Per-process loopback capture (process-loopback-capture L4):
     /// `ActivateAudioInterfaceAsync` + `PROCESS_LOOPBACK` in the real
     /// `win-audio` impl — replaces the old per-endpoint `open_capture`.
-    /// `include_tree` captures the process's child processes too (same
-    /// activation parameter WASAPI exposes).
+    /// `include_tree` selects WASAPI's `ProcessLoopbackMode`, a binary
+    /// switch, not an additive modifier: `true` ->
+    /// `PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE` (capture *only*
+    /// `pid` and its child processes — what per-app routing needs). `false`
+    /// -> `PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE` (capture
+    /// *everything except* `pid` and its tree — every other app on the
+    /// system). Every call site passed `false` since this trait's
+    /// introduction — capturing the wrong stream — until the 2026-07-25 fix;
+    /// every call site now passes `true`.
     fn open_process_capture(&self, pid: u32, include_tree: bool) -> Result<Box<dyn CapturePort>, PortError>;
     fn open_render(&self, id: &EndpointId) -> Result<Box<dyn RenderPort>, PortError>;
     fn promote_rt_thread(&self) -> RtGuard;

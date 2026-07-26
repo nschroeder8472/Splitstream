@@ -1160,6 +1160,12 @@ fn run_startup_and_dispatch(
         let suspended = dispatcher.compute_suspended();
         dispatcher.volume_bind.set_suspended(suspended);
     }
+    // Temporary diagnostic (audio-flow-control follow-up): these counters
+    // already exist on EngineStats but nothing logs or displays them, so a
+    // flow-control regression (drops/xruns) is indistinguishable from a
+    // signal-domain one (limiter clipping) without this. Logs only on
+    // change — safe to leave running for a full repro session.
+    let mut last_flow_stats: Option<(u64, u64, u64, u64, u64)> = None;
     while !should_quit.load(Ordering::Relaxed) {
         match config_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(new_snapshot) => dispatcher.handle_watcher_snapshot(new_snapshot),
@@ -1176,7 +1182,28 @@ fn run_startup_and_dispatch(
         }
         dispatcher.check_push_to_mute_expiry();
         dispatcher.refresh_tray_icon();
-        dispatcher.ui.lock().unwrap().stats = dispatcher.handle.stats();
+        let fresh_stats = dispatcher.handle.stats();
+        let limiter_engaged_total: u64 =
+            fresh_stats.limiter_engaged.iter().map(|(_, c)| *c).sum();
+        let flow_stats = (
+            fresh_stats.xruns,
+            fresh_stats.output_drops,
+            fresh_stats.capture_drops,
+            fresh_stats.render_shortfall,
+            limiter_engaged_total,
+        );
+        if last_flow_stats != Some(flow_stats) {
+            tracing::info!(
+                xruns = flow_stats.0,
+                output_drops = flow_stats.1,
+                capture_drops = flow_stats.2,
+                render_shortfall = flow_stats.3,
+                limiter_engaged_total = flow_stats.4,
+                "flow-control counters changed"
+            );
+            last_flow_stats = Some(flow_stats);
+        }
+        dispatcher.ui.lock().unwrap().stats = fresh_stats;
     }
 
     drop(watcher);

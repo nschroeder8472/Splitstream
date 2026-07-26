@@ -30,7 +30,7 @@ This document specifies the architecture, component boundaries, runtime model, W
 
 ### 2.2 Non-goals (v1)
 
-- Shipping our own kernel-mode virtual audio driver, or depending on anyone else's. v1 has no virtual-driver dependency of any kind — each app's audio is captured directly by process id via `ActivateAudioInterfaceAsync`/`PROCESS_LOOPBACK` (see §9.3). Building/signing our own driver is a separate, later track (§13, Phase 6), revisited only if a future need (e.g. exposing a mix as a capture device) actually requires one.
+- Shipping our own kernel-mode virtual audio driver. v1 does **not** ship one — but it *does* depend on a user-installed virtual audio device (free VB-CABLE, or any equivalent already present) serving as a **silent sink**: the endpoint Windows' default is pointed at, so no app renders anywhere audible and Splitstream's processed copy is the only one heard (§9.3, §9.6). Capture itself remains per-process by pid via `ActivateAudioInterfaceAsync`/`PROCESS_LOOPBACK` — the sink carries no audio anyone listens to and is never a capture path. Building/signing our own single-endpoint driver is a separate, later track (§13, Phase 6) that would replace *only* the sink, behind the same seam.
 - Pro-audio-grade sub-5 ms latency. Target is glitch-free shared-mode operation (~10–30 ms), not live monitoring for musicians.
 - Cross-platform. Windows 10 (1803+) and Windows 11 only.
 - Network/streaming features (exposing a mix as a capture device for OBS/Discord) — possible later, out of scope for v1.
@@ -237,15 +237,31 @@ Audio worker threads call `CoInitializeEx(COINIT_MULTITHREADED)`; each thread th
 
 Each matched app's audio is captured directly, by process id, via `ActivateAudioInterfaceAsync` with `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK` (Windows 10 Build 20348+, `AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS { TargetProcessId, ProcessLoopbackMode }`). This is a **documented**, `windows-rs`-native API — no hand-declared vtables, no undocumented surface. The returned `IAudioClient` does not implement `GetMixFormat`; the caller dictates a fixed format at `Initialize` time instead (§8 step 1). A pid that fails to activate (permission denied, protected process) is excluded from that group only — isolated per pid, never a global degraded posture (§10).
 
-Process-loopback capture is a **tap, not a redirect** — the source process keeps rendering to Windows normally alongside Splitstream's own copy. Left alone this double-plays whenever the group's output device is also Windows' current default. Splitstream mutes a session's own Windows volume (`ISimpleAudioVolume::SetMute`, another documented Core Audio interface) for exactly as long as that pid is actively captured — muted the moment capture is confirmed open, unmuted the moment it's released (rule change, session end) or on Splitstream's own clean shutdown. Best-effort, same isolation posture as activation failures (§10) — never blocks routing, never treated as a degraded condition. See `.lattice/context/session-mute-on-capture.md`.
+Process-loopback capture is a **tap, not a redirect** — the source process keeps rendering to Windows normally alongside Splitstream's own copy. Left alone this double-plays whenever the group's output device is also Windows' current default.
+
+**Session muting is not a valid fix and is not used.** Splitstream previously muted the source session's own Windows volume (`ISimpleAudioVolume::SetMute`) for the duration of capture. That was disproved on real hardware 2026-07-25: the `PROCESS_LOOPBACK` tap sits *after* session-level processing, so muting the session silences the capture as well — peak `0.0814` unmuted vs `0.0` muted, with sample counts unchanged (188160 vs 189120), i.e. the stream keeps flowing but every frame is zeroed. The feature silenced the exact stream it existed to route. The mechanism is removed entirely. See §9.6 and `.lattice/context/double-audio-prevention.md`.
+
+### 9.6 Silent sink and default-device management
+
+Double-audio is an artifact of the **tap** model, not a requirement of the product: a tap does not consume the original, so two streams exist by construction. Only two operations can remove one from earshot — silence it (disproved above) or **move** it. Endpoint redirect was measured on the same hardware and preserves the tap (`PROCESS_LOOPBACK` activates against `VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK`, not a real endpoint, so it is genuinely process-scoped and endpoint-independent).
+
+Therefore: Windows' default render endpoint is pointed at a **single silent sink** (§2.2), so no app renders anywhere audible. Each matched app is still captured by pid, processed, and rendered to its group's physical output; a `*` catch-all group ensures nothing unmatched becomes inaudible. One sink, not one per group — per-PID capture already provides separation, so endpoint-splitting (the mechanism SteelSeries Sonar uses, one virtual device per channel) would cap group count at devices shipped and discard rule-based assignment for no gain.
+
+Setting the default endpoint has **no documented API**. Splitstream uses `IPolicyConfigWin7::SetDefaultEndpoint` (IID `F8679F50-850A-41CF-9C72-430F290290C8`, **12 own vtable slots, `SetDefaultEndpoint` at slot 11** — verified against EarTrumpet's source, not from memory), applied to all three roles (`eConsole`/`eMultimedia`/`eCommunications`; leaving communications behind would let Discord-class apps double). This is the **only** undocumented surface in the design and is narrowly scoped to this one call — it does not reintroduce the per-app redirect surface §6's history describes.
+
+Taking the default is opt-in. The prior default is recorded in config *only if that key is empty*, so a value surviving a restart signals an unclean exit and still restores correctly on the next clean quit. An externally-initiated default change is surfaced, never re-asserted against the user.
 
 ### 9.4 Endpoint visibility (F7 — eliminated)
 
 Not applicable. Process-loopback capture creates no virtual endpoints, so there is nothing to hide from the Windows device UI or to set as a branded default.
 
-### 9.5 Virtual driver dependency (eliminated)
+### 9.5 Virtual driver dependency (user-supplied sink)
 
-v1 has no virtual driver dependency, bundled or user-supplied. Capture is per-process (§9.3), not per-endpoint, so there is no virtual bus for a driver to provide. Phase 6 (§13) — a signed WDM driver — remains deferred/optional, revisited only if a future need (e.g. exposing a mix as a capture device, §15 open question #6) actually requires a new kind of endpoint.
+v1 ships no driver, but **does** require a user-supplied virtual audio device to act as the silent sink (§9.6). Free VB-CABLE is the default recommendation; anything already installed (Sonar, VoiceMeeter, or an unused physical output the user never listens to) works identically, since the sink is identified by configurable device name.
+
+**Third position on this question — recorded plainly.** §15.2's original override removed the *bundled* driver in favour of BYOD; process-loopback-capture's later override eliminated the driver dependency *entirely* ("not even user-supplied"). This restores a user-supplied dependency, for a different reason than either: not as an audio *transport* (capture is still per-process by pid — the sink carries nothing anyone hears), but purely as somewhere for the untapped original stream to go. Only **one** sink is needed regardless of group count.
+
+Phase 6 (§13) — a signed single-endpoint driver — remains deferred, and would replace only the sink behind the same seam: capture, mixing, DSP, routing and render are untouched by which endpoint is the sink.
 
 ---
 
@@ -258,7 +274,10 @@ v1 has no virtual driver dependency, bundled or user-supplied. Capture is per-pr
 | Endpoint format change | Render returns `AUDCLNT_E_DEVICE_INVALIDATED`; supervisor rebuilds that stream with the new mix format and rebuilds SRC. |
 | Process capture activation fails (pid) | That pid excluded from its group this attempt only; every other pid/group unaffected; retried on the next reconcile pass (no global degraded flag). |
 | Matched process exits | Its capture thread stops; the group's remaining pids (if any) keep playing undisturbed; a relaunch is matched fresh. |
-| Session mute/unmute call fails | Logged, isolated to that pid — never blocks reconcile, never a `RoutingDegraded` condition (cosmetic possible-double-audio, not a routing failure). Splitstream crashing (not a clean exit) while a still-running app is muted leaves it muted until manually un-muted (Volume Mixer) or until the app/Splitstream restarts and re-captures it — accepted, no persisted recovery state in v1. |
+| Sink not installed / not found | Surfaced in the UI with the reason and a call to action; capture and mixing still run, but every routed app also plays directly (double-audio) because nothing moved it. Never a crash, never silent (§9.6). |
+| Sink present but not the default | Same posture — surfaced, naming the current default so the user can act. Splitstream does **not** re-assert the default against an external change. |
+| `SetDefaultEndpoint` call fails | Logged and surfaced; the sink simply doesn't become default, leaving the case above. Never a panic, never retried in a loop. |
+| Splitstream crashes while owning the default | The recorded prior default survives in config (written only-if-empty), so the next clean quit still restores it. Until then the machine's default remains the sink — audible only through Splitstream. Documented escape hatch: change the default in Windows Sound settings. |
 | Xrun / ring underflow | Emit silence for the missing frames, bump a counter, let drift loop recenter; never block. |
 
 Supervisor owns teardown/rebuild of any sub-graph so a single device fault never takes down the whole engine.
@@ -314,6 +333,10 @@ match_rules = ["*"]                    # catch-all: unmatched apps still get a d
 
 [app]
 autostart = true
+sink_device = "CABLE Input (VB-Audio Virtual Cable)"  # the silent sink (§9.6)
+manage_default = true                  # user opted in to Splitstream owning the default
+previous_default = "Headset (USB)"     # what to restore on clean quit; only-if-empty write
+volume_bind = "Game"                   # which group the keyboard volume keys drive
 
 [hotkeys]
 mute_master = "Ctrl+Alt+M"
@@ -326,7 +349,8 @@ mute_master = "Ctrl+Alt+M"
 - v1 ships the installer and binary **unsigned** (§13 N6 override) — OV/EV cert cost + recurring renewal disproportionate for a free, no-revenue OSS project; onboarding/README document the SmartScreen "More info → Run anyway" step. Revisit if the project gains funding.
 - Memory safety (Rust) meaningfully shrinks the attack-surface class for an always-running background process.
 - Process-loopback capture (§9.3) uses a documented Windows API and runs in the user's context; no elevation required.
-- **Driver track (Phase 6 only, still deferred):** a kernel-mode virtual audio driver requires an EV code-signing certificate plus Microsoft attestation signing (or full WHQL). Budget cost and lead time; not needed for v1 at all (§9.5).
+- Default-endpoint management (§9.6) uses the **undocumented** `IPolicyConfigWin7` — the single such surface in the design, one method, vtable verified against a live reference implementation rather than from memory. Runs in the user's context; no elevation required.
+- **Driver track (Phase 6 only, still deferred — repriced 2026-07-26):** a virtual audio driver requires an EV code-signing certificate plus Microsoft attestation signing (or full WHQL). Two facts revise the original estimate: **Microsoft Trusted Signing is ~$9.99/month (~$120/yr)** versus $215–409/yr for a traditional EV cert, materially shortening the reach for a donation-funded project (verify kernel-driver eligibility and individual-maintainer eligibility before relying on it); and **shipping unsigned for users willing to disable driver signature enforcement is not a viable fallback** — Easy Anti-Cheat and BattlEye both refuse to launch with DSE disabled or test signing on, which excludes precisely this product's gaming audience. A driver is therefore all-or-nothing on funding, and scoped to replacing the §9.6 sink only.
 
 ---
 
@@ -359,7 +383,7 @@ P0–P1 are the "prove the model" milestones; do not build UI before P1 audio is
 ## 15. Open questions / decisions to make
 
 1. **UI toolkit:** `egui`/`eframe` (fast, immediate-mode, easy) vs `slint` (more native look) vs Tauri (`wry`, web UI, heavier). Recommendation: `egui` for speed of iteration; revisit if the design needs a more native feel.
-2. **~~Bundled virtual driver~~** — moot. §9.5: v1 has no virtual driver dependency of any kind; capture is per-process (§9.3).
+2. **Bundled virtual driver** — partially re-opened (2026-07-26). Capture stays per-process (§9.3), but v1 now depends on a *user-supplied* virtual device as the silent sink (§9.5/§9.6). A bundled single-endpoint driver is the named upgrade: it would remove the third-party install and work on single-output laptops, replacing only the sink behind the same seam. Gated on signing funding (§12), not on architecture.
 3. **Ring library:** `rtrb` (SPSC, minimal) vs `ringbuf` (more features). Default `rtrb`.
 4. **Mixer threading:** single mixer thread vs a small pool keyed by output. Start single; measure.
 5. **Session→group matching rules:** exact process name, path globs, or window title — define the precedence order.
@@ -494,6 +518,17 @@ Real code must: register the thread with MMCSS before the loop; handle `AUDCLNT_
 - Design alignment: `§15.1` UI toolkit unchanged (`egui`/`eframe`); settings-window layout/interaction model (columns, dropdown-backed pickers, drag-assign) has no prior spec text to diverge from — pure elaboration on app-shell.md's approved F9/§6.5 contracts. See `.lattice/context/mixer-ui-redesign.md`.
 - Design addition: `§9.3` gains session-mute-on-capture — found live (process-loopback capture is a tap, not a redirect, so a captured session's own Windows output kept playing unmuted, double-audio whenever the group's output device is also Windows' default). Splitstream now mutes (`ISimpleAudioVolume::SetMute`) a session's own volume for exactly as long as it's actively captured, unmuted on release or clean shutdown. `§10` gains a matching error-table row. No existing spec text overridden — nothing previously said the source session would be left alone, this fills a genuine gap. See `.lattice/context/session-mute-on-capture.md`.
 - Design alignment: `§15.1` UI toolkit unchanged (`egui`/`eframe`); settings-window responsive layout, gear-navigated group settings page, and speaker-icon mute control have no prior spec text to diverge from — pure elaboration on app-shell.md's approved F9/§6.5 contracts, same posture as mixer-ui-redesign. See `.lattice/context/responsive-ui-refinement.md`.
+
+### double-audio-prevention (2026-07-26) — supersedes session-mute-on-capture
+
+- Design override: `§9.3` session-mute-on-capture — **disproved on real hardware and removed.** The `PROCESS_LOOPBACK` tap sits *after* session-level processing, so `ISimpleAudioVolume::SetMute` silences the capture as well as the source: peak `0.0814` unmuted vs `0.0` muted, sample counts unchanged (188160 vs 189120) — the stream keeps flowing, every frame zeroed. The mechanism silenced the exact stream it existed to route, which is why routed apps produced no audio. Body text of `§9.3` rewritten; the immediately-preceding `§9.3` addition entry (2026-07-22) is superseded, not amended.
+- Design override: `§10` error table — the "Session mute/unmute call fails" row is removed with its mechanism, replaced by four rows covering sink-missing, sink-not-default, `SetDefaultEndpoint` failure, and crash-while-owning-the-default.
+- Design addition: `§9.6` (new) — silent sink and default-device management. Double-audio is an artifact of the **tap** model, not a product requirement; a tap does not consume the original, so two streams exist by construction and only two operations can remove one from earshot — silence it (disproved) or move it. Endpoint redirect was measured to preserve the tap, so Windows' default is pointed at one silent sink. One sink, not one per group: per-PID capture already separates, so endpoint-splitting (SteelSeries Sonar's model, one virtual device per channel) would cap group count at devices shipped and discard rule-based assignment for no gain.
+- Design override: `§2.2` / `§9.5` — v1 regains a **user-supplied** virtual-device dependency, as a silent sink only. This is the third position taken on this question; recorded explicitly rather than quietly reconciled. `§15.2`'s original override removed the *bundled* driver in favour of BYOD; process-loopback-capture's later override eliminated the dependency entirely ("not even user-supplied"). The reason here differs from both: the sink is not an audio *transport* (capture remains per-process by pid; the sink carries nothing anyone hears), only somewhere for the untapped original to go.
+- Design override: `§12` and process-loopback-capture's claim of removing "the whole risk class" of undocumented COM — **one undocumented surface returns.** `IPolicyConfigWin7::SetDefaultEndpoint` (IID `F8679F50-850A-41CF-9C72-430F290290C8`, 12 own vtable slots, `SetDefaultEndpoint` at **slot 11**) is required because Windows exposes no documented way to set the default endpoint. Narrowly scoped to that one call; the per-app redirect surface stays out. Vtable verified against EarTrumpet's source — `.lattice/implementation-notes.md:331` declares 2 slots and would have called `Unused1`, and is corrected in the same change.
+- Design addition: `§11.3` config schema — `[app]` gains `sink_device`, `manage_default`, `previous_default`; `volume_bind` becomes UI-settable (keyboard volume keys drive the *selected* group, mirroring Sonar's per-channel key control without Sonar's per-channel devices).
+- Design addition: `§12` / `§13` Phase 6 repriced — Microsoft Trusted Signing ~$120/yr vs $215–409/yr EV cert; and shipping unsigned for users who disable driver signature enforcement is **not** a viable fallback, since EAC and BattlEye both refuse to launch in that state, excluding this product's gaming audience.
+- Design addition: `§15.2` bundled virtual driver un-mooted — now the named upgrade path, replacing only the §9.6 sink behind the same seam. Gated on signing funding, not architecture.
 
 ---
 

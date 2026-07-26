@@ -386,9 +386,31 @@ mod tests {
             println!("SPLITSTREAM_TEST_PID not set — skipping");
             return;
         };
-        let mut capture = open(pid, false).expect("open should succeed for a real, running pid");
+        let mut capture = open(pid, true).expect("open should succeed for a real, running pid");
         let mut buf = vec![0.0f32; 4096];
-        let n = capture.read(&mut buf).expect("read");
-        println!("captured {n} samples from pid {pid}, format={:?}", capture.format());
+
+        // A single read() immediately after Start() almost always races
+        // WASAPI's first buffer period and reads 0 regardless of whether the
+        // process is producing audio — poll for up to 2s so a 0 here means
+        // "genuinely silent," not "read too early."
+        let mut total = 0usize;
+        let mut peak = 0.0f32;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let n = capture.read(&mut buf).expect("read");
+            total += n;
+            for &s in &buf[..n] {
+                peak = peak.max(s.abs());
+            }
+            if n > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        println!(
+            "captured {total} samples over 2s from pid {pid}, peak={peak}, format={:?}",
+            capture.format()
+        );
     }
 }
