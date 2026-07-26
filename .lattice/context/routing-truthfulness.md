@@ -2,7 +2,7 @@
 feature: routing-truthfulness
 requirement_doc: null
 created: 2026-07-25
-status: approved
+status: complete
 note: >
   Origin: `.lattice/reviews/2026-07-25-end-to-end-audit.md` B9/B10/B18, plus
   the user-reported "routing seems to be doing something but I can't tell
@@ -454,6 +454,9 @@ mistaking the change for a regression.
 | 7 | 2026-07-25 | **`match_session`'s return widens to `Option<Match>` carrying `MatchKind`,** and `RoutingReader`'s routes output carries `RoutedSession` rather than `SessionInfo`. | Provenance is computed where the decision is actually made, rather than the UI re-deriving catch-all-ness from raw rule strings — the "prefer the authoritative source over a lookalike reconstruction" rule (level-meters `output_names`, per-group-mute-solo's `Epoch`). Rides the existing read model; no new channel (level-meters precedent). Cleanly reversible: cutting capability 4 restores `Option<GroupId>` and deletes three types. |
 | 8 | 2026-07-25 | **The existing test `resolve_drag_assign_never_touches_glob_rules` is deleted and replaced by its inverse**, not amended. | Its body comment documents the reversed behaviour as intentional. Leaving a weakened version would let a future reader read the change as a regression; an explicitly inverted test named `unassigning_a_glob_matched_session_is_no_longer_a_no_op` records the reversal at the place someone would look. |
 | 9 | 2026-07-25 | **Design approved at Level 4. Status set to `approved` — ready for implementation.** | All four level sections persisted, including the Level 2 revision made at Level 3 (component 7). No open questions remain. |
+| 10 | 2026-07-25 | **Implemented as designed, no deviations from L4 contracts.** `ChipZoneCtx` gained a `kinds: &HashMap<u32, MatchKind>` field (empty for the Master zone) rather than making `RoutedSession` flow all the way into chip rendering — the Master pool has no provenance to show, and `GroupColumnCtx` gained a matching `excluded: &[String]` field so `handle_drop` never needs the whole snapshot. Neither is a new component, just plumbing for components 4/6. | Threading `RoutedSession` itself into `ChipZoneCtx.sessions` would force the Master (unassigned) zone to fabricate a `MatchKind` for sessions that were never matched at all — a lie even if never rendered. A side-channel map keeps the "unmatched" and "matched" zones honestly typed. |
+| 11 | 2026-07-25 | **Master's persistent footer label changed from "Routed Apps" to "Not Routed"**, alongside the `AllRouted` empty-state text change already in L4. | Capability 2 ("Master's footer tells the truth about what it holds") applies to the always-visible header, not just the empty state — leaving "Routed Apps" as the permanent label while the zone holds exclusively unrouted apps would still misrepresent it. |
+| 12 | 2026-07-25 | **Status set to `complete`.** Implemented across all three build-boundary layers (`engine` — rules/graph/routing; `control` — store/config/profiles; `app` — main.rs/ui.rs/event_pump.rs). Full workspace build + `cargo test --workspace` + `cargo clippy --workspace --all-targets` all clean; every test contract from L4's table is present (one, `master_settings_returns_to_the_mixer`, has no pure-function equivalent to test — this file has no precedent for testing egui widget interaction directly, so it's left as an untested UI wire-up, consistent with the rest of the settings window). | Real-hardware validation not yet run this session — routing/mute paths are covered by the existing mocked `engine::routing` test suite (unchanged in kind, just widened for `MatchKind`/`excluded`). |
 
 ## Open Questions
 

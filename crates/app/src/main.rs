@@ -576,15 +576,15 @@ impl Dispatcher {
                 eprintln!("rebuild failed: {e:?}");
             }
             self.rebuild_generation += 1;
-            self.routing.update_rules(group_rules(&new_snapshot));
+            self.routing.update_rules(group_rules(&new_snapshot), new_snapshot.app.excluded.clone());
         } else {
             if !delta.params.is_empty() {
                 if let Err(e) = self.handle.apply_params(delta.params) {
                     eprintln!("apply_params failed: {e:?}");
                 }
             }
-            if delta.rules.is_some() {
-                self.routing.update_rules(group_rules(&new_snapshot));
+            if delta.rules.is_some() || delta.excluded.is_some() {
+                self.routing.update_rules(group_rules(&new_snapshot), new_snapshot.app.excluded.clone());
             }
         }
         self.set_current(new_snapshot);
@@ -600,7 +600,7 @@ impl Dispatcher {
                     eprintln!("rebuild failed: {e:?}");
                 }
                 self.rebuild_generation += 1;
-                self.routing.update_rules(group_rules(&new_snapshot));
+                self.routing.update_rules(group_rules(&new_snapshot), new_snapshot.app.excluded.clone());
                 self.set_current(new_snapshot);
             }
             Err(e) => eprintln!("structural edit rejected: {e:?}"),
@@ -631,11 +631,11 @@ impl Dispatcher {
             }
         }
 
-        let rules_changed = edits.iter().any(|e| matches!(e, ConfigEdit::SetRules(..)));
+        let routing_changed = edits.iter().any(|e| matches!(e, ConfigEdit::SetRules(..) | ConfigEdit::SetExcluded(..)));
         match self.store.apply(edits) {
             Ok(new_snapshot) => {
-                if rules_changed {
-                    self.routing.update_rules(group_rules(&new_snapshot));
+                if routing_changed {
+                    self.routing.update_rules(group_rules(&new_snapshot), new_snapshot.app.excluded.clone());
                 }
                 self.set_current(new_snapshot);
                 self.push_bound_target_changes(edits);
@@ -738,7 +738,7 @@ impl Dispatcher {
                         eprintln!("rebuild failed: {e:?}");
                     }
                     self.rebuild_generation += 1;
-                    self.routing.update_rules(group_rules(&new_snapshot));
+                    self.routing.update_rules(group_rules(&new_snapshot), new_snapshot.app.excluded.clone());
                 } else {
                     let commands = edits_to_mixer_commands(&edits, &self.current);
                     if !commands.is_empty() {
@@ -890,7 +890,8 @@ fn edits_to_mixer_commands(edits: &[ConfigEdit], current: &ConfigSnapshot) -> Ve
             | ConfigEdit::RemoveProfile(..)
             | ConfigEdit::SetActiveProfile(..)
             | ConfigEdit::SetTheme(..)
-            | ConfigEdit::SetAccent(..) => None,
+            | ConfigEdit::SetAccent(..)
+            | ConfigEdit::SetExcluded(..) => None,
         })
         .collect()
 }
@@ -1063,6 +1064,7 @@ fn run_startup_and_dispatch(
     let capture_control: CaptureControl = handle.capture_control();
     let routing = engine::start_routing(
         group_rules(&snapshot),
+        snapshot.app.excluded.clone(),
         std::process::id(),
         sessions,
         capture_control,

@@ -20,7 +20,7 @@ use std::thread::{self, JoinHandle};
 
 use audio_core::GroupId;
 use engine::ports::Endpoint;
-use engine::{ConfigSnapshot, EngineEvent, EngineStats, SessionInfo};
+use engine::{ConfigSnapshot, EngineEvent, EngineStats, RoutedSession, SessionInfo};
 
 /// Shared read model for the settings window and tray — the app-shell.md L4
 /// `UiState` contract, extended by simple-launch.md L4 for first-run
@@ -28,7 +28,7 @@ use engine::{ConfigSnapshot, EngineEvent, EngineStats, SessionInfo};
 /// nothing in `engine`/`control` reads it.
 pub struct UiState {
     pub snapshot: ConfigSnapshot,
-    pub routes: Vec<(GroupId, Vec<SessionInfo>)>,
+    pub routes: Vec<(GroupId, Vec<RoutedSession>)>,
     pub stats: EngineStats,
     pub routing_degraded: bool,
     /// True until at least one group exists — `main::needs_onboarding`'s
