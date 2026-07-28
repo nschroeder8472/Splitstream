@@ -53,33 +53,73 @@ Capture and render run off independent hardware clocks that drift apart over
 minutes, so the engine decouples them with elastic buffers and continuously
 resamples to compensate. That drift control, not the DSP, is the hard part.
 
-### Why a virtual audio device is required
+### The silent sink
 
 Splitstream captures a *copy* of each app's audio — the app is still rendering to
 whatever endpoint Windows sent it to, so without something to absorb it you would
 hear both the original and Splitstream's processed version.
 
-The fix is one silent sink: a virtual audio device set as the Windows default, so
-apps render somewhere inaudible and Splitstream's output is the only thing you
-hear. Free [VB-CABLE](https://vb-audio.com/Cable/) is the default recommendation,
-but anything already installed works — SteelSeries Sonar, VoiceMeeter, or even a
-physical output you never listen to. The sink carries no audio anyone listens to
-and is never a capture path. Splitstream restores your previous default device on
-a clean exit.
+The fix is one silent sink: an output device set as the Windows default that
+nobody listens to, so apps render somewhere inaudible and Splitstream's output is
+the only thing you hear. It carries no audio anyone listens to and is never a
+capture path. Splitstream restores your previous default device on a clean exit.
+
+**A virtual audio device is strongly recommended, but not strictly required.**
+Any output you never listen to works — a motherboard line-out with nothing
+plugged into it, an unused HDMI audio output, or a second sound card. A virtual
+device is simply the tidier option: it can't be unplugged by accident, it costs
+you no physical port, and it never plays anything into a room.
+
+If you go virtual, [VB-CABLE](https://vb-audio.com/Cable/) is the default
+recommendation, and anything already installed works identically — SteelSeries
+Sonar or VoiceMeeter, for instance — since the sink is chosen by device name.
+
+> **VB-CABLE is donationware.** It is free to download and use, and VB-Audio asks
+> for a donation if you find it useful. If Splitstream is working for you, a good
+> share of the credit belongs to their driver — **please
+> [donate to VB-Audio](https://vb-audio.com/Cable/)**. We are not affiliated with
+> them and receive nothing from it; we just think people who make the free
+> infrastructure everyone builds on should get paid for it.
+
+### Why we don't ship our own virtual endpoint
+
+The obvious question: why not include the sink instead of asking you to install
+one?
+
+Because Windows will not let us, cheaply. Creating an audio endpoint requires a
+kernel-mode driver, and Windows will not load one that isn't signed through
+Microsoft's hardware program. That means an ongoing certificate, hardware-lab
+submission, and re-signing every time the driver changes — real recurring cost
+and real process overhead, for a component whose entire job is to be silent.
+Bundling someone else's driver doesn't avoid this; it just moves the cost and
+adds a licensing question on top.
+
+So for now Splitstream is deliberately built around a sink you already have, or a
+free one you install once. It's one extra step at setup, and then you never think
+about it again.
+
+**If this project finds an audience, we will revisit it.** Shipping our own
+endpoint would make the whole thing feel like one product instead of two —
+install, run, done, with no third-party driver in the story. That is where we'd
+like to end up. We're just a small operation with no financial backing, and that
+work has to be justified by enough people actually using this. If that's
+something you want, star the repo, file issues, tell people — that's the signal
+that makes it worth doing.
 
 ## Quick Start
 
 ### Prerequisites
 
 - Windows 11, latest version recommended
-- A virtual audio device to act as the silent sink (see above)
+- An output device to act as the silent sink — a virtual audio device is
+  strongly recommended, though any output you never listen to will do (see above)
 
 ### Setup
 
 1. Install Splitstream (or `cargo build --release` and run
    `target\release\splitstream.exe`).
-2. On first run, pick the virtual device to use as the sink. Splitstream takes it
-   as the Windows default and gives it back when you quit.
+2. On first run, pick the device to use as the sink. Splitstream takes it as the
+   Windows default and gives it back when you quit.
 3. Create groups, pick an output device for each, and assign your running apps.
 
 Settings live in `%APPDATA%\Splitstream\splitstream.toml` and can be edited by

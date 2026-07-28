@@ -57,11 +57,12 @@ AI tools (ChatGPT, Claude, GitHub Copilot, etc.) are **encouraged and welcomed**
   The project is developed against Rust 1.93 with the MSVC toolchain; there is
   no formally supported MSRV yet.
 - Cargo (comes with Rust)
-- A virtual audio device to act as the silent sink — free
-  [VB-CABLE](https://vb-audio.com/Cable/) is the default recommendation. Anything
-  already installed (SteelSeries Sonar, VoiceMeeter, or a physical output you
-  never listen to) works identically, since the sink is chosen by device name.
-  See the README for why this is needed.
+- An output device to act as the silent sink. A virtual audio device is strongly
+  recommended — [VB-CABLE](https://vb-audio.com/Cable/) is the default suggestion,
+  and it is donationware, so please donate to VB-Audio if you use it. Anything
+  already installed (SteelSeries Sonar, VoiceMeeter) works identically, as does
+  any physical output you never listen to, since the sink is chosen by device
+  name. See the README for why this is needed.
 - [Inno Setup](https://jrsoftware.org/isinfo.php) only if you want to build the
   installer (`installer/splitstream.iss`).
 
