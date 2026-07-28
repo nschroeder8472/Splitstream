@@ -52,6 +52,18 @@ pub fn open(id: &EndpointId) -> Result<WasapiRender, PortError> {
         let wfx = client
             .GetMixFormat()
             .map_err(|e| PortError::Backend(e.to_string()))?;
+        // Before anything reinterprets this device's buffer as `*mut f32`
+        // (`write`, below): a non-float mix format would turn every write into
+        // full-scale noise rather than audio, so refuse the device instead.
+        if !crate::format::is_float32(wfx) {
+            let bits = (*wfx).wBitsPerSample;
+            let tag = (*wfx).wFormatTag;
+            windows::Win32::System::Com::CoTaskMemFree(Some(wfx as *const _));
+            return Err(PortError::Backend(format!(
+                "unsupported mix format: {bits}-bit, wFormatTag {tag} — this build only \
+                 renders 32-bit IEEE float"
+            )));
+        }
         let format = format_from_wfx(wfx);
 
         client

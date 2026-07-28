@@ -34,6 +34,44 @@ unsafe fn wave_format(client: &IAudioClient) -> Result<Format, PortError> {
     Ok(format)
 }
 
+/// `WAVE_FORMAT_IEEE_FLOAT` (mmreg.h value `3`) and the matching
+/// `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT` GUID (ksmedia.h), both defined locally
+/// rather than pulling in the whole `Win32_Media_Multimedia` Cargo feature for
+/// two well-known, stable Win32 constants — same precedent as
+/// `process_capture.rs`.
+const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
+const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: windows::core::GUID =
+    windows::core::GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
+
+/// Whether `wfx` describes 32-bit IEEE float samples — the one and only layout
+/// every buffer in this crate reinterprets a raw WASAPI pointer as
+/// (`render.rs`'s `dst_ptr as *mut f32`, `process_capture.rs`'s
+/// `data as *const f32`). Windows' shared-mode engine format is float32 in
+/// practice regardless of the bit depth chosen in the Sound control panel
+/// (that setting drives the driver side, not the shared-mode client format),
+/// but "in practice" is not "guaranteed": a device reporting 16- or 24-bit
+/// PCM here would have its bytes reinterpreted as floats, i.e. full-scale
+/// noise. Checked at `open` so that fails loudly instead.
+///
+/// # Safety
+/// Same contract as [`format_from_wfx`].
+pub(crate) unsafe fn is_float32(wfx: *const WAVEFORMATEX) -> bool {
+    if (*wfx).wBitsPerSample != 32 {
+        return false;
+    }
+    match (*wfx).wFormatTag as u32 {
+        t if t == WAVE_FORMAT_IEEE_FLOAT as u32 => true,
+        WAVE_FORMAT_EXTENSIBLE if (*wfx).cbSize >= 22 => {
+            let ext = wfx as *const WAVEFORMATEXTENSIBLE;
+            // `WAVEFORMATEXTENSIBLE` is `#[repr(packed)]`, so `SubFormat` may
+            // be unaligned — copy it out rather than taking a reference to it.
+            let sub = std::ptr::addr_of!((*ext).SubFormat).read_unaligned();
+            sub == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+        }
+        _ => false,
+    }
+}
+
 /// Reads sample rate, channel count, and speaker layout from a raw
 /// `WAVEFORMATEX*` (as returned by `GetMixFormat` / `Initialize`'s in/out
 /// param). `dwChannelMask` only exists on the `WAVEFORMATEXTENSIBLE`

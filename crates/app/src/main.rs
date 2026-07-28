@@ -1458,6 +1458,12 @@ fn run_startup_and_dispatch(
     // signal-domain one (limiter clipping) without this. Logs only on
     // change — safe to leave running for a full repro session.
     let mut last_flow_stats: Option<(u64, u64, u64, u64, u64)> = None;
+    // Opt-in audit trace (`SPLITSTREAM_AUDIT=1`): once a second, the flow
+    // state the counters alone can't distinguish — is a ring starving, is the
+    // drift controller running away, is a group producing signal at all.
+    // Off by default; this is a repro tool, not normal-run logging.
+    let audit = std::env::var_os("SPLITSTREAM_AUDIT").is_some();
+    let mut last_audit = std::time::Instant::now();
     while !should_quit.load(Ordering::Relaxed) {
         match config_rx.recv_timeout(Duration::from_millis(50)) {
             Ok(new_snapshot) => dispatcher.handle_watcher_snapshot(new_snapshot),
@@ -1494,6 +1500,62 @@ fn run_startup_and_dispatch(
                 "flow-control counters changed"
             );
             last_flow_stats = Some(flow_stats);
+        }
+        if audit && last_audit.elapsed() >= Duration::from_secs(1) {
+            last_audit = std::time::Instant::now();
+            let fill: Vec<String> = fresh_stats
+                .ring_fill
+                .iter()
+                .map(|(id, f)| format!("{}:{:.2}", id.0, f))
+                .collect();
+            let ratio: Vec<String> = fresh_stats
+                .applied_ratio
+                .iter()
+                .map(|(id, r)| format!("{}:{:.5}", id.0, r))
+                .collect();
+            // Input side of `ring_fill`, per group, and what the drift loop
+            // controls against (aggregated to the fullest per output). Smoothed
+            // at the source, so a value drifting off 0.5 is a standing rate
+            // surplus rather than which part of a poll packet the read landed on.
+            let cfill: Vec<String> = fresh_stats
+                .capture_fill
+                .iter()
+                .map(|(id, f)| format!("{}:{:.2}", id.0, f))
+                .collect();
+            let gpeak: Vec<String> = fresh_stats
+                .group_peak
+                .iter()
+                .map(|(id, m)| format!("{}:{:.4}", id.0, m.peak))
+                .collect();
+            let opeak: Vec<String> = fresh_stats
+                .output_peak
+                .iter()
+                .map(|(id, m)| format!("{}:{:.4}", id.0, m.peak))
+                .collect();
+            // Why the last rejected push was rejected, in output frames.
+            // `span` above `budget` means the mixer produced more than the
+            // governor budgeted for; `span` at or below `free` means the ring
+            // freed up between the headroom snapshot and the flush. Absent
+            // until an output ring rejects something, which it should never do.
+            let reject = match fresh_stats.last_output_reject {
+                Some((span, free, capacity, budget)) => {
+                    format!("span={span},free={free},cap={capacity},budget={budget}")
+                }
+                None => "none".to_string(),
+            };
+            tracing::info!(
+                xruns = fresh_stats.xruns,
+                output_drops = fresh_stats.output_drops,
+                capture_drops = fresh_stats.capture_drops,
+                last_reject = %reject,
+                capture_fill = %cfill.join(","),
+                ring_fill = %fill.join(","),
+                applied_ratio = %ratio.join(","),
+                group_peak = %gpeak.join(","),
+                output_peak = %opeak.join(","),
+                routes = dispatcher.routing.reader().current_routes().len(),
+                "audit"
+            );
         }
         dispatcher.ui.lock().unwrap().stats = fresh_stats;
     }

@@ -4,6 +4,36 @@
 //! thread at `DriftConfig::tick` cadence (~100 ms); RT threads only publish
 //! fill via atomics upstream, `tick` emits `MixerCommand::SetOutputRatio`
 //! for the RT mixer thread to apply.
+//!
+//! # Which buffer this regulates
+//!
+//! The **capture** rings, aggregated per output — not the output ring
+//! (output-rate-truncation follow-on, 2026-07-27). The output ring is already
+//! regulated:
+//! the governor (`group_may_push`) holds it at its threshold by withholding
+//! ticks. Pointing this loop at the same buffer made `ratio` an unobservable
+//! free variable — it integrated on the governor sawtooth's phase noise and
+//! wandered onto both clamp rails, measured in a live audit trace.
+//!
+//! Since `SincFixedIn` consumes a *fixed* input chunk, in steady state
+//! `input consumed/sec = R_out / ratio`. So whatever value `ratio` drifted to
+//! silently dictated the capture drain rate, and the capture ring — the only
+//! elastic buffer between the capture clock and the DAC's crystal, and the one
+//! with no controller on it — absorbed the difference until it saturated and
+//! began discarding samples permanently.
+//!
+//! `ratio` is the only lever that can absorb a clock mismatch. This module
+//! points it at the buffer that needs it.
+//!
+//! Keyed per **output**, not per group, for two reasons. Correctness:
+//! `mix_tick` sums every group on an output into one shared accumulator over a
+//! single span, so they must produce identical frame counts — a per-group ratio
+//! (tried and reverted the same day) notches the shorter group's tail at the
+//! tick rate. Physics: process-loopback capture for every app on a machine runs
+//! off one WASAPI engine clock at one pinned rate, so two groups' capture
+//! streams do not drift apart from each other. The clock that differs is the
+//! DAC's, which every group on that output shares. A group's own capture ring
+//! is still what is *measured* — the output's sample is the fullest of them.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -21,6 +51,14 @@ pub struct DriftConfig {
 
 impl Default for DriftConfig {
     /// Starting gains from notes §10: kp ≈ 0.05, ki ≈ 0.01, max_correction = 0.005.
+    ///
+    /// `target_fill` is mid-capacity and, unlike the old output-side target, is
+    /// **not** computed per build. The output ring's target had to be offset to
+    /// the governor sawtooth's midpoint (`drift_target_fill`, deleted) or the
+    /// controller would read a permanent error against the governor. A capture
+    /// ring has no governor on it — its disturbance is the poll burst, in both
+    /// directions — so mid-capacity is the value that leaves symmetric room for
+    /// either sign of error.
     fn default() -> DriftConfig {
         DriftConfig {
             target_fill: 0.5,
@@ -32,9 +70,11 @@ impl Default for DriftConfig {
     }
 }
 
-/// Per-output fill measurement for one `tick`. `active` is the idle guard
-/// (drift-and-recovery revision): a silent bus produces no loopback packets,
-/// so without this the integrator winds up on silence and pegs the ratio.
+/// One output's capture-ring fill for one `tick`: the fullest ring among the
+/// groups routed to it. `active` is the idle guard (drift-and-recovery
+/// revision) — pids that have stopped delivering leave a ring draining to
+/// empty, and without this the integrator reads that as a huge negative error
+/// and pegs the ratio, so the next time audio arrives it starts from a rail.
 #[derive(Debug, Clone, Copy)]
 pub struct FillSample {
     pub fill: f32,
@@ -44,22 +84,6 @@ pub struct FillSample {
 #[derive(Default)]
 struct OutputState {
     integ: f64,
-}
-
-/// The governor's (β, full-block-or-skip) sawtooth midpoint (audio-flow-
-/// control decision 7) — what `DriftController` should aim at, not the
-/// governor's own skip threshold. (β) leaves an output ring sawtoothing
-/// between `threshold_fill` and one block above it, so its *average* fill
-/// sits about half a block above the threshold; aiming the controller at the
-/// threshold itself would read a permanent positive error and hold a
-/// permanent negative ratio bias against the governor. Pure — computed, not
-/// estimated, and pinned by a test against the exact numbers decision 7
-/// worked out by hand.
-pub fn drift_target_fill(threshold_fill: f32, block_out_frames: usize, capacity_frames: usize) -> f32 {
-    if capacity_frames == 0 {
-        return threshold_fill;
-    }
-    threshold_fill + block_out_frames as f32 / (2.0 * capacity_frames as f32)
 }
 
 pub struct DriftController {
@@ -102,12 +126,15 @@ impl DriftController {
                 state.integ -= err * tick_secs;
             }
 
-            // ring too full (err > 0) -> corr > 0 -> ratio < 1 (B7 fix).
-            // `SincFixedIn` consumes a FIXED input chunk and produces
-            // `chunk_in * ratio` output frames (audio-flow-control grounding,
-            // resample.rs's `Src::process`) — raising the ratio produces
-            // MORE output, filling an already-too-full ring further. A ring
-            // above target must drive the ratio below 1 to produce less.
+            // Ring too full (err > 0) -> corr > 0 -> ratio < 1. The sign is
+            // unchanged by the move from the output ring to the capture ring,
+            // for a reason worth stating because it looks like it should have
+            // flipped: `SincFixedIn` consumes a FIXED input chunk and produces
+            // `chunk_in * ratio` output frames (resample.rs's `Src::process`),
+            // so in steady state `input consumed/sec = R_out / ratio`. A
+            // capture ring above target needs its input drained FASTER, which
+            // is a LOWER ratio — the same direction an over-full output ring
+            // needed for the opposite reason (produce less).
             let ratio = ResampleRatio::new(1.0 - corr)
                 .expect("max_correction configured within ResampleRatio's clamp range");
             cmds.push(MixerCommand::SetOutputRatio(*id, ratio));
@@ -225,6 +252,9 @@ mod tests {
 
     #[test]
     fn outputs_correct_independently() {
+        // Two DACs, two crystals, two independent errors. This is the axis
+        // that genuinely varies — unlike two groups on ONE output, whose
+        // capture streams share a clock and must share a ratio.
         let mut ctrl = DriftController::new(&[OutputId(0), OutputId(1)], cfg());
         let cmds = ctrl.tick(&[(OutputId(0), active(0.9)), (OutputId(1), active(0.1))]);
         assert_eq!(cmds.len(), 2);
@@ -286,17 +316,22 @@ mod tests {
     }
 
     #[test]
-    fn drift_target_fill_lands_on_the_governors_sawtooth_midpoint() {
-        // Decision 7's worked numbers (audio-flow-control): 48kHz stereo,
-        // 10ms device period -> RING_PERIOD_MARGIN=4 gives 1920-frame
-        // capacity; WAKE_MARGIN=1.25 + BLOCK_FRAME_MARGIN=8 gives a
-        // 608-frame block. Midpoint of the 960->1568 sawtooth is 1264/1920.
-        let target = drift_target_fill(0.5, 608, 1920);
-        assert!((target - 0.658_333).abs() < 0.001, "got {target}");
-    }
-
-    #[test]
-    fn drift_target_fill_falls_back_to_the_threshold_with_no_capacity() {
-        assert_eq!(drift_target_fill(0.5, 608, 0), 0.5);
+    fn a_saturated_capture_ring_drives_the_ratio_down_not_up() {
+        // The bug this loop was moved to fix, as a control-law assertion.
+        // A capture ring pinned at its brim (measured: 0.83–0.97 while
+        // `capture_drops` climbed ~192/s) must be corrected by consuming its
+        // input FASTER. Input consumed/sec = R_out / ratio, so faster means a
+        // LOWER ratio — the direction that reads backwards if you think of
+        // ratio only as "how much output the resampler emits".
+        let mut ctrl = DriftController::new(&[OutputId(0)], cfg());
+        let cmds = ctrl.tick(&[(OutputId(0), active(0.97))]);
+        let MixerCommand::SetOutputRatio(_, ratio) = cmds[0] else {
+            panic!("expected SetOutputRatio");
+        };
+        assert!(
+            ratio.value() < 1.0,
+            "a brim-pinned capture ring must drain faster, i.e. ratio below 1, got {}",
+            ratio.value()
+        );
     }
 }
