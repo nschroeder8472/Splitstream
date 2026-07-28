@@ -71,9 +71,7 @@ a clean exit.
 
 ### Prerequisites
 
-- Windows 10 (build 19041+) or Windows 11 — per-process loopback capture is the
-  hard requirement, and the exact minimum Windows 10 build has not been verified
-  on hardware
+- Windows 11, latest version recommended
 - A virtual audio device to act as the silent sink (see above)
 
 ### Setup
