@@ -1761,6 +1761,7 @@ fn mixer_loop(
         })
         .collect();
     let mut headroom = vec![OutputHeadroom { filled_frames: 0, capacity_frames: 0 }; output_producers.len()];
+    let mut blocked_outputs: Vec<OutputId> = Vec::with_capacity(output_producers.len());
 
     while !args.stop.load(Ordering::Relaxed) {
         drain_capture_commands(&args.capture_rx, &mut group_consumers);
@@ -1778,7 +1779,17 @@ fn mixer_loop(
             &headroom,
             &block_out_frames,
         );
-        mixer.mix_tick();
+        // Same predicate, same snapshot, applied to emission as well as to
+        // the input pull: parked surplus must not be offered to a ring with
+        // no room for it (`Mixer::mix_tick_gated`). Reuses one allocation for
+        // the life of the thread — cleared, never grown, on the RT path.
+        blocked_outputs.clear();
+        for (i, id) in output_ids.iter().enumerate() {
+            if !group_may_push(headroom[i], budget_per_output[i]) {
+                blocked_outputs.push(*id);
+            }
+        }
+        mixer.mix_tick_gated(&blocked_outputs);
         update_telemetry(&mixer, &group_ids, &output_ids, &args);
         flush_outputs(
             &mut output_producers,

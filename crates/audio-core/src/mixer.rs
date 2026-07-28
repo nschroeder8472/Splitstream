@@ -678,6 +678,37 @@ impl Mixer {
     /// matrix -> SRC -> sum per group (phase 3), then the always-on
     /// per-output headroom limiter (phase 4).
     pub fn mix_tick(&mut self) {
+        self.mix_tick_gated(&[]);
+    }
+
+    /// `mix_tick`, with the outputs in `blocked` producing no span this tick.
+    ///
+    /// Backpressure from the output ring (audio-flow-control). The governor
+    /// withholds a group's input pull while its output ring is at threshold,
+    /// on the assumption that no input means no output — but a group holding
+    /// parked surplus keeps supplying the shared span through a withhold, so
+    /// the mixer could offer a ring more than it had room for. Measured on
+    /// hardware 2026-07-27: spans of 858–1212 frames offered to a ring with
+    /// 705–825 free, the remainder rejected and counted as `output_drops`,
+    /// audible as popping whenever two groups shared an output.
+    ///
+    /// A blocked output computes no span, so every group's surplus stays
+    /// parked in its own FIFO and goes out on a tick that has room — which is
+    /// what the FIFO is for. Groups still run their gain, DSP, duck, matrix
+    /// and SRC stages, so no smoother or resampler goes cold.
+    ///
+    /// This cannot be done by skipping the flush instead: `take_output` is
+    /// what clears the accumulator, so a skipped flush with a live `mix_tick`
+    /// would sum the next tick on top of this one.
+    ///
+    /// **The caller must block emission only while it is also withholding
+    /// input for that output** — in the engine both answer to one
+    /// `group_may_push` call against one headroom snapshot. Blocking emission
+    /// while input still arrives overruns `resampled`, and the input that no
+    /// longer fits is dropped without a counter (`a_blocked_output_parks_its_
+    /// audio_instead_of_emitting_it` covers the paired case; the unpaired one
+    /// trips `mix_tick`'s own "resampled scratch undersized" assert in debug).
+    pub fn mix_tick_gated(&mut self, blocked: &[OutputId]) {
         let solo_active = self.solo_active();
 
         for i in 0..self.groups.len() {
@@ -801,6 +832,14 @@ impl Mixer {
         // `groups_sharing_an_output_never_emit_a_span_another_group_owes`
         // exercises stays parked for a single tick).
         for out in self.outputs.iter_mut() {
+            // No room in this output's ring: emit nothing, park everything.
+            // `filled` is already 0 (the previous `take_output` cleared it) —
+            // set explicitly so this holds even if a caller skipped a flush.
+            if blocked.contains(&out.id) {
+                out.filled = 0;
+                continue;
+            }
+
             let parking_full = self
                 .groups
                 .iter()
@@ -1525,6 +1564,69 @@ mod tests {
             "output stalled after the discard — it should free the span immediately, \
              not wait for the parking capacity to fill"
         );
+    }
+
+    #[test]
+    fn a_blocked_output_parks_its_audio_instead_of_emitting_it() {
+        // Contract for the emission gate, measured on hardware 2026-07-27: the
+        // governor withholds a group's input while its ring is at threshold,
+        // but a group holding parked surplus kept supplying the shared span
+        // through that withhold, so the mixer offered the ring more than it
+        // had room for and the remainder was rejected — `output_drops`, heard
+        // as popping.
+        //
+        // NOT an A/B of that fault: it passes with the gate reverted too,
+        // because reaching the faulting state offline needs every gating group
+        // to hold parked surplus at once, and after any emitting tick `min`
+        // leaves at least one of them at zero. Four oracles failed to
+        // construct it (see session-2026-07-27-static.md); the fault is only
+        // reproducible on hardware so far. What this DOES pin is the contract
+        // the gate has to keep: a blocked output emits nothing, and nothing it
+        // was holding is lost.
+        let block = 304;
+        let mut mixer = Mixer::new(&two_groups_one_output(), block).unwrap();
+
+        // One tick that parks: group 1 completes a chunk while group 2 is
+        // still mid-chunk, so group 2 gates the span to zero and group 1's
+        // block goes into its FIFO. This is the state the fault needs — a
+        // group holding surplus when the ring runs out of room.
+        mixer.push_group(GroupId(1), &vec![0.5f32; block * 2]);
+        mixer.push_group(GroupId(2), &vec![0.5f32; (block / 3) * 2]);
+        mixer.mix_tick();
+        let mut out = vec![0.0f32; mixer.output_capacity(OutputId(1))];
+        assert_eq!(
+            mixer.take_output(OutputId(1), &mut out),
+            0,
+            "group 2 is mid-chunk, so nothing should be emitted yet — without this the \
+             rest of the test proves nothing"
+        );
+
+        // Blocked. Input is withheld by the SAME predicate in the engine
+        // (`group_may_push` decides both), so the groups are pushed empty —
+        // that coupling is load-bearing, not incidental: blocking emission
+        // while input still flowed would overrun `resampled` and the surplus
+        // would become unconsumed input, silently dropped in release.
+        let mut emitted_while_blocked = 0;
+        for _ in 0..40 {
+            mixer.push_group(GroupId(1), &[]);
+            mixer.push_group(GroupId(2), &[]);
+            mixer.mix_tick_gated(&[OutputId(1)]);
+            let mut out = vec![0.0f32; mixer.output_capacity(OutputId(1))];
+            emitted_while_blocked += mixer.take_output(OutputId(1), &mut out);
+        }
+        assert_eq!(emitted_while_blocked, 0, "a blocked output must not emit");
+
+        // Unblocked, with input resumed as the engine resumes pulling it: the
+        // parked audio comes out. It was held, not dropped.
+        let mut recovered = 0;
+        for _ in 0..20 {
+            mixer.push_group(GroupId(1), &vec![0.5f32; block * 2]);
+            mixer.push_group(GroupId(2), &vec![0.5f32; block * 2]);
+            mixer.mix_tick();
+            let mut out = vec![0.0f32; mixer.output_capacity(OutputId(1))];
+            recovered += mixer.take_output(OutputId(1), &mut out);
+        }
+        assert!(recovered > 0, "audio parked during the block must still be delivered");
     }
 
     #[test]

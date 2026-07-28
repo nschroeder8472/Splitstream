@@ -2,12 +2,13 @@
 feature: session-handoff
 created: 2026-07-27
 status: >
-  Three defects found and fixed, then a FOURTH found by running MT17 (2026-07-27,
-  22:30): unassigning a group's last app silenced the whole output permanently.
-  Fixed. MT17 re-run PASSES — the static is gone and the unassign no longer
-  stalls. 496 tests green, clippy clean. One open item, new and separate:
-  light popping while two groups are BOTH producing audio, with the drift
-  ratio parked on its lower clamp rail. See "Open: the two-group popping".
+  FIVE defects, all found, fixed and hardware-validated on 2026-07-27. The
+  static (defect 3), the unassign stall MT17 exposed (defect 4), and the
+  two-group popping (defect 5: the governor's backpressure applied to input
+  but not to emission, so parked surplus was offered to a ring with no room).
+  Final run: 201 seconds of two groups both producing, every counter at zero,
+  the drift ratio never on a clamp rail, and the user reports the popping gone.
+  498 tests green, clippy clean. No open items.
 related:
   - .lattice/context/output-rate-truncation.md
   - .lattice/context/audio-flow-control.md
@@ -23,12 +24,13 @@ long as it did.
 
 # Pick up here
 
-MT17 is **done and passing** (2026-07-27 22:30, results at the bottom of the
-MT17 section). The static is gone; so is the unassign stall it exposed.
+Nothing outstanding. MT17 passes, and so does the two-group popping it exposed
+in turn — all five defects are fixed and heard clean on hardware.
 
-What is left is one new, separate symptom — light popping while two groups are
-both producing audio. It is not the static and not the stall: both of those are
-now measured clean. Start at "Open: the two-group popping".
+The work sits on branch `fix/routed-audio-transport`, unpushed and not merged
+to main. If anything here regresses, the audit line (`SPLITSTREAM_AUDIT=1`) now
+carries `last_reject`, which names *why* an output ring rejected a push rather
+than only counting that one did.
 
 ---
 
@@ -426,14 +428,41 @@ Nothing degrades with group count, and the gate is a pure relabelling of the
 ticks that already emitted nothing — no added latency, no lost frames, rate
 conserved. That is the *healthy* regime only.
 
-**What is still unproven: the fix's behaviour under the fault**, because no
-oracle here reproduces the fault. Every model feeds each group a uniform amount
-per tick; the rejected spans on hardware (858, 1017, 1212, 1012, 1020 against a
-1216-frame block) are partial and unequal, so the real cadence delivers
-fractions of a block with independent per-group phase. A faithful model needs
-that. The alternative is to implement the gate — the invariant "never offer the
-ring more than it can take" is unconditionally correct and the trace proves it
-is violated — and measure on hardware, where the fault demonstrably occurs.
+**No oracle here reproduces the fault**, so the fix could not be A/B'd offline.
+Every model feeds each group a uniform amount per tick; the rejected spans on
+hardware (858, 1017, 1212, 1012, 1020 against a 1216-frame block) are partial
+and unequal, so the real cadence delivers fractions of a block with independent
+per-group phase. Reaching the faulting state needs every gating group to hold
+parked surplus at once, and after any emitting tick `min` leaves at least one
+of them at zero. `a_blocked_output_parks_its_audio_instead_of_emitting_it`
+therefore pins the gate's *contract* (blocked emits nothing, loses nothing) and
+passes with the gate reverted — it is not a regression test for the fault.
+
+### Implemented and hardware-validated, 2026-07-27 23:23
+
+`Mixer::mix_tick_gated`, with `mixer_loop` deriving the blocked set from the
+same `group_may_push` call and the same headroom snapshot the input pull uses.
+
+| | before | after |
+|---|---|---|
+| two-group time, both producing | ~150 s | 201 s |
+| `output_drops` | 1078+ in 5 bursts | **0** |
+| `last_output_reject` | span=1020 free=710 | **none** |
+| `capture_drops` | 128 | **0** |
+| `xruns` | 0 | **0** |
+| `applied_ratio` on a clamp rail | every burst, pinned 0.99500 | **0 of 201 ticks** |
+| `ring_fill` | 0.50–0.81 | 0.50–0.81, mean 0.65 |
+
+368 audit seconds, zero fault lines in the whole run. The user reports the
+popping is gone. The gate's own risk — holding emission back starving the ring
+instead, which would surface as `xruns` where drops used to be — did not
+materialise.
+
+**Coupling requirement, now load-bearing:** emission may only be blocked while
+input is also withheld for that output. Blocking emission alone overruns
+`resampled`, and the input that no longer fits is dropped with no counter (it
+trips `mix_tick`'s own "resampled scratch undersized" assert in debug, which is
+how this was found).
 
 ### Scaling risks that are not the gate's fault
 
