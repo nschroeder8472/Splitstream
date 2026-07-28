@@ -307,24 +307,63 @@ settled. So it takes two groups actually *producing*, not merely two groups
 routed. That also means this cannot be attributed to the defect-4 fix on the
 evidence available: the two runs differ in workload as well as in build.
 
-**Hypothesis, untested — do not act on this without an oracle.** The `min` span
-rule couples groups on one output: the shared span advances at the slowest
-group's rate, so a group producing faster has nowhere to put its surplus except
-its own capture ring. The trace is consistent — `cf0` climbs to 0.68 while
-`cf1` sits at 0.37, and one ratio serves both. The previous session's three
-wrong turns all sounded this plausible and all compiled.
+## Diagnosed by oracle, 2026-07-27
 
-**How to actually settle it**, per what worked before:
+`probe_a_starved_group_loses_a_block_per_missed_tick` (ignored diagnostic in
+`mixer.rs`). Group 1 fed a full block every tick; group 2 fed nothing on every
+Nth tick and a full block otherwise — the same rate, delivered with a hole.
 
-1. An offline oracle in `mixer.rs`'s tests: two groups on one output, one fed
-   fewer input frames per tick than the other, asserting on whether the faster
-   group's parked surplus and its ring grow without bound. Deterministic, and
-   A/B-able against the span rule.
-2. If it reproduces, the question is where a per-group rate difference is
-   allowed to accumulate at all, given both captures share one WASAPI engine
-   clock — the answer is more likely in `pull_group_inputs`/governor
-   interaction than in the clock.
-3. Only then reach for hardware.
+| Group 2 fed | Samples at half amplitude | Max tick (nominal 608) | Zero ticks |
+|---|---|---|---|
+| every tick | 0 | 608 | 0 |
+| hole every 50th | **2.0%** | 676 | 0 |
+| hole every 10th | **10.0%** | 676 | 0 |
+
+**The notch fraction equals the gap frequency exactly.** Every tick a live group
+delivers nothing costs it one whole block of audio, permanently — `push_group`
+truncates at `max_block_frames`, so a group that misses a tick can never
+deliver extra to catch up.
+
+**Why the `min` rule does not catch it.** On a gap tick the group has nothing in
+flight *at all* (with `block == chunk_in` its SRC empties cleanly), so
+`has_audio_in_flight()` is false and the "a group with nothing in flight does
+not gate" exemption applies — the span advances with that group's silence in
+the mix. That exemption exists for a real reason (otherwise an idle group
+stalls its output forever, pinned by
+`a_group_with_nothing_in_flight_does_not_stall_its_output`), and nothing at the
+mixer's level distinguishes *idle* from *starved for one tick*.
+
+So this is the original static's mechanism surviving in the one case the `min`
+rule cannot reach. It explains the workload dependence exactly: a silent
+group's silence is correct, so run 1's assigned-but-silent second group showed
+nothing; only a *producing* group's missed tick is audible.
+
+The earlier hypothesis — that `min` couples the groups and the surplus backs up
+into the capture ring — is **not** what the oracle shows. A sustained rate
+deficit does produce stalls and 5–20% notches (`95%`/`80%` feed), but the live
+trace has `cf1` holding 0.36–0.52 for 90 s rather than draining, so the rates
+match. Jitter alone is sufficient, and jitter is what the system actually has:
+the mixer ticks on render wakes, which do not align with capture packet
+arrivals.
+
+## What a fix has to do
+
+The mixer cannot tell idle from starved, but `pull_group_inputs` **can** — it
+knows whether a slot has live pids and whether its ring came up empty. Two
+pieces, and both are needed:
+
+1. **Tell the mixer.** A group that is live but delivered nothing this tick
+   should gate the span (wait a tick), while a group with no pids should not —
+   that distinction is already half-built, since `discard_group_partial_input`
+   is driven by the same signal.
+2. **Let a lagging group catch up.** Gating alone is not enough: `push_group`
+   and `pull_group_inputs` both cap at one block per tick, so a group that
+   waits can never make up the deficit and the gate would just stall until the
+   parking-capacity backstop fires — trading the notch for a burst. The
+   per-tick input capacity has to allow a lagging group to over-deliver.
+
+Piece 2 resizes RT-owned buffers, so it wants its own review pass rather than
+being folded into a quick fix.
 
 ## If MT17 still shows static
 
