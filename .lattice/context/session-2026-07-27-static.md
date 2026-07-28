@@ -369,11 +369,83 @@ The third is the only one left standing, and the drift ratio is the obvious way
 production could exceed the nominal block — but ±0.5% of a block is single-digit
 frames, and the observed bursts are 560–900 samples.
 
-**Next measurement, and it belongs in the binary rather than in a model:** log
-the span, the ring's free space, and `block_out_frames` at the moment
-`flush_outputs` rejects a push. One hardware run answers directly which of the
-three it is. Every remaining theory is cheap to state and expensive to chase —
-that was the lesson of the three above.
+## Measured on hardware, 2026-07-27 23:0x — the answer
+
+`EngineStats::last_output_reject`, in output frames. Every reject in the run:
+
+| | span | free | cap | budget |
+|---|---|---|---|---|
+| 03:03:18 | 858 | 705 | 3840 | 1216 |
+| 03:03:51 | 1017 | 717 | 3840 | 1216 |
+| 03:03:53 | 1212 | 825 | 3840 | 1216 |
+| 03:06:09 | 1012 | 783 | 3840 | 1216 |
+| 03:06:40 | 1020 | 710 | 3840 | 1216 |
+
+**`span <= budget` always.** The mixer never overproduced; `group_may_push`'s
+arithmetic was never wrong. Third hypothesis dead, by measurement.
+
+**The ring was ~80% full before each push.** free ≈ 710–825 of 3840 means fill
+≈ 3100, and one block is 1216 = 31.7% of capacity. The governor admits below
+50%, pushes a block, lands at 81.7% — exactly the documented sawtooth
+(`ring_fill` 0.50–0.81). An 81% ring is the *normal* post-push peak.
+
+**So the fault is emission on the following tick, before the render thread has
+drained.** Fill is still ~81%, the governor withholds and pulls no input — and
+the mixer emits anyway, out of parked surplus. That span meets a ring with ~710
+frames free and the remainder is rejected. Parking only exists when groups gate
+each other, which is why one group never shows this.
+
+**The governor regulates input on the assumption that no input means no
+output.** Parked surplus broke that assumption.
+
+### Why oracle 3 said this could not happen
+
+It made every group misaligned-but-active, so on a withhold tick some group
+always had nothing parked and `min` took the span to zero. The real case has
+groups whose parked amounts are non-zero *simultaneously*, which needs
+independent per-group arrival phase.
+
+## The fix, and what is known about it
+
+Gate emission on the same per-output headroom the input pull already answers
+to: no room, no span, surplus stays parked — which is what the FIFO is for.
+It cannot be done by skipping `flush_outputs` alone, because `take_output`
+clears the accumulator: skipping the flush while still running `mix_tick` would
+superimpose two ticks of audio in `accum`. The skip belongs inside `mix_tick`,
+per output.
+
+`probe_span_rule_against_group_count` measures it at the real 48k→96k pair for
+2–5 groups sharing one output:
+
+| groups | notched | rejected | emitted | zero-span ticks | gated ticks |
+|---|---|---|---|---|---|
+| 2–5, gate off | 0% | 0 | 3538424 | 90 | — |
+| 2–5, gate on | 0% | 0 | 3538424 | 0 | 90 |
+
+Nothing degrades with group count, and the gate is a pure relabelling of the
+ticks that already emitted nothing — no added latency, no lost frames, rate
+conserved. That is the *healthy* regime only.
+
+**What is still unproven: the fix's behaviour under the fault**, because no
+oracle here reproduces the fault. Every model feeds each group a uniform amount
+per tick; the rejected spans on hardware (858, 1017, 1212, 1012, 1020 against a
+1216-frame block) are partial and unequal, so the real cadence delivers
+fractions of a block with independent per-group phase. A faithful model needs
+that. The alternative is to implement the gate — the invariant "never offer the
+ring more than it can take" is unconditionally correct and the trace proves it
+is violated — and measure on hardware, where the fault demonstrably occurs.
+
+### Scaling risks that are not the gate's fault
+
+Worth separating, since they get likelier as groups are added to one output:
+
+- `min` over gating groups means any one group that cannot supply throttles all
+  of them, and the chance that some group is mid-chunk on a given tick rises
+  with group count.
+- The parking-capacity backstop is a per-output release: one runaway group
+  filling its parking stops *every* in-flight group on that output from gating,
+  so their audio is skipped. Measured at 0% up to 5 groups in the healthy
+  regime, but it is a shared-fate mechanism by construction.
 
 ## If MT17 still shows static
 

@@ -1092,6 +1092,34 @@ mod tests {
         collected
     }
 
+    /// `n` groups sharing one output, ids 1..=n — the shape every span-rule
+    /// probe needs to vary group count rather than assume two.
+    fn n_groups_one_output_at(n: u16, out_rate: u32) -> Topology {
+        let mut t = n_groups_one_output(n);
+        t.outputs[0].format = stereo(out_rate);
+        t
+    }
+
+    fn n_groups_one_output(n: u16) -> Topology {
+        Topology {
+            master: Gain::new(1.0).unwrap(),
+            groups: (1..=n)
+                .map(|id| GroupSpec {
+                    id: GroupId(id),
+                    gain: Gain::new(1.0).unwrap(),
+                    follow_master: false,
+                    output: OutputId(1),
+                    input_format: stereo(48_000),
+                    dsp: Vec::new(),
+                    duck: None,
+                    spatial: false,
+                    mute: false,
+                })
+                .collect(),
+            outputs: vec![OutputSpec { id: OutputId(1), format: stereo(48_000) }],
+        }
+    }
+
     fn two_groups_one_output() -> Topology {
         let group = |id: u16| GroupSpec {
             id: GroupId(id),
@@ -1271,6 +1299,93 @@ mod tests {
                 "threshold={threshold} rejected={rejected} withheld_ticks={withheld_ticks} \
                  emitted_while_withheld={emitted_while_withheld} final_fill={fill}/{capacity}"
             );
+        }
+    }
+
+    /// Diagnostic, not an assertion — run it with
+    /// `cargo test -p audio-core group_count -- --ignored --nocapture`.
+    ///
+    /// How the shared-span design scales past two groups, and what gating
+    /// emission on the output ring's headroom (the proposed fix for the
+    /// two-group popping) does at each group count. Models the output ring,
+    /// the governor's input withhold, and — under `gate_emission` — the same
+    /// withhold applied to emission.
+    ///
+    /// Groups are staggered so their SRC chunk boundaries never coincide,
+    /// which is the condition that makes them gate each other at all.
+    #[test]
+    #[ignore = "diagnostic oracle, not a pass/fail check"]
+    fn probe_span_rule_against_group_count() {
+        // The reporting machine's pair: capture pinned at 48 kHz into a 96 kHz
+        // DAC, so one input block becomes two output blocks and `resampled`
+        // (two output blocks) holds only one block of parking.
+        let block = 304;
+        let out_block = block * 2; // output frames per input block, ratio 2.0
+        let capacity = out_block * 2 * 4; // samples, 4 output blocks — as ring_capacity_samples sizes it
+        let drain_per_tick = out_block * 2 * 97 / 100;
+        let threshold = 0.5f64;
+
+        for gate_emission in [false, true] {
+            for n in 2u16..=5 {
+                let mut mixer = Mixer::new(&n_groups_one_output_at(n, 96_000), block).unwrap();
+                let mut fill = 0usize;
+                let (mut rejected, mut zero_spans, mut emitted_total) = (0usize, 0usize, 0usize);
+                let mut gated_ticks = 0usize;
+                let mut collected = Vec::new();
+                // Per-group level scaled so the SUM is 0.5 whatever n is —
+                // otherwise n >= 3 sums past the output limiter's headroom and
+                // every sample reads as notched.
+                let level = 0.5f32 / n as f32;
+
+                for t in 0..3000 {
+                    fill = fill.saturating_sub(drain_per_tick);
+                    let has_room = (fill as f64) < threshold * capacity as f64;
+
+                    for id in 1..=n {
+                        if has_room {
+                            // Staggered priming: each group sits at a
+                            // different phase within its chunk forever.
+                            let extra = if t == 0 { (block / (n as usize + 1)) * id as usize } else { 0 };
+                            mixer.push_group(GroupId(id), &vec![level; (block + extra) * 2]);
+                        } else {
+                            mixer.push_group(GroupId(id), &[]);
+                        }
+                    }
+
+                    // The fix: emission answers to the same headroom the
+                    // input pull does, so parked surplus waits for room
+                    // instead of being pushed into a ring that has none.
+                    if gate_emission && !has_room {
+                        gated_ticks += 1;
+                        continue;
+                    }
+                    mixer.mix_tick();
+
+                    let mut out = vec![0.0f32; mixer.output_capacity(OutputId(1))];
+                    let n_out = mixer.take_output(OutputId(1), &mut out);
+                    if n_out == 0 {
+                        zero_spans += 1;
+                    }
+                    emitted_total += n_out;
+                    collected.extend_from_slice(&out[..n_out]);
+
+                    let room = capacity - fill;
+                    fill += n_out.min(room);
+                    rejected += n_out.saturating_sub(room);
+                }
+
+                // The sum is 0.5 whatever n is, so anything meaningfully below
+                // it is some group's contribution missing from that span.
+                let tail = &collected[collected.len() / 2..];
+                let notched = tail.iter().filter(|s| **s < 0.45).count();
+                println!(
+                    "gate_emission={gate_emission} n={n} rejected={rejected} \
+                     notched={notched}/{} ({:.2}%) zero_spans={zero_spans} \
+                     gated_ticks={gated_ticks} emitted={emitted_total}",
+                    tail.len(),
+                    100.0 * notched as f64 / tail.len().max(1) as f64,
+                );
+            }
         }
     }
 
