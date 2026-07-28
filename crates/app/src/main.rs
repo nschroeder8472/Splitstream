@@ -1532,10 +1532,22 @@ fn run_startup_and_dispatch(
                 .iter()
                 .map(|(id, m)| format!("{}:{:.4}", id.0, m.peak))
                 .collect();
+            // Why the last rejected push was rejected, in output frames.
+            // `span` above `budget` means the mixer produced more than the
+            // governor budgeted for; `span` at or below `free` means the ring
+            // freed up between the headroom snapshot and the flush. Absent
+            // until an output ring rejects something, which it should never do.
+            let reject = match fresh_stats.last_output_reject {
+                Some((span, free, capacity, budget)) => {
+                    format!("span={span},free={free},cap={capacity},budget={budget}")
+                }
+                None => "none".to_string(),
+            };
             tracing::info!(
                 xruns = fresh_stats.xruns,
                 output_drops = fresh_stats.output_drops,
                 capture_drops = fresh_stats.capture_drops,
+                last_reject = %reject,
                 capture_fill = %cfill.join(","),
                 ring_fill = %fill.join(","),
                 applied_ratio = %ratio.join(","),

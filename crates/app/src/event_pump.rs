@@ -104,6 +104,7 @@ mod tests {
             routes: vec![],
             stats: EngineStats {
                 xruns: 0,
+                last_output_reject: None,
                 ring_fill: vec![],
                 applied_ratio: vec![],
                 group_faults: vec![],

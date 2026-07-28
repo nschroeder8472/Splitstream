@@ -194,6 +194,29 @@ pub struct EngineStats {
     /// Frames offered to a render device that it did not accept. Structurally
     /// impossible post-B1 — counted because "impossible" is what B1 was.
     pub render_shortfall: u64,
+    /// The last push an output ring rejected, in that output's own frames:
+    /// `(span, free, capacity, budget)`. `None` until one is rejected.
+    ///
+    /// Diagnostic for the two-group popping (session-2026-07-27-static.md).
+    /// `output_drops` says a push was rejected but not which of the three
+    /// possible disagreements caused it, and offline oracles ruled out the
+    /// other two: `span > budget` means the mixer produced more than
+    /// `group_may_push` budgeted for, while `span <= free` means the ring
+    /// freed up between the headroom snapshot and the flush.
+    pub last_output_reject: Option<(u64, u64, u64, u64)>,
+}
+
+/// The last rejected push, in output frames — see
+/// [`EngineStats::last_output_reject`]. Written from the mixer thread on the
+/// reject path only (which should never run), so nothing is allocated or
+/// logged on the RT path; the audit line reads it out.
+#[derive(Debug, Default)]
+struct RejectDiag {
+    seen: AtomicBool,
+    span_frames: AtomicU64,
+    free_frames: AtomicU64,
+    capacity_frames: AtomicU64,
+    budget_frames: AtomicU64,
 }
 
 /// Packs a [`MeterLevel`] into one `AtomicU64` cell: the f32 peak in the low
@@ -247,6 +270,7 @@ fn read_stats(running: &Mutex<Option<RunningGraph>>) -> EngineStats {
             capture_drops: 0,
             capture_fill: Vec::new(),
             render_shortfall: 0,
+            last_output_reject: None,
         },
         Some(rg) => EngineStats {
             xruns: rg.xruns.load(Ordering::Relaxed),
@@ -304,6 +328,14 @@ fn read_stats(running: &Mutex<Option<RunningGraph>>) -> EngineStats {
                 .map(|id| (*id, capture_gauges(rg, *id).0))
                 .collect(),
             render_shortfall: rg.render_shortfall.load(Ordering::Relaxed),
+            last_output_reject: rg.reject_diag.seen.load(Ordering::Relaxed).then(|| {
+                (
+                    rg.reject_diag.span_frames.load(Ordering::Relaxed),
+                    rg.reject_diag.free_frames.load(Ordering::Relaxed),
+                    rg.reject_diag.capacity_frames.load(Ordering::Relaxed),
+                    rg.reject_diag.budget_frames.load(Ordering::Relaxed),
+                )
+            }),
         },
     }
 }
@@ -487,6 +519,9 @@ struct RunningGraph {
     output_drops: Arc<AtomicU64>,
     capture_drops: Arc<AtomicU64>,
     render_shortfall: Arc<AtomicU64>,
+    /// Why the last rejected push was rejected — see
+    /// [`EngineStats::last_output_reject`].
+    reject_diag: Arc<RejectDiag>,
     /// Last resample ratio applied per output, in `output_ids` order, as
     /// `f64::to_bits` (no `AtomicF64` in std) — written by the mixer thread as
     /// it applies each `SetOutputRatio`, surfaced via `EngineStats`.
@@ -1281,6 +1316,7 @@ fn build_running_graph(
     let stop = Arc::new(AtomicBool::new(false));
     let xruns = Arc::new(AtomicU64::new(0));
     let output_drops = Arc::new(AtomicU64::new(0));
+    let reject_diag = Arc::new(RejectDiag::default());
     let capture_drops = Arc::new(AtomicU64::new(0));
     let render_shortfall = Arc::new(AtomicU64::new(0));
     let group_ids: Vec<GroupId> = opened.plan.topology.groups.iter().map(|g| g.id).collect();
@@ -1391,6 +1427,7 @@ fn build_running_graph(
         group_input_rates,
         output_rates,
         output_drops: Arc::clone(&output_drops),
+        reject_diag: Arc::clone(&reject_diag),
         applied_ratio: Arc::clone(&applied_ratio),
         output_index_of: output_index_of.clone(),
     };
@@ -1417,6 +1454,7 @@ fn build_running_graph(
         render_threads,
         xruns,
         output_drops,
+        reject_diag,
         capture_drops,
         render_shortfall,
         applied_ratio,
@@ -1662,6 +1700,9 @@ struct MixerThreadArgs {
     /// anyway (cap 3) — should stay 0; a disagreement between the budget and
     /// the ring's real capacity.
     output_drops: Arc<AtomicU64>,
+    /// Why the last rejected push was rejected — see
+    /// [`EngineStats::last_output_reject`].
+    reject_diag: Arc<RejectDiag>,
 }
 
 fn mixer_loop(
@@ -1705,6 +1746,20 @@ fn mixer_loop(
             block_output_frames(args.max_block_frames, group_rate, output_rate)
         })
         .collect();
+    // The same budget, folded per output: the largest block any group feeding
+    // it may push. Only the reject diagnostic reads it — `group_may_push`
+    // still decides per group, against that group's own block.
+    let budget_per_output: Vec<usize> = (0..output_producers.len())
+        .map(|out_i| {
+            group_consumers
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| slot.output_index == out_i)
+                .map(|(g, _)| block_out_frames[g])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
     let mut headroom = vec![OutputHeadroom { filled_frames: 0, capacity_frames: 0 }; output_producers.len()];
 
     while !args.stop.load(Ordering::Relaxed) {
@@ -1734,6 +1789,8 @@ fn mixer_loop(
                 real_this_tick: &real_this_tick,
                 ticks_since_real: &mut ticks_since_real,
                 drops: &args.output_drops,
+                reject_diag: &args.reject_diag,
+                budget_frames: &budget_per_output,
             },
         );
 
@@ -1949,6 +2006,12 @@ struct FlushCtx<'a> {
     /// should stay 0 (cap 3); non-zero means the budget and the ring's real
     /// capacity disagree.
     drops: &'a AtomicU64,
+    /// Which of the possible disagreements it was — see
+    /// [`EngineStats::last_output_reject`].
+    reject_diag: &'a RejectDiag,
+    /// Governor budget per output, in that output's frames: the largest block
+    /// any group feeding it may push. Index-parallel to `output_producers`.
+    budget_frames: &'a [usize],
 }
 
 fn flush_outputs(
@@ -1957,9 +2020,12 @@ fn flush_outputs(
     mixer: &mut Mixer,
     ctx: FlushCtx<'_>,
 ) {
-    for (i, (output_id, producer, _)) in output_producers.iter_mut().enumerate() {
+    for (i, (output_id, producer, channels)) in output_producers.iter_mut().enumerate() {
         let scratch = &mut output_scratch[i];
         let n = mixer.take_output(*output_id, scratch);
+        // Captured before the push loop consumes it: what the ring could have
+        // taken at the moment the mixer offered this span.
+        let free_before = producer.slots();
         let mut dropped = 0u64;
         for &sample in &scratch[..n] {
             if producer.push(sample).is_err() {
@@ -1968,6 +2034,19 @@ fn flush_outputs(
         }
         if dropped > 0 {
             ctx.drops.fetch_add(dropped, Ordering::Relaxed);
+            // In frames, so it compares directly against the governor's budget
+            // and the headroom snapshot it decided on. Relaxed and unordered
+            // between fields: the four are read together for a human, never
+            // acted on, and this path is already a fault.
+            let ch = (*channels).max(1);
+            let d = ctx.reject_diag;
+            d.span_frames.store((n / ch) as u64, Ordering::Relaxed);
+            d.free_frames.store((free_before / ch) as u64, Ordering::Relaxed);
+            d.capacity_frames
+                .store((producer.buffer().capacity() / ch) as u64, Ordering::Relaxed);
+            d.budget_frames
+                .store(ctx.budget_frames.get(i).copied().unwrap_or(0) as u64, Ordering::Relaxed);
+            d.seen.store(true, Ordering::Relaxed);
         }
         let capacity = producer.buffer().capacity();
         let filled = capacity - producer.slots();
@@ -3579,6 +3658,7 @@ mod tests {
             group_input_rates: vec![48_000],
             output_rates: vec![48_000],
             output_drops: Arc::new(AtomicU64::new(0)),
+            reject_diag: Arc::new(RejectDiag::default()),
         };
         let handle = thread::spawn(move || mixer_loop(mixer, group_consumers, output_producers, args));
 
@@ -3668,6 +3748,7 @@ mod tests {
             group_input_rates: vec![48_000],
             output_rates: vec![48_000],
             output_drops: Arc::new(AtomicU64::new(0)),
+            reject_diag: Arc::new(RejectDiag::default()),
         };
         let handle = thread::spawn(move || mixer_loop(mixer, group_consumers, output_producers, args));
 
@@ -3715,6 +3796,7 @@ mod tests {
             group_input_rates: Vec::new(),
             output_rates: Vec::new(),
             output_drops: Arc::new(AtomicU64::new(0)),
+            reject_diag: Arc::new(RejectDiag::default()),
         };
         let handle = thread::spawn(move || mixer_loop(mixer, group_consumers, output_producers, args));
         let waker = MixerWaker(handle.thread().clone());
@@ -4508,6 +4590,8 @@ mod tests {
                     real_this_tick: &real_this_tick,
                     ticks_since_real: &mut ticks_since_real,
                     drops: &drops,
+                    reject_diag: &RejectDiag::default(),
+                    budget_frames: &[],
                 },
             );
         }
@@ -4520,6 +4604,66 @@ mod tests {
         assert!(
             consumers[0].pids[0].1.slots() > 0,
             "once the output ring is saturated, leftover audio must stay queued in the pid ring, not be pulled and dropped"
+        );
+    }
+
+    #[test]
+    fn a_rejected_push_records_why_it_was_rejected() {
+        // `output_drops` says a push was rejected but not which disagreement
+        // caused it, which is what left the two-group popping unexplained
+        // (session-2026-07-27-static.md). A ring far too small for the span
+        // stands in for whatever the real cause turns out to be: what matters
+        // is that the four numbers a reader needs are captured at the moment
+        // it happens, in frames, and comparable against the governor's budget.
+        let topology = Topology {
+            master: audio_core::Gain::UNITY,
+            groups: vec![group_spec(GroupId(0), OutputId(0))],
+            outputs: vec![audio_core::OutputSpec { id: OutputId(0), format: mono(48_000) }],
+        };
+        let mut mixer = Mixer::new(&topology, 304).unwrap();
+        // Enough input to drive the SRC past its warm-up and produce a span.
+        for _ in 0..4 {
+            mixer.push_group(GroupId(0), &vec![0.5f32; 304]);
+            mixer.mix_tick();
+        }
+
+        let (out_p, _out_c) = RingBuffer::<f32>::new(16); // never drained
+        let mut output_producers = vec![(OutputId(0), out_p, 1usize)];
+        let mut output_scratch = vec![vec![0.0f32; mixer.output_capacity(OutputId(0))]];
+        let ring_fill = vec![RingGauge {
+            fill_permille: AtomicU32::new(0),
+            active: AtomicBool::new(false),
+        }];
+        let mut ticks_since_real = vec![ACTIVE_HOLD_TICKS];
+        let drops = AtomicU64::new(0);
+        let diag = RejectDiag::default();
+
+        flush_outputs(
+            &mut output_producers,
+            &mut output_scratch,
+            &mut mixer,
+            FlushCtx {
+                ring_fill: &ring_fill,
+                real_this_tick: &[true],
+                ticks_since_real: &mut ticks_since_real,
+                drops: &drops,
+                reject_diag: &diag,
+                budget_frames: &[304],
+            },
+        );
+
+        assert!(drops.load(Ordering::Relaxed) > 0, "the 16-slot ring cannot hold a full span");
+        assert!(diag.seen.load(Ordering::Relaxed), "a reject must record why");
+        assert_eq!(diag.capacity_frames.load(Ordering::Relaxed), 16);
+        assert_eq!(diag.budget_frames.load(Ordering::Relaxed), 304);
+        assert_eq!(
+            diag.free_frames.load(Ordering::Relaxed),
+            16,
+            "free space is captured BEFORE the push loop consumes it, or it always reads 0"
+        );
+        assert!(
+            diag.span_frames.load(Ordering::Relaxed) > 16,
+            "the span is what was offered, not what fit"
         );
     }
 
