@@ -1,5 +1,5 @@
-﻿//! Per-group gain, DSP, duck, SRC, and output summing. Everything here runs
-//! on the RT mixer thread (`engine::runtime`) â€” no allocation, no locks, no
+//! Per-group gain, DSP, duck, SRC, and output summing. Everything here runs
+//! on the RT mixer thread (`engine::runtime`) — no allocation, no locks, no
 //! blocking.
 
 use crate::channel::ChannelMatrix;
@@ -23,14 +23,14 @@ pub enum Render {
 impl Render {
     /// Shared by `build_group` (initial construction) and
     /// `engine::EngineHandle::apply_spatial` (live toggle, off-thread
-    /// rebuild) â€” see spatial-audio.md's "Render::build" decision. Owns the
+    /// rebuild) — see spatial-audio.md's "Render::build" decision. Owns the
     /// fallback rule: `spatial` only takes effect when `to` is stereo.
     pub fn build(spatial: bool, from: Format, to: Format, max_block_frames: usize) -> Render {
         if spatial && to.layout == ChannelLayout::STEREO {
             // `from`'s rate, not `to`'s: the render stage runs BEFORE the SRC
             // (`mix_tick` phase 3), so the samples this convolves are still at
             // the group's input rate. Building the HRIR at the device rate put
-            // the interaural delay out by the whole rate ratio â€” a 48 kHz
+            // the interaural delay out by the whole rate ratio — a 48 kHz
             // capture into a 96 kHz DAC got twice the intended ITD.
             let hrirs = HrirSet::embedded(from.sample_rate);
             Render::Spatial(Spatializer::new(from.layout, &hrirs, max_block_frames))
@@ -56,7 +56,7 @@ impl Render {
 }
 
 /// Manual impl: `Spatializer` holds `Arc<dyn rustfft::Fft<f32>>`, which has
-/// no `Debug` â€” same rationale as `DspChain`'s manual impl in `dsp.rs`.
+/// no `Debug` — same rationale as `DspChain`'s manual impl in `dsp.rs`.
 impl std::fmt::Debug for Render {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -67,7 +67,7 @@ impl std::fmt::Debug for Render {
 }
 
 /// What a `SwapChain`/`SwapRender` apply hands back for the caller to drop
-/// off-RT (notes Â§7) â€” widened from a bare `Box<DspChain>` (dsp-pipeline.md)
+/// off-RT (notes §7) — widened from a bare `Box<DspChain>` (dsp-pipeline.md)
 /// once `SwapRender` needed the same swap-and-retire path.
 #[derive(Debug)]
 pub enum Retired {
@@ -80,14 +80,14 @@ pub enum MixerCommand {
     SetGroupGain(GroupId, Gain),
     SetMaster(Gain),
     SetFollowMaster(GroupId, bool),
-    /// Fans out to every group's `Src` feeding that output â€” each group has its
+    /// Fans out to every group's `Src` feeding that output — each group has its
     /// own resampler, but they must all run the **same** ratio.
     ///
     /// This is a correctness constraint, not a convenience: `mix_tick` sums
     /// every group into one shared accumulator over a single span, so groups on
     /// one output must produce identical frame counts per tick. A per-group
     /// ratio (tried 2026-07-27) makes them diverge, and the shorter group's
-    /// tail is silently zero-filled â€” a level notch at the tick rate, measured
+    /// tail is silently zero-filled — a level notch at the tick rate, measured
     /// at 1% of output samples dropping to half amplitude.
     ///
     /// Per-output is also the right *physical* granularity. Process-loopback
@@ -96,7 +96,7 @@ pub enum MixerCommand {
     /// from each other. The clock that genuinely differs is the DAC's, and
     /// that is shared by every group routed to it.
     SetOutputRatio(OutputId, ResampleRatio),
-    /// Global output-stage kill, independent of `follow_master` â€” silences
+    /// Global output-stage kill, independent of `follow_master` — silences
     /// every group's contribution to every output. Gain/master smoothers
     /// keep running so unmute resumes at the same value with no re-ramp.
     SetMuted(bool),
@@ -106,8 +106,8 @@ pub enum MixerCommand {
     /// Session-only solo, never persisted. Any group soloed puts the whole
     /// mixer in solo mode: non-soloed groups are silenced on every output.
     SetGroupSolo(GroupId, bool),
-    /// Param tweak or bypass toggle on a pre-allocated stage â€” smoothed
-    /// internally, never a stepped change (notes Â§8).
+    /// Param tweak or bypass toggle on a pre-allocated stage — smoothed
+    /// internally, never a stepped change (notes §8).
     SetDspParam {
         group: GroupId,
         stage: usize,
@@ -120,7 +120,7 @@ pub enum MixerCommand {
     },
     /// Reconfigures (or clears) a group's duck sidechain. Command-path, not
     /// `Structural`: unlike adding/removing a DSP stage, this never resizes
-    /// any RT-owned buffer â€” just swaps a few scalar fields.
+    /// any RT-owned buffer — just swaps a few scalar fields.
     SetDuck {
         group: GroupId,
         duck: Option<DuckSpec>,
@@ -146,14 +146,14 @@ pub enum MixerCommand {
     },
 }
 
-const GAIN_TIME_CONSTANT_S: f32 = 0.01; // 10ms â€” inaudible as a ramp, kills zipper noise
-/// Envelope-follower detection time, fixed (not user-configurable â€” `DuckSpec`
+const GAIN_TIME_CONSTANT_S: f32 = 0.01; // 10ms — inaudible as a ramp, kills zipper noise
+/// Envelope-follower detection time, fixed (not user-configurable — `DuckSpec`
 /// only exposes the *reaction* attack/release, see `DuckTargetGain`). Fast
 /// enough to catch onset without being noise-jittery.
 const ENV_FOLLOWER_ATTACK_MS: f32 = 5.0;
 const ENV_FOLLOWER_RELEASE_MS: f32 = 100.0;
 /// Always-on per-output headroom limiter ceiling (L1 capability 4: shared
-/// outputs must never clip). Not user-configurable â€” this is a safety net,
+/// outputs must never clip). Not user-configurable — this is a safety net,
 /// not a mix decision; per-group limiting is what `DspSpec::Limiter` is for.
 const OUTPUT_HEADROOM_CEILING_DB: f32 = 0.0;
 
@@ -161,7 +161,7 @@ fn one_pole_coeff(time_constant_s: f32, sample_rate: u32) -> f32 {
     (-1.0 / (time_constant_s * sample_rate as f32)).exp()
 }
 
-/// Mixer-level cross-group sidechain follower (L2: not a `DspStage` â€” it
+/// Mixer-level cross-group sidechain follower (L2: not a `DspStage` — it
 /// reads one group's post-chain signal to drive gain on a *different*
 /// group). One instance per group, always running: any group can become a
 /// duck trigger via a live `SetDuck` command, and pre-allocating a follower
@@ -183,12 +183,12 @@ impl EnvFollower {
         }
     }
 
-    /// Returns the envelope, in dBFS, at the end of `buf` â€” the per-frame
+    /// Returns the envelope, in dBFS, at the end of `buf` — the per-frame
     /// tracking state carries across calls, but only the final value is
     /// reported (L3 interaction A: one reading per group per tick).
     ///
     /// One update per FRAME (peak across `channels`), not per interleaved
-    /// element â€” `attack`/`release` assume one call per sample-period;
+    /// element — `attack`/`release` assume one call per sample-period;
     /// stepping per element would make detection `channels` times faster
     /// than intended (review finding, dsp-pipeline P5).
     fn process_block(&mut self, buf: &[f32], channels: usize) -> f32 {
@@ -205,7 +205,7 @@ impl EnvFollower {
     }
 }
 
-/// Smoothed linear gain applied to a duck target's buffer â€” asymmetric
+/// Smoothed linear gain applied to a duck target's buffer — asymmetric
 /// attack/release from the group's own `DuckSpec` (the knobs a user tunes),
 /// distinct from `EnvFollower`'s fixed detection timing.
 struct DuckTargetGain {
@@ -225,7 +225,7 @@ impl DuckTargetGain {
 
     /// Ramps per-frame toward `target` (attack when reducing, release when
     /// recovering) and applies the running gain to every channel in that
-    /// frame. One ramp step per frame, not per interleaved element â€” same
+    /// frame. One ramp step per frame, not per interleaved element — same
     /// rate bug class as `EnvFollower::process_block` (review finding,
     /// dsp-pipeline P5): `attack_coeff`/`release_coeff` assume one call per
     /// sample-period, so a per-element step would make the group's
@@ -269,12 +269,12 @@ struct GroupState {
     // and multiple groups following master in the same tick would otherwise
     // advance shared state multiple times, converging faster than intended.
     // Independent copies at the same time constant drift from each other by
-    // a fraction of a sample over a ~10ms ramp â€” inaudible.
+    // a fraction of a sample over a ~10ms ramp — inaudible.
     master: Smoothed,
     /// Converts source layout -> output layout, between the DSP chain and
-    /// SRC â€” either the plain channel matrix or a binaural spatializer.
+    /// SRC — either the plain channel matrix or a binaural spatializer.
     /// Boxed at construction (off-RT) so a live `SwapRender` command is a
-    /// pointer move, never an RT allocation (notes Â§7). Skipped entirely
+    /// pointer move, never an RT allocation (notes §7). Skipped entirely
     /// when `is_identity()` (same layout in and out, `Matrix` only).
     render: Box<Render>,
     /// Render output, pre-SRC. Capacity: `max_block_frames * output channels`.
@@ -282,9 +282,9 @@ struct GroupState {
     src: Src,
     /// Gain-applied, then DSP-chain- and duck-processed samples, pre-matrix.
     /// Capacity: `max_block_frames * channels`. Source layout throughout
-    /// (notes Â§17: DSP/duck stay at source layout, not output layout).
+    /// (notes §17: DSP/duck stay at source layout, not output layout).
     scratch: Vec<f32>,
-    /// Valid interleaved sample count in `scratch` this tick â€” set by
+    /// Valid interleaved sample count in `scratch` this tick — set by
     /// `push_group`, consumed by `mix_tick`'s duck/matrix/SRC/sum phases.
     valid_len: usize,
     /// SRC output, as a FIFO. Capacity is generous (see Mixer::new) so a full
@@ -305,16 +305,16 @@ struct GroupState {
     resampled_samples: usize,
     input_format: Format,
     /// Boxed at construction (off-RT) so a live `SwapChain` command is a
-    /// pointer move, never an RT allocation (notes Â§7).
+    /// pointer move, never an RT allocation (notes §7).
     dsp_chain: Box<DspChain>,
     duck: Option<DuckSpec>,
     duck_gain: Option<DuckTargetGain>,
     env_follower: EnvFollower,
     /// This group's own envelope, computed fresh every tick before any
-    /// target's duck gain is applied â€” see `Mixer::mix_tick` phase 1.
+    /// target's duck gain is applied — see `Mixer::mix_tick` phase 1.
     last_env_db: f32,
     /// Post-fader level meter (level-meters.md): sampled on the group's
-    /// post-gain/DSP/duck signal (`scratch`), before matrix/SRC â€” the audible
+    /// post-gain/DSP/duck signal (`scratch`), before matrix/SRC — the audible
     /// contribution this group makes to its output. Independent of the global
     /// mute kill (which happens at the output accumulator, not here), so the
     /// bar reflects what the group is producing even while master is muted;
@@ -328,7 +328,7 @@ struct OutputState {
     /// High-water mark of valid samples in `accum` since the last `take_output`.
     filled: usize,
     format: Format,
-    /// Always-on headroom limiter (L1 capability 4) â€” runs after every
+    /// Always-on headroom limiter (L1 capability 4) — runs after every
     /// group has summed into `accum`, before the render thread reads it.
     limiter: Limiter,
     /// Per-output level meter (level-meters.md): sampled on the final summed +
@@ -353,7 +353,7 @@ fn silenced(g: &GroupState, solo_active: bool) -> bool {
 }
 
 /// A `Format`'s `layout` must describe exactly as many speakers as
-/// `channels` says â€” the invariant a raw device mix-format read or a
+/// `channels` says — the invariant a raw device mix-format read or a
 /// hand-built test `Format` could otherwise violate silently.
 fn validate_layout(fmt: &Format) -> Result<(), DomainError> {
     if fmt.layout.count() == fmt.channels {
@@ -366,7 +366,7 @@ fn validate_layout(fmt: &Format) -> Result<(), DomainError> {
     }
 }
 
-/// How many frames of THIS output's audio one input block can become â€” the
+/// How many frames of THIS output's audio one input block can become — the
 /// worst case across every group routed here, since each group resamples from
 /// its own input rate to this device's rate. A device nobody feeds still gets
 /// a full block so the buffer is never zero-length.
@@ -430,7 +430,7 @@ fn build_group(
     // SRC runs post-matrix: both sides already share `out_channels` and
     // `out_spec.format.layout`, so only the sample rate differs between
     // them. This is why `Src::new`'s equal-channel-count check can no
-    // longer be hit from a public path â€” the matrix guarantees it upstream.
+    // longer be hit from a public path — the matrix guarantees it upstream.
     let src_from = Format {
         sample_rate,
         channels: out_spec.format.channels,
@@ -489,7 +489,7 @@ impl Mixer {
 
         let mut outputs = Vec::with_capacity(topology.outputs.len());
         for spec in &topology.outputs {
-            // OUTPUT frames, not `max_block_frames` â€” see
+            // OUTPUT frames, not `max_block_frames` — see
             // [`max_output_block_frames`]. `max_block_frames` counts frames at
             // a group's INPUT rate; everything from here on holds frames at
             // this device's rate. Sizing this buffer in input frames truncates
@@ -521,7 +521,7 @@ impl Mixer {
         })
     }
 
-    /// Interleaved samples one tick can leave in this output's accumulator â€”
+    /// Interleaved samples one tick can leave in this output's accumulator —
     /// the exact size a caller's `take_output` buffer must be. Callers must
     /// not re-derive it from `max_block_frames`: that counts INPUT frames, and
     /// a buffer short of this silently truncates the tick (see
@@ -542,8 +542,8 @@ impl Mixer {
 
     /// Unknown ids are dropped silently: the command ring may still carry a
     /// stale-epoch command past the point its group/output was torn down.
-    /// Returns the retired chain/render on `SwapChain`/`SwapRender` â€” the
-    /// caller drops it off-RT (notes Â§7); every other variant returns `None`.
+    /// Returns the retired chain/render on `SwapChain`/`SwapRender` — the
+    /// caller drops it off-RT (notes §7); every other variant returns `None`.
     pub fn apply(&mut self, cmd: MixerCommand) -> Option<Retired> {
         match cmd {
             MixerCommand::SetGroupGain(id, gain) => {
@@ -621,7 +621,7 @@ impl Mixer {
     }
 
     /// Applies gain (and master, if bound) per-sample, then the group's DSP
-    /// chain â€” both at source layout. Duck, matrix, SRC, and output summing
+    /// chain — both at source layout. Duck, matrix, SRC, and output summing
     /// happen later in `mix_tick`, once every group has reached this point
     /// (L3 interaction A: duck needs every trigger's post-chain signal
     /// before any target is touched). `frames` is interleaved and truncated
@@ -663,7 +663,7 @@ impl Mixer {
     /// after the live groups had filled their parking and lost a block of input
     /// to it. This is the exact signal for the case that actually occurs; the
     /// capacity bound is the backstop for causes not enumerated here.
-    /// Idempotent â€” the caller fires it every tick while the group is empty.
+    /// Idempotent — the caller fires it every tick while the group is empty.
     pub fn discard_group_partial_input(&mut self, group: GroupId) {
         if let Some(g) = self.groups.iter_mut().find(|g| g.id == group) {
             g.src.discard_partial_input();
@@ -673,8 +673,8 @@ impl Mixer {
     /// Runs once per tick, after every group's `push_group` call and before
     /// `take_output`. Order per L3 interaction A: every trigger's post-chain
     /// envelope first (phase 1), then duck gain reduction on every target
-    /// (phase 2) â€” no target's matrix/SRC/sum has run yet, so there's no
-    /// feedback regardless of how the duck config graph is shaped â€” then
+    /// (phase 2) — no target's matrix/SRC/sum has run yet, so there's no
+    /// feedback regardless of how the duck config graph is shaped — then
     /// matrix -> SRC -> sum per group (phase 3), then the always-on
     /// per-output headroom limiter (phase 4).
     pub fn mix_tick(&mut self) {
@@ -723,7 +723,7 @@ impl Mixer {
 
             // Post-fader meter tap (level-meters.md): the group's fully-faded
             // post-duck signal, at source layout, before matrix/SRC. Empty
-            // this tick (no input pushed) â†’ decay across the nominal block so
+            // this tick (no input pushed) → decay across the nominal block so
             // the bar falls instead of freezing at its last peak.
             if n > 0 {
                 g.meter.observe(&g.scratch[..n], g.channels);
@@ -732,7 +732,7 @@ impl Mixer {
             }
 
             // Render stage: skipped entirely (no copy) when the matrix is
-            // identity â€” the common case should pay nothing extra. `Spatial`
+            // identity — the common case should pay nothing extra. `Spatial`
             // is never identity, so it always goes through `render.process`.
             let (matrix_input, matrix_len): (&[f32], usize) = if g.render.is_identity() {
                 (&g.scratch[..n], n)
@@ -753,7 +753,7 @@ impl Mixer {
 
             // Output-stage kill: gain/chain/duck/matrix/SRC still ran above
             // (smoothers and resampler state stay warm), only the write into
-            // the shared output accumulator is skipped â€” unmute resumes with
+            // the shared output accumulator is skipped — unmute resumes with
             // no re-ramp or glitch. Per-group mute/solo silencing rides the
             // same skip point. The FIFO is dropped rather than carried: a
             // silenced group must not gate its output's span (below), and
@@ -769,7 +769,7 @@ impl Mixer {
         // NOT the most (`filled.max(write_len)`, the pre-2026-07-27 rule).
         // Groups sharing an output cross their SRC chunk boundaries on
         // different ticks, so on the tick where one group completes a chunk
-        // the other has produced nothing â€” and emitting the longer span put
+        // the other has produced nothing — and emitting the longer span put
         // that group's *silence* into the output where its audio should have
         // gone. With one group it was invisible (nothing produced meant
         // nothing emitted); with two it spliced a silence block into the other
@@ -778,18 +778,18 @@ impl Mixer {
         // `groups_sharing_an_output_never_emit_a_span_another_group_owes`.
         //
         // A group with nothing in flight is genuinely silent for this span and
-        // does not gate â€” otherwise an idle group would stall its output
+        // does not gate — otherwise an idle group would stall its output
         // forever.
         //
         // Nor does a group whose in-flight audio is no longer coming. A partial
         // SRC chunk only completes when more input arrives; when a group's last
         // pid goes away none ever does, so it gated at zero forever and every
-        // group on that output went permanently silent â€” measured on hardware
+        // group on that output went permanently silent — measured on hardware
         // 2026-07-27 (MT17), by unassigning the second group's last app.
         //
         // The bound is the parking capacity, not a timeout. Waiting is only
         // free while the groups running ahead can park their surplus, and
-        // `resampled` holds two output blocks â€” one block in flight plus one
+        // `resampled` holds two output blocks — one block in flight plus one
         // parked. Once a group is holding a full block it can accept no more,
         // and `src.process` would leave the next block's input unconsumed:
         // waiting past that point discards live audio to keep faith with a
@@ -841,7 +841,7 @@ impl Mixer {
             out.limiter.process(&mut out.accum[..filled], out.format);
 
             // Per-output meter tap (level-meters.md): final summed + limited
-            // signal. Nothing summed this tick (muted or idle) â†’ decay across
+            // signal. Nothing summed this tick (muted or idle) → decay across
             // the nominal block so the device bar falls to the floor.
             if filled > 0 {
                 out.meter.observe(&out.accum[..filled], out.format.channels as usize);
@@ -853,7 +853,7 @@ impl Mixer {
 
     /// Copies this tick's summed output into `buf` (up to its length) and
     /// clears the accumulator for the next tick. Returns samples written;
-    /// short reads mean underrun â€” the caller (render.rs) pads with silence.
+    /// short reads mean underrun — the caller (render.rs) pads with silence.
     pub fn take_output(&mut self, output: OutputId, buf: &mut [f32]) -> usize {
         let Some(out) = self.outputs.iter_mut().find(|o| o.id == output) else {
             return 0;
@@ -933,7 +933,7 @@ mod tests {
         // 48 kHz, the user's DAC reports a 96 kHz mix format. `max_block_frames`
         // counts INPUT frames, so an accumulator sized with it held exactly
         // half of what the SRC produced and `mix_tick`'s
-        // `produced.min(accum.len())` threw the other half away â€” every block,
+        // `produced.min(accum.len())` threw the other half away — every block,
         // silently. Audibly: playback skips forward a few milliseconds at a
         // time while every surviving instant is full-bandwidth.
         let block = 512;
@@ -978,14 +978,14 @@ mod tests {
         assert!(
             ratio > 1.9,
             "a 48k -> 96k path must emit ~2 output samples per input sample; got {ratio:.3} \
-             ({total_out} out / {total_in} in) â€” the surplus is being truncated"
+             ({total_out} out / {total_in} in) — the surplus is being truncated"
         );
     }
 
     #[test]
     fn every_device_rate_conserves_frames_against_the_fixed_48k_capture() {
         // Capture is pinned at 48 kHz (`PROCESS_CAPTURE_FORMAT`), so the rate
-        // ratio is whatever the user's DAC reports â€” anything from a 24 kHz
+        // ratio is whatever the user's DAC reports — anything from a 24 kHz
         // endpoint to a 192 kHz one. Every output-side buffer is sized from
         // `max_output_block_frames`, so this must hold for ALL of them, not
         // just the 2x case that surfaced the bug: an accumulator one frame
@@ -1025,7 +1025,7 @@ mod tests {
                 assert!(
                     n < capacity,
                     "{out_rate} Hz: a tick produced {n} samples into a {capacity}-sample \
-                     accumulator â€” at the brim, so the SRC's surplus was truncated"
+                     accumulator — at the brim, so the SRC's surplus was truncated"
                 );
                 total_out += n;
             }
@@ -1035,7 +1035,7 @@ mod tests {
             assert!(
                 (actual - expected).abs() < 0.02,
                 "{out_rate} Hz: expected ~{expected:.3} output samples per input sample, \
-                 got {actual:.3} â€” frames are being lost or fabricated"
+                 got {actual:.3} — frames are being lost or fabricated"
             );
         }
     }
@@ -1069,7 +1069,7 @@ mod tests {
         }
     }
 
-    /// Every `Src` is a real chunked resampler now (P2 â€” see resample.rs module
+    /// Every `Src` is a real chunked resampler now (P2 — see resample.rs module
     /// doc), even at unity ratio: a single push_group/take_output tick doesn't
     /// necessarily yield output immediately (the resampler needs a full input
     /// chunk buffered first). Tests collect output across many ticks and check
@@ -1114,67 +1114,169 @@ mod tests {
     /// Diagnostic, not an assertion — run it with
     /// `cargo test -p audio-core starved_group -- --ignored --nocapture`.
     ///
-    /// Oracle for the two-group popping (session-2026-07-27-static.md). Group 1
-    /// is fed a full block every tick; group 2 is fed nothing on every Nth
-    /// tick, at the same rate otherwise. Measured 2026-07-27:
+    /// Oracle for the two-group popping (session-2026-07-27-static.md). Both
+    /// groups' producers run at the SAME average rate, one block per tick, but
+    /// group 2's arrivals are bursty: nothing on every Nth tick, double on the
+    /// tick after. Each group has a capture ring in front of it and the mixer
+    /// pops at most one block per tick from it, exactly as `pull_group_inputs`
+    /// does — that cap is what is under test, since a group that misses a tick
+    /// can only catch up by over-delivering later.
     ///
-    /// | gap every | samples at half amplitude | max tick (nominal 608) |
-    /// |---|---|---|
-    /// | never | 0 | 608 |
-    /// | 50 ticks | 2.0% | 676 |
-    /// | 10 ticks | 10.0% | 676 |
+    /// **Result, 2026-07-27: the span rule is exonerated in steady state.**
+    /// Jitter alone produces no notching at any gap frequency — the group
+    /// carries a bounded one-block backlog in its ring and emission stays flat
+    /// at one block per tick:
     ///
-    /// The notch fraction equals the gap frequency: every tick a live group
-    /// delivers nothing costs it one whole block of audio, permanently, because
-    /// `push_group` truncates at one block so it can never catch up. On a gap
-    /// tick the group has nothing in flight at all, so the "idle groups do not
-    /// gate" exemption lets the span advance with its silence in the mix —
-    /// the original static's mechanism, in the one case the `min` rule cannot
-    /// reach, since nothing here distinguishes "idle" from "starved".
+    /// | gap every | samples at half amplitude | max tick | ring B peak |
+    /// |---|---|---|---|
+    /// | never | 0% | 608 | 1 block |
+    /// | 50 ticks | 0% | 608 | 2 blocks |
+    /// | 10 ticks | 0% | 608 | 2 blocks |
     ///
-    /// It is left ignored rather than asserted because it documents a defect
-    /// that is still open, not behaviour to lock in.
+    /// Feeding the mixer *directly*, with no ring in front of it, does notch
+    /// (2% at a hole every 50 ticks, 10% at every 10) — but that models a
+    /// group receiving genuinely less audio, not a group receiving it late,
+    /// because `push_group` truncates at one block so the deficit is
+    /// permanent. Do not mistake one for the other; this probe originally did.
     #[test]
     #[ignore = "diagnostic oracle for an open defect, not a pass/fail check"]
     fn probe_a_starved_group_loses_a_block_per_missed_tick() {
-        // gap_every: group 2 is fed NOTHING every Nth tick and a full block on
-        // every other tick â€” same peak rate as group 1, just delivered with a
-        // hole. `push_group` truncates at one block, so a missed tick can
-        // never be made up.
+        let block = 304;
         for gap_every in [0usize, 50, 10] {
-            let block = 304;
             let mut mixer = Mixer::new(&two_groups_one_output(), block).unwrap();
+            let (mut ring_a, mut ring_b) = (0usize, 0usize);
+            let mut ring_b_peak = 0usize;
             let mut per_tick = Vec::new();
             let mut collected = Vec::new();
+
             for t in 0..2000 {
-                let b_frames = if gap_every > 0 && t % gap_every == 0 { 0 } else { block };
-                mixer.push_group(GroupId(1), &vec![0.5f32; block * 2]);
-                mixer.push_group(GroupId(2), &vec![0.5f32; b_frames * 2]);
+                ring_a += block;
+                ring_b += if gap_every == 0 {
+                    block
+                } else if t % gap_every == 0 {
+                    0
+                } else if t % gap_every == 1 {
+                    2 * block
+                } else {
+                    block
+                };
+                ring_b_peak = ring_b_peak.max(ring_b);
+
+                let (pop_a, pop_b) = (ring_a.min(block), ring_b.min(block));
+                ring_a -= pop_a;
+                ring_b -= pop_b;
+                mixer.push_group(GroupId(1), &vec![0.5f32; pop_a * 2]);
+                mixer.push_group(GroupId(2), &vec![0.5f32; pop_b * 2]);
                 mixer.mix_tick();
+
                 let mut out = vec![0.0f32; mixer.output_capacity(OutputId(1))];
                 let n = mixer.take_output(OutputId(1), &mut out);
                 per_tick.push(n);
                 collected.extend_from_slice(&out[..n]);
             }
-            let fed_a = 2000 * block * 2;
-            let emitted: usize = per_tick.iter().sum();
-            let max_tick = per_tick.iter().max().unwrap();
-            let zero_ticks = per_tick.iter().filter(|&&n| n == 0).count();
+
+            // Both groups feed 0.5, so a correct sum is a flat 1.0; anything
+            // at 0.5 is one group's contribution missing from that span.
             let tail = &collected[collected.len() / 2..];
-            let low = tail.iter().filter(|s| **s < 0.9).count();
+            let notched = tail.iter().filter(|s| **s < 0.9).count();
             println!(
-                "gap={gap_every} fed_a={fed_a} emitted={emitted} ({:.1}% of A) max_tick={max_tick} \
-                 zero_ticks={zero_ticks} low_samples={low}/{} min={:.3} ",
-                100.0 * emitted as f64 / fed_a as f64,
+                "gap_every={gap_every} notched={notched}/{} ({:.1}%) max_tick={} \
+                 zero_ticks={} ring_b_end={ring_b} ring_b_peak={ring_b_peak} block={block}",
                 tail.len(),
-                tail.iter().cloned().fold(f32::INFINITY, f32::min),
+                100.0 * notched as f64 / tail.len() as f64,
+                per_tick.iter().max().unwrap(),
+                per_tick.iter().filter(|&&n| n == 0).count(),
+            );
+        }
+    }
+
+    /// Diagnostic, not an assertion — run it with
+    /// `cargo test -p audio-core parked_surplus -- --ignored --nocapture`.
+    ///
+    /// Second oracle for the two-group popping. The first one ruled the span
+    /// rule out in steady state; this one models what the span rule's *parked
+    /// surplus* does to the output ring.
+    ///
+    /// The governor (`engine::runtime::group_may_push`) withholds input pulls
+    /// while an output ring sits at or above its threshold. It does not gate
+    /// emission: a group holding parked surplus keeps feeding the shared span
+    /// through a withhold, so the mixer can push into a ring that has no room.
+    /// Parking only exists when two groups gate each other, which is exactly
+    /// the condition under which `output_drops` was observed climbing on
+    /// hardware (3818 → 7172 over a two-group phase, flat at one group).
+    ///
+    /// Groups are fed a third of a block per tick with group 2 primed half a
+    /// block ahead — the same misalignment `groups_sharing_an_output_never_
+    /// emit_a_span_another_group_owes` uses, so their chunk boundaries never
+    /// line up.
+    ///
+    /// **Result, 2026-07-27: this hypothesis is dead too.** With the governor
+    /// engaged (63 withheld ticks at threshold 0.75), `emitted_while_withheld`
+    /// is 0 and nothing is rejected. Parking does not leak through a withhold,
+    /// because a withhold pushes every group an empty block, the starved group
+    /// gates, and the span collapses to zero — the `min` rule holds the
+    /// surplus back precisely when the ring has no room for it.
+    #[test]
+    #[ignore = "diagnostic oracle for an open defect, not a pass/fail check"]
+    fn probe_parked_surplus_pushes_into_a_withheld_ring() {
+        let block = 304;
+        // Output ring sized and drained like the real one: the governor holds
+        // it near GOVERNOR_THRESHOLD_FILL, and the device drains a block per
+        // tick on average.
+        // Partial blocks, so the two groups' chunk completions land on
+        // different ticks and one of them is always parking surplus.
+        let feed = block / 3;
+        let capacity = block * 2 * 4;
+        // Slightly slower than production, so the ring rises to the governor's
+        // threshold and sawtooths there — the regime the hardware trace shows
+        // (`ring_fill` 0.52–0.81), not the balanced one where it never engages.
+        let drain_per_tick = feed * 2 * 97 / 100;
+
+        for threshold in [0.75f64, 0.9] {
+            let mut mixer = Mixer::new(&two_groups_one_output(), block).unwrap();
+            let mut fill = 0usize;
+            let mut rejected = 0usize;
+            let mut withheld_ticks = 0usize;
+            let mut emitted_while_withheld = 0usize;
+
+            for t in 0..2000 {
+                fill = fill.saturating_sub(drain_per_tick);
+
+                let may_push = (fill as f64) < threshold * capacity as f64;
+                if may_push {
+                    // A block per group per tick, matching the drain. Group 2
+                    // is primed half a block ahead at t=0 and stays offset, so
+                    // the two never complete their SRC chunks on the same tick.
+                    mixer.push_group(GroupId(1), &vec![0.5f32; feed * 2]);
+                    let n = if t == 0 { block / 2 + feed } else { feed };
+                    mixer.push_group(GroupId(2), &vec![0.5f32; n * 2]);
+                } else {
+                    withheld_ticks += 1;
+                    mixer.push_group(GroupId(1), &[]);
+                    mixer.push_group(GroupId(2), &[]);
+                }
+                mixer.mix_tick();
+
+                let mut out = vec![0.0f32; mixer.output_capacity(OutputId(1))];
+                let n = mixer.take_output(OutputId(1), &mut out);
+                if !may_push {
+                    emitted_while_withheld += n;
+                }
+                let room = capacity - fill;
+                fill += n.min(room);
+                rejected += n.saturating_sub(room);
+            }
+
+            println!(
+                "threshold={threshold} rejected={rejected} withheld_ticks={withheld_ticks} \
+                 emitted_while_withheld={emitted_while_withheld} final_fill={fill}/{capacity}"
             );
         }
     }
 
     #[test]
     fn groups_sharing_an_output_never_emit_a_span_another_group_owes() {
-        // Regression, 2026-07-27 â€” the static the user could switch on and off
+        // Regression, 2026-07-27 — the static the user could switch on and off
         // by ASSIGNING an app to a second group, whether or not it played.
         //
         // Groups on one output cross their SRC chunk boundaries on different
@@ -1192,7 +1294,7 @@ mod tests {
         let mut mixer = Mixer::new(&two_groups_one_output(), block).unwrap();
         let mut collected = Vec::new();
         for t in 0..900 {
-            // Partial blocks every tick â€” both groups always have input in
+            // Partial blocks every tick — both groups always have input in
             // flight, which is what makes each of them gate the shared span.
             mixer.push_group(GroupId(1), &vec![0.5f32; (block / 3) * 2]);
             // Primed half a block ahead, so its chunk boundaries never line up
@@ -1210,7 +1312,7 @@ mod tests {
         assert_eq!(
             near_zero,
             0,
-            "{near_zero} of {} settled output samples are near silence â€” group 1 feeds              continuous audio, so any silence in the span is group 2's chunk timing              being emitted in its place",
+            "{near_zero} of {} settled output samples are near silence — group 1 feeds              continuous audio, so any silence in the span is group 2's chunk timing              being emitted in its place",
             tail.len()
         );
     }
@@ -1218,7 +1320,7 @@ mod tests {
     #[test]
     fn a_group_with_nothing_in_flight_does_not_stall_its_output() {
         // The other half of the `min` rule. Gating on every group regardless
-        // would let one idle group hold an output at zero forever â€” the
+        // would let one idle group hold an output at zero forever — the
         // failure mode the rule has to avoid while fixing the notch above.
         let block = 304;
         let mut mixer = Mixer::new(&two_groups_one_output(), block).unwrap();
@@ -1234,7 +1336,7 @@ mod tests {
 
         assert!(
             !collected.is_empty(),
-            "an output whose second group is idle must still emit â€” gating on a group              that has no audio at all would stall it permanently"
+            "an output whose second group is idle must still emit — gating on a group              that has no audio at all would stall it permanently"
         );
         let tail = &collected[collected.len() / 2..];
         for &s in tail {
@@ -1243,7 +1345,7 @@ mod tests {
     }
 
     /// Feeds group 1 continuously and group 2 exactly one short block (half a
-    /// chunk â€” `chunk_in` is `max_block_frames`, so it can never complete),
+    /// chunk — `chunk_in` is `max_block_frames`, so it can never complete),
     /// then stops feeding group 2 the way the engine does: an empty push every
     /// tick. Returns, per tick, how many output samples came out.
     fn ticks_after_a_group_stops_being_fed(
@@ -1254,7 +1356,7 @@ mod tests {
         let mut mixer = Mixer::new(&two_groups_one_output(), block).unwrap();
         // The partial only reaches the resampler when a tick runs, and the
         // stop loop below pushes group 2 an empty block that would overwrite
-        // `valid_len` first â€” so prime with a tick of its own.
+        // `valid_len` first — so prime with a tick of its own.
         mixer.push_group(GroupId(1), &vec![0.5f32; block * 2]);
         mixer.push_group(GroupId(2), &vec![0.5f32; (block / 2) * 2]);
         mixer.mix_tick();
@@ -1276,7 +1378,7 @@ mod tests {
     #[test]
     fn a_group_that_stops_being_fed_stops_gating_its_output() {
         // Regression, MT17 on hardware 2026-07-27: unassigning the second
-        // group's last app killed ALL audio on that output, permanently â€”
+        // group's last app killed ALL audio on that output, permanently —
         // `ring_fill` flat at 0.00 while `group_peak` stayed live.
         //
         // A partial SRC chunk only completes when more input arrives. With no
@@ -1289,7 +1391,7 @@ mod tests {
 
         assert!(
             per_tick.iter().any(|&n| n > 0),
-            "the output never resumed â€” a group that will never be fed again is still \
+            "the output never resumed — a group that will never be fed again is still \
              gating its span"
         );
     }
@@ -1305,7 +1407,7 @@ mod tests {
 
         assert!(
             per_tick[..4].iter().any(|&n| n > 0),
-            "output stalled after the discard â€” it should free the span immediately, \
+            "output stalled after the discard — it should free the span immediately, \
              not wait for the parking capacity to fill"
         );
     }
@@ -1316,7 +1418,7 @@ mod tests {
         // accumulator over a single span (`out.filled`), so groups on one
         // output MUST produce identical frame counts per tick. A per-group
         // drift ratio made them diverge, and the shorter group's tail was
-        // silently zero-filled â€” a level notch at the tick rate, which
+        // silently zero-filled — a level notch at the tick rate, which
         // measured 1% of output samples at half amplitude and was audible as
         // constant static that scaled with source level.
         //
@@ -1341,13 +1443,13 @@ mod tests {
             collected.extend_from_slice(&out[..n]);
         }
 
-        // Settled tail only â€” the resampler's start-up transient is not what
+        // Settled tail only — the resampler's start-up transient is not what
         // this pins.
         let tail = &collected[collected.len() / 2..];
         let notched = tail.iter().filter(|s| **s < 0.4).count();
         assert_eq!(
             notched, 0,
-            "{notched} of {} output samples dropped below 0.4 â€” one group's contribution is \
+            "{notched} of {} output samples dropped below 0.4 — one group's contribution is \
              missing from part of the span, which is the frame-misalignment notch",
             tail.len()
         );
@@ -1399,7 +1501,7 @@ mod tests {
         // least one chunk of output at some point.
         run_ticks(&mut mixer, GroupId(1), OutputId(1), &frames, 32);
 
-        // No push_group this tick â€” accumulator must read back empty, not stale.
+        // No push_group this tick — accumulator must read back empty, not stale.
         let mut out = vec![9.0f32; 32 * 2];
         let n = mixer.take_output(OutputId(1), &mut out);
         assert_eq!(n, 0);
@@ -1440,7 +1542,7 @@ mod tests {
         mixer.mix_tick();
         let loud = mixer.group_peak(GroupId(1)).peak;
 
-        // Ticks with nothing pushed â€” the idle-decay path must lower the bar.
+        // Ticks with nothing pushed — the idle-decay path must lower the bar.
         for _ in 0..50 {
             mixer.push_group(GroupId(1), &[]);
             mixer.mix_tick();
@@ -1778,7 +1880,7 @@ mod tests {
         mixer.mix_tick();
 
         // Sampled pre-skip (mixer.rs meter tap), so a muted group's own bar
-        // must keep reading its unrouted signal â€” same invariant as master mute.
+        // must keep reading its unrouted signal — same invariant as master mute.
         assert!(
             (mixer.group_peak(GroupId(1)).peak - 0.5).abs() < 1e-3,
             "a muted group's own meter must stay live"
@@ -1853,7 +1955,7 @@ mod tests {
             master: Gain::UNITY,
             groups: vec![
                 GroupSpec {
-                    id: GroupId(1), // trigger â€” e.g. voice chat
+                    id: GroupId(1), // trigger — e.g. voice chat
                     gain: Gain::UNITY,
                     follow_master: false,
                     output: OutputId(1),
@@ -1864,7 +1966,7 @@ mod tests {
                     mute: false,
                 },
                 GroupSpec {
-                    id: GroupId(2), // target â€” e.g. music, ducks under GroupId(1)
+                    id: GroupId(2), // target — e.g. music, ducks under GroupId(1)
                     gain: Gain::UNITY,
                     follow_master: false,
                     output: OutputId(1),
@@ -1907,7 +2009,7 @@ mod tests {
 
         assert!(mixer.group_duck_depth_db(GroupId(2)) > 1.0, "target should be ducked");
         // Summed output is trigger + ducked target; the ducked target alone
-        // settles below its dry 0.5 â€” check via the depth accessor above
+        // settles below its dry 0.5 — check via the depth accessor above
         // rather than trying to separate it back out of the sum.
         assert!(!settled.is_empty());
     }
@@ -2014,7 +2116,7 @@ mod tests {
             }],
         };
         let mut mixer = Mixer::new(&topo, 256).unwrap();
-        // No panic / unknown-id-style silent success is the assertion here â€”
+        // No panic / unknown-id-style silent success is the assertion here —
         // the per-stage EQ/limiter math itself is covered in dsp.rs's own tests.
         mixer.apply(MixerCommand::SetDspParam {
             group: GroupId(1),
@@ -2065,7 +2167,7 @@ mod tests {
             }],
         };
         let mut mixer = Mixer::new(&topo, 256).unwrap();
-        let hot = vec![0.9f32; 64 * 2]; // two groups at 0.9 sum to 1.8 â€” well over full scale
+        let hot = vec![0.9f32; 64 * 2]; // two groups at 0.9 sum to 1.8 — well over full scale
 
         let mut settled = Vec::new();
         for _ in 0..80 {

@@ -307,63 +307,73 @@ settled. So it takes two groups actually *producing*, not merely two groups
 routed. That also means this cannot be attributed to the defect-4 fix on the
 evidence available: the two runs differ in workload as well as in build.
 
-## Diagnosed by oracle, 2026-07-27
+## What the oracles ruled OUT, 2026-07-27
 
-`probe_a_starved_group_loses_a_block_per_missed_tick` (ignored diagnostic in
-`mixer.rs`). Group 1 fed a full block every tick; group 2 fed nothing on every
-Nth tick and a full block otherwise — the same rate, delivered with a hole.
+Two ignored diagnostics in `mixer.rs`, runnable with
+`cargo test -p audio-core probe_ -- --ignored --nocapture`. Between them they
+kill three hypotheses. **None of them is the cause**, and that is the useful
+result — the span rule and the governor are both exonerated in steady state.
 
-| Group 2 fed | Samples at half amplitude | Max tick (nominal 608) | Zero ticks |
+### 1. `min` couples the groups, so a surplus backs up (DEAD)
+
+A sustained rate *deficit* does produce stalls and 5–20% notches. But the live
+trace has `cf1` holding 0.36–0.52 for 90 s rather than draining, so the two
+groups' rates match. Not this.
+
+### 2. A missed tick costs a group a block, permanently (DEAD)
+
+`probe_a_starved_group_loses_a_block_per_missed_tick`. Both producers at the
+same average rate, group 2's arrivals bursty, **with a capture ring in front of
+each group** and the mixer popping at most one block per tick from it — as
+`pull_group_inputs` does.
+
+| gap every | samples at half amplitude | max tick | ring B peak |
 |---|---|---|---|
-| every tick | 0 | 608 | 0 |
-| hole every 50th | **2.0%** | 676 | 0 |
-| hole every 10th | **10.0%** | 676 | 0 |
+| never | 0% | 608 | 1 block |
+| 50 ticks | **0%** | 608 | 2 blocks |
+| 10 ticks | **0%** | 608 | 2 blocks |
 
-**The notch fraction equals the gap frequency exactly.** Every tick a live group
-delivers nothing costs it one whole block of audio, permanently — `push_group`
-truncates at `max_block_frames`, so a group that misses a tick can never
-deliver extra to catch up.
+Jitter alone notches **nothing**. The group carries a bounded one-block backlog
+and emission stays flat.
 
-**Why the `min` rule does not catch it.** On a gap tick the group has nothing in
-flight *at all* (with `block == chunk_in` its SRC empties cleanly), so
-`has_audio_in_flight()` is false and the "a group with nothing in flight does
-not gate" exemption applies — the span advances with that group's silence in
-the mix. That exemption exists for a real reason (otherwise an idle group
-stalls its output forever, pinned by
-`a_group_with_nothing_in_flight_does_not_stall_its_output`), and nothing at the
-mixer's level distinguishes *idle* from *starved for one tick*.
+**This one was briefly recorded as the diagnosis and it was wrong.** The first
+version of the probe fed the mixer directly, with no ring, which models a group
+receiving genuinely *less* audio rather than receiving it *late* — `push_group`
+truncates at one block, so a deficit fed that way is permanent. Adding the ring
+made the notching vanish entirely. A probe that omits a buffer the real system
+has does not model the real system.
 
-So this is the original static's mechanism surviving in the one case the `min`
-rule cannot reach. It explains the workload dependence exactly: a silent
-group's silence is correct, so run 1's assigned-but-silent second group showed
-nothing; only a *producing* group's missed tick is audible.
+### 3. Parked surplus is pushed into a ring the governor is withholding (DEAD)
 
-The earlier hypothesis — that `min` couples the groups and the surplus backs up
-into the capture ring — is **not** what the oracle shows. A sustained rate
-deficit does produce stalls and 5–20% notches (`95%`/`80%` feed), but the live
-trace has `cf1` holding 0.36–0.52 for 90 s rather than draining, so the rates
-match. Jitter alone is sufficient, and jitter is what the system actually has:
-the mixer ticks on render wakes, which do not align with capture packet
-arrivals.
+`probe_parked_surplus_pushes_into_a_withheld_ring`. Misaligned groups so one is
+always parking, an output ring drained slightly slower than production so the
+governor actually engages (63 withheld ticks at threshold 0.75).
+`emitted_while_withheld` = 0, rejects = 0. A withhold pushes every group an
+empty block, the starved group gates, and the span collapses to zero — the
+`min` rule holds the surplus back precisely when there is no room for it.
 
-## What a fix has to do
+## Where that leaves `output_drops`
 
-The mixer cannot tell idle from starved, but `pull_group_inputs` **can** — it
-knows whether a slot has live pids and whether its ring came up empty. Two
-pieces, and both are needed:
+`od` counts frames an output ring rejected. For that to happen, either:
 
-1. **Tell the mixer.** A group that is live but delivered nothing this tick
-   should gate the span (wait a tick), while a group with no pids should not —
-   that distinction is already half-built, since `discard_group_partial_input`
-   is driven by the same signal.
-2. **Let a lagging group catch up.** Gating alone is not enough: `push_group`
-   and `pull_group_inputs` both cap at one block per tick, so a group that
-   waits can never make up the deficit and the gate would just stall until the
-   parking-capacity backstop fires — trading the notch for a burst. The
-   per-tick input capacity has to allow a lagging group to over-deliver.
+- the span exceeded one block — but `accum` **is** exactly one output block
+  (`Mixer::new`), so `take_output` cannot return more; or
+- the governor's headroom snapshot was stale by flush time — but it is sampled
+  at the top of the same tick and only the render thread touches the ring in
+  between, and it only *drains*; or
+- `group_may_push`'s own overflow guard (`filled + block_out_frames <=
+  capacity`) was computed against a `block_out_frames` smaller than what was
+  actually produced.
 
-Piece 2 resizes RT-owned buffers, so it wants its own review pass rather than
-being folded into a quick fix.
+The third is the only one left standing, and the drift ratio is the obvious way
+production could exceed the nominal block — but ±0.5% of a block is single-digit
+frames, and the observed bursts are 560–900 samples.
+
+**Next measurement, and it belongs in the binary rather than in a model:** log
+the span, the ring's free space, and `block_out_frames` at the moment
+`flush_outputs` rejects a push. One hardware run answers directly which of the
+three it is. Every remaining theory is cheap to state and expensive to chase —
+that was the lesson of the three above.
 
 ## If MT17 still shows static
 
