@@ -115,6 +115,7 @@ mod tests {
                 group_rates: vec![],
                 output_drops: 0,
                 capture_drops: 0,
+                capture_fill: vec![],
                 render_shortfall: 0,
             },
             routing_degraded: false,

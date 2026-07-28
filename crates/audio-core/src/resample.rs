@@ -21,6 +21,26 @@ const OVERSAMPLING_FACTOR: usize = 32;
 /// (notes §11); ~20 chunks to settle, inaudible at typical block rates.
 const RATIO_GLIDE_RATE: f64 = 0.05;
 
+/// Upper bound on the OUTPUT frames one `max_block_frames` input block can
+/// become after this crate's SRC, drift-correction headroom included.
+///
+/// Every output-side buffer must be sized with this, never with
+/// `max_block_frames` directly: `max_block_frames` is derived from a GROUP's
+/// input sample rate, while an output accumulator holds frames at the OUTPUT
+/// device's rate. A 48 kHz capture feeding a 96 kHz device produces two output
+/// frames per input frame, so a buffer sized `max_block_frames` holds exactly
+/// half a block and the rest is silently truncated — audibly, half of every
+/// block is discarded and playback skips forward in time every few
+/// milliseconds.
+pub fn max_output_block_frames(max_block_frames: usize, from_rate: u32, to_rate: u32) -> usize {
+    // Same relative headroom `Src::new` hands rubato, so this can never be
+    // tighter than what the resampler is actually allowed to emit.
+    let max_relative =
+        crate::sample::MAX_RESAMPLE_RATIO.max(1.0 / crate::sample::MIN_RESAMPLE_RATIO);
+    let ratio = (to_rate.max(1) as f64 / from_rate.max(1) as f64) * max_relative;
+    ((max_block_frames as f64 * ratio).ceil() as usize).saturating_add(SINC_LEN)
+}
+
 /// Progress of one [`Src::process`] call, in samples (interleaved elements,
 /// i.e. `frames * channels`) — matches the unit callers already index `input`/`output` in.
 pub struct SrcProgress {
@@ -102,6 +122,39 @@ impl Src {
     /// toward this one chunk at a time; never steps.
     pub fn set_ratio(&mut self, target: ResampleRatio) {
         self.target_ratio = target.value();
+    }
+
+    /// Whether this resampler is still holding audio that has not come out
+    /// yet — either a partial input chunk waiting to be filled, or output
+    /// already resampled but not yet delivered.
+    ///
+    /// `mix_tick` needs it to tell "this group is silent" from "this group's
+    /// audio has not reached the output stage yet". A group in the second
+    /// state must hold the shared output span back rather than let another
+    /// group's block go out with silence in its place — see
+    /// `groups_sharing_an_output_never_emit_a_span_another_group_owes`.
+    pub fn has_audio_in_flight(&self) -> bool {
+        self.pending_in_frames > 0 || self.pending_out_read < self.pending_out_frames
+    }
+
+    /// Drops the partial input chunk this resampler is holding, without
+    /// touching already-resampled output (`pending_out` drains itself on the
+    /// next `process` call, so it is never stuck).
+    ///
+    /// A partial chunk only completes when more input arrives. When a group's
+    /// last pid goes away — unassigned, app exited — no input ever arrives
+    /// again, so `has_audio_in_flight` stayed true forever and the group kept
+    /// gating its output's span at zero: every group sharing that output went
+    /// permanently silent. Measured 2026-07-27 (MT17): unassigning the second
+    /// group killed all audio, `ring_fill` flat at 0.00 with `group_peak`
+    /// still live. Pinned by
+    /// `unassigning_a_groups_last_pid_frees_its_outputs_span`.
+    ///
+    /// The dropped audio is under one chunk of a source that has stopped
+    /// producing. Whatever already made it through the SRC is still in the
+    /// group's FIFO and still plays out.
+    pub fn discard_partial_input(&mut self) {
+        self.pending_in_frames = 0;
     }
 
     /// RT-safe: preallocated at construction, no allocation on this path.

@@ -154,6 +154,9 @@ pub enum EngineEvent {
 pub struct EngineStats {
     pub xruns: u64,
     pub ring_fill: Vec<(OutputId, f32)>,
+    /// Last resample ratio applied per output — the drift loop's actuator. Per
+    /// output, not per group: groups sharing an output must run the same ratio
+    /// or they fall out of frame alignment (see `MixerCommand::SetOutputRatio`).
     pub applied_ratio: Vec<(OutputId, f64)>,
     pub group_faults: Vec<GroupId>,
     /// Always-on per-output headroom limiter engagement count (P5) — a
@@ -181,6 +184,13 @@ pub struct EngineStats {
     pub output_drops: u64,
     /// Frames the capture side read that a group ring could not accept.
     pub capture_drops: u64,
+    /// Per group, the fullest of its pids' capture rings (0.0–1.0), sampled at
+    /// each ring's high-water point. The counterpart to `ring_fill` on the
+    /// input side: `capture_drops` alone says samples were lost but not why,
+    /// and a ring pinned near 1.0 means a standing surplus the mixer's drain
+    /// rate structurally cannot absorb, not a transient scheduling burst.
+    /// Empty for a group with no pids currently captured.
+    pub capture_fill: Vec<(GroupId, f32)>,
     /// Frames offered to a render device that it did not accept. Structurally
     /// impossible post-B1 — counted because "impossible" is what B1 was.
     pub render_shortfall: u64,
@@ -235,6 +245,7 @@ fn read_stats(running: &Mutex<Option<RunningGraph>>) -> EngineStats {
             group_rates: Vec::new(),
             output_drops: 0,
             capture_drops: 0,
+            capture_fill: Vec::new(),
             render_shortfall: 0,
         },
         Some(rg) => EngineStats {
@@ -248,8 +259,8 @@ fn read_stats(running: &Mutex<Option<RunningGraph>>) -> EngineStats {
             applied_ratio: rg
                 .output_ids
                 .iter()
-                .zip(rg.ring_fill.iter())
-                .map(|(id, gauge)| (*id, f64::from_bits(gauge.applied_ratio_bits.load(Ordering::Relaxed))))
+                .zip(rg.applied_ratio.iter())
+                .map(|(id, bits)| (*id, f64::from_bits(bits.load(Ordering::Relaxed))))
                 .collect(),
             // Always empty (process-loopback-capture pivot): a per-pid capture
             // failure is isolated to that one pid, never "the whole group" —
@@ -284,6 +295,14 @@ fn read_stats(running: &Mutex<Option<RunningGraph>>) -> EngineStats {
             group_rates: rg.group_formats.iter().map(|(id, fmt)| (*id, fmt.sample_rate)).collect(),
             output_drops: rg.output_drops.load(Ordering::Relaxed),
             capture_drops: rg.capture_drops.load(Ordering::Relaxed),
+            // `group_ids` order (not the map's) so the vec lines up with
+            // `group_peak` and every other per-group gauge. Same reading the
+            // drift loop regulates against.
+            capture_fill: rg
+                .group_ids
+                .iter()
+                .map(|id| (*id, capture_gauges(rg, *id).0))
+                .collect(),
             render_shortfall: rg.render_shortfall.load(Ordering::Relaxed),
         },
     }
@@ -321,10 +340,21 @@ const RENDER_BUF_PERIODS: usize = 4;
 /// packets queued. The old fixed 256-frame buffer was ~53% of a single
 /// interval at a typical 10ms poll/48kHz.
 const CAPTURE_BUF_INTERVALS: usize = 2;
+/// One-pole coefficient for the published capture-ring fill, applied once per
+/// poll (~10 ms). 0.02 is a ~500 ms time constant — several times the drift
+/// controller's own 100 ms tick, so the controller sees the ring's standing
+/// level rather than which part of a poll packet it happened to land in.
+const CAPTURE_FILL_SMOOTHING: f32 = 0.02;
+/// Seeded at the controller's own target, not 0: a ring starting from a
+/// reported-empty state would take the whole time constant to climb, and the
+/// controller would spend that ramp correcting an error that was never there.
+const CAPTURE_FILL_SMOOTHING_SEED: f32 = 0.5;
 /// Fill fraction at or above which the mixer tick governor stops producing
 /// for an output (audio-flow-control B2/B4, decision 6: full-block-or-skip).
-/// The ring then sawtooths between this floor and one block above it — see
-/// `drift_target_fill` (clock.rs), which aims at that sawtooth's midpoint.
+/// The ring then sawtooths between this floor and one block above it. This
+/// *is* the output ring's regulation — which is why the drift loop no longer
+/// also aims at it (clock.rs's module doc): two controllers on one actuator
+/// left the ratio free to wander.
 const GOVERNOR_THRESHOLD_FILL: f32 = 0.5;
 
 /// Wakes the mixer thread out of its park (mixer-demand-driven-wakeup L2/L4).
@@ -343,11 +373,12 @@ impl MixerWaker {
 struct RingGauge {
     fill_permille: AtomicU32,
     /// Set by the mixer tick (notes §6); read cross-thread by the recovery
-    /// supervisor to build `DriftController` `FillSample`s.
+    /// supervisor. Since the drift loop moved to the capture ring this is no
+    /// longer what it regulates against — it is the second half of the idle
+    /// guard: a group is corrected only if its pids are delivering *and* its
+    /// output is actually running, so a parked or faulted output does not have
+    /// corrections integrated against it while nothing can drain its ring.
     active: AtomicBool,
-    /// Last `ResampleRatio` applied to this output's `Src`s, as `f64::to_bits`
-    /// (no `AtomicF64` in std) — surfaced via `EngineStats::applied_ratio`.
-    applied_ratio_bits: AtomicU64,
 }
 
 /// One group's mixer-thread-local input state: zero or more per-pid capture
@@ -372,6 +403,22 @@ type OutputProducers = Vec<(OutputId, rtrb::Producer<f32>, usize)>;
 struct PidCapture {
     stop: Arc<AtomicBool>,
     thread: JoinHandle<()>,
+    /// This pid's capture ring fill in permille, published by its own capture
+    /// thread right after each push batch — i.e. the ring's high-water point
+    /// in the cycle, before the mixer drains it again. The output rings have
+    /// had a gauge since drift-and-recovery; the capture rings had none, which
+    /// is why `capture_drops` could climb for a whole session with no way to
+    /// tell a brim-pinned ring (a standing rate surplus) from an occasional
+    /// scheduling burst. Read out per group as `EngineStats::capture_fill`,
+    /// and fed to the drift controller as the buffer it regulates.
+    fill_permille: Arc<AtomicU32>,
+    /// Monotonic count of samples this pid has pushed. The drift loop's idle
+    /// guard: the supervisor compares it against the previous tick's value, and
+    /// a group whose pids delivered nothing in that window is skipped. Without
+    /// it, a paused app's ring drains to empty and the integrator reads a
+    /// permanent -0.5 error, pegging the ratio at a rail that the group then
+    /// has to unwind from when it resumes.
+    pushed_samples: Arc<AtomicU64>,
 }
 
 /// Wire format from `CaptureControl::apply_capture_sources` (any thread —
@@ -440,10 +487,10 @@ struct RunningGraph {
     output_drops: Arc<AtomicU64>,
     capture_drops: Arc<AtomicU64>,
     render_shortfall: Arc<AtomicU64>,
-    /// This build's own computed drift target (audio-flow-control decision
-    /// 7) — the supervisor reads it to (re)construct `DriftConfig` instead
-    /// of holding one fixed value for the process lifetime.
-    drift_target_fill: f32,
+    /// Last resample ratio applied per output, in `output_ids` order, as
+    /// `f64::to_bits` (no `AtomicF64` in std) — written by the mixer thread as
+    /// it applies each `SetOutputRatio`, surfaced via `EngineStats`.
+    applied_ratio: Arc<Vec<AtomicU64>>,
     ring_fill: Arc<Vec<RingGauge>>,
     output_ids: Vec<OutputId>,
     group_ids: Vec<GroupId>,
@@ -838,16 +885,30 @@ impl CaptureControl {
             let drops = Arc::clone(&rg.capture_drops);
             for (pid, port, producer, consumer) in opened {
                 let stop = Arc::new(AtomicBool::new(false));
+                let fill_permille = Arc::new(AtomicU32::new(0));
+                let pushed_samples = Arc::new(AtomicU64::new(0));
                 let thread = {
                     let stop = Arc::clone(&stop);
                     let sys = Arc::clone(&self.sys);
                     let waker = waker.clone();
                     let drops = Arc::clone(&drops);
+                    let fill = Arc::clone(&fill_permille);
+                    let pushed = Arc::clone(&pushed_samples);
                     thread::spawn(move || {
-                        pid_capture_loop(port, producer, &stop, sys.as_ref(), waker, &drops)
+                        pid_capture_loop(
+                            port,
+                            producer,
+                            &stop,
+                            sys.as_ref(),
+                            waker,
+                            CaptureGauges { drops: &drops, fill: &fill, pushed: &pushed },
+                        )
                     })
                 };
-                rg.capture_pids.entry(group).or_default().insert(pid, PidCapture { stop, thread });
+                rg.capture_pids.entry(group).or_default().insert(
+                    pid,
+                    PidCapture { stop, thread, fill_permille, pushed_samples },
+                );
                 let _ = rg.capture_tx.send(CaptureMsg::Add { group, pid, consumer });
             }
         }
@@ -868,13 +929,25 @@ fn capture_buf_samples(poll_interval: Duration, sample_rate: u32, channels: usiz
     frames * channels.max(1)
 }
 
+/// One pid capture thread's telemetry cells, grouped at the same parameter
+/// threshold as `FlushCtx`/`RenderFaultCtx` (operational learnings) —
+/// `pid_capture_loop` would otherwise take 8.
+struct CaptureGauges<'a> {
+    /// Samples the ring could not accept (audio-flow-control B2/B3).
+    drops: &'a AtomicU64,
+    /// Ring fill in permille at its high-water point each cycle.
+    fill: &'a AtomicU32,
+    /// Samples the port delivered — the drift loop's idle guard.
+    pushed: &'a AtomicU64,
+}
+
 fn pid_capture_loop(
     mut port: Box<dyn CapturePort>,
     mut producer: rtrb::Producer<f32>,
     stop: &AtomicBool,
     sys: &dyn AudioSystem,
     waker: MixerWaker,
-    drops: &AtomicU64,
+    gauges: CaptureGauges<'_>,
 ) {
     let _rt = sys.promote_rt_thread();
     let poll_interval = port.poll_interval();
@@ -885,18 +958,35 @@ fn pid_capture_loop(
     // under-reading what the source actually produced.
     let mut buf = vec![0.0f32; capture_buf_samples(poll_interval, sample_rate, channels)];
 
+    let capacity = producer.buffer().capacity();
+    // Smoothed fill, not the instantaneous reading. A capture ring's level is
+    // inherently bursty — a whole poll packet lands, then the mixer drains it —
+    // so a single sample swings by most of a packet either way. Measured live
+    // at 0.27–0.77 tick to tick around a target of 0.5: with kp=0.05 that is a
+    // correction 2.5x the clamp every tick, so the controller sat on alternate
+    // rails, driving nothing but noise into the resample ratio. The controller
+    // needs the ring's *level*, not its phase within a packet.
+    let mut smoothed = CAPTURE_FILL_SMOOTHING_SEED;
+
     while !stop.load(Ordering::Relaxed) {
         match port.read(&mut buf) {
             Ok(n) => {
-                let mut dropped = 0u64;
-                for &sample in &buf[..n] {
-                    if producer.push(sample).is_err() {
-                        dropped += 1; // ring full: counted, never silent (B2/B3)
-                    }
-                }
+                let dropped = push_whole_frames(&mut producer, &buf[..n], channels);
                 if dropped > 0 {
-                    drops.fetch_add(dropped, Ordering::Relaxed);
+                    gauges.drops.fetch_add(dropped, Ordering::Relaxed); // never silent (B2/B3)
                 }
+                // Counts what the port DELIVERED, not what the ring accepted.
+                // A saturated ring rejects everything, and that is precisely
+                // the state the drift loop exists to correct — subtracting
+                // `dropped` here would mark the group idle exactly when its
+                // ring is at the brim, so the controller would stop pulling the
+                // ratio down and the surplus would never clear.
+                gauges.pushed.fetch_add(n as u64, Ordering::Relaxed);
+                let filled = capacity - producer.slots();
+                let instant =
+                    if capacity > 0 { filled as f32 / capacity as f32 } else { 0.0 };
+                smoothed += CAPTURE_FILL_SMOOTHING * (instant - smoothed);
+                gauges.fill.store((smoothed * 1000.0) as u32, Ordering::Relaxed);
                 // New audio arrived — mix it (mixer-demand-driven-wakeup L3
                 // Flow D), bounded by MIXER_FALLBACK_INTERVAL if ever missed.
                 waker.wake();
@@ -905,6 +995,90 @@ fn pid_capture_loop(
         }
         std::thread::sleep(poll_interval);
     }
+}
+
+/// Pushes `samples` into a capture ring **whole frames at a time**, returning
+/// the sample count that did not fit.
+///
+/// The per-sample `producer.push(..).is_err()` loop this replaces could fail
+/// on one channel of a frame and then succeed on the next, because the mixer
+/// pops concurrently and frees slots mid-frame. That splits a frame across the
+/// gap and shifts the ring's interleave by one sample **permanently** — every
+/// later frame arrives channel-swapped. Same defect class as the pop side's
+/// (`pull_group_inputs_never_pops_a_partial_frame`), on the producing end,
+/// and far more likely to fire here: a ring carrying a standing rate surplus
+/// sits at its brim continuously, so this is the steady state, not a rare race.
+///
+/// `slots()` only grows behind us (SPSC — only the mixer pops), so a frame
+/// that fits at the check still fits at the push. Any tail shorter than a
+/// whole frame is counted as dropped rather than pushed: keeping the ring
+/// frame-aligned matters more than those samples, and counting makes an
+/// off-frame port read visible instead of silently shifting the stream.
+fn push_whole_frames(
+    producer: &mut rtrb::Producer<f32>,
+    samples: &[f32],
+    channels: usize,
+) -> u64 {
+    let mut dropped = 0u64;
+    let mut frames = samples.chunks_exact(channels);
+    for frame in frames.by_ref() {
+        if producer.slots() < channels {
+            dropped += channels as u64;
+            continue;
+        }
+        for &sample in frame {
+            let _ = producer.push(sample); // guaranteed to fit by the check above
+        }
+    }
+    dropped + frames.remainder().len() as u64
+}
+
+/// One group's capture-side gauges, read out of a locked `RunningGraph`: the
+/// fullest of its pids' rings (0.0-1.0) and the total samples its pids have
+/// delivered.
+///
+/// The *fullest*, not the mean: one pid backing up is the signal, and averaging
+/// it against healthy pids in the same group hides it. A group with no pids
+/// currently captured reads (0.0, 0).
+fn capture_gauges(rg: &RunningGraph, group: GroupId) -> (f32, u64) {
+    let Some(pids) = rg.capture_pids.get(&group) else {
+        return (0.0, 0);
+    };
+    let fill = pids
+        .values()
+        .map(|pc| pc.fill_permille.load(Ordering::Relaxed))
+        .max()
+        .unwrap_or(0);
+    let pushed = pids.values().map(|pc| pc.pushed_samples.load(Ordering::Relaxed)).sum();
+    (fill as f32 / 1000.0, pushed)
+}
+
+/// What the drift loop actually controls against: one output's worth of
+/// capture state, aggregated over every group routed to it, plus whether the
+/// output itself is live.
+///
+/// The aggregate is the *fullest* ring and the *summed* delivery. One ratio
+/// reaches all these groups (`SetOutputRatio`), so it has to answer to whichever
+/// of them is closest to overflowing; and delivery by any of them means the
+/// output is doing work. `output_active` gates on the render side, so a parked
+/// or faulted output never has corrections integrated against it while nothing
+/// can drain its ring.
+fn output_capture_gauges(rg: &RunningGraph, output: OutputId) -> (f32, u64, bool) {
+    let output_active = rg
+        .output_ids
+        .iter()
+        .position(|id| *id == output)
+        .and_then(|i| rg.ring_fill.get(i))
+        .is_some_and(|gauge| gauge.active.load(Ordering::Relaxed));
+
+    let mut fill = 0.0f32;
+    let mut pushed = 0u64;
+    for (group, _) in rg.group_outputs.iter().filter(|(_, out)| *out == output) {
+        let (g_fill, g_pushed) = capture_gauges(rg, *group);
+        fill = fill.max(g_fill);
+        pushed += g_pushed;
+    }
+    (fill, pushed, output_active)
 }
 
 /// Applies `overrides` on top of `canonical`: a fallen-back group's
@@ -1134,7 +1308,6 @@ fn build_running_graph(
             .map(|_| RingGauge {
                 fill_permille: AtomicU32::new(0),
                 active: AtomicBool::new(false),
-                applied_ratio_bits: AtomicU64::new(1.0f64.to_bits()),
             })
             .collect::<Vec<_>>(),
     );
@@ -1198,29 +1371,16 @@ fn build_running_graph(
     // that order, since `render_loop` requires a `MixerWaker` that only
     // exists once the mixer thread is spawned.
     let (prepared_renders, output_producers) = prepare_output_rings(opened.renders);
-    // Audio-flow-control decision 7: the drift loop's target aims at the
-    // governor's own sawtooth midpoint rather than a flat 0.5, computed from
-    // this build's real ring capacity and block size (not the nominal
-    // numbers decision 7 worked out by hand). Representative, not per-group
-    // exact — `DriftConfig` is one scalar for the whole graph, so this reads
-    // the first output's own capacity; `block_out_frames` assumes that
-    // output's feeding group shares its rate (the common case), same
-    // approximation the governor itself falls back on when a group's own
-    // rate isn't separately known at this call site.
-    let drift_target_fill = output_producers
-        .first()
-        .map(|(_, producer, channels)| {
-            let capacity_frames = producer.buffer().capacity() / (*channels).max(1);
-            crate::clock::drift_target_fill(GOVERNOR_THRESHOLD_FILL, max_block_frames, capacity_frames)
-        })
-        .unwrap_or(GOVERNOR_THRESHOLD_FILL);
+
+    let applied_ratio: Arc<Vec<AtomicU64>> = Arc::new(
+        output_ids.iter().map(|_| AtomicU64::new(1.0f64.to_bits())).collect(),
+    );
 
     let (capture_tx, capture_rx) = mpsc::channel();
     let mixer_args = MixerThreadArgs {
         max_block_frames,
         persistent: Arc::clone(persistent),
         ring_fill: Arc::clone(&ring_fill),
-        output_index_of: output_index_of.clone(),
         stop: Arc::clone(&stop),
         sys: Arc::clone(sys),
         duck_depth_db: Arc::clone(&duck_depth_db),
@@ -1231,6 +1391,8 @@ fn build_running_graph(
         group_input_rates,
         output_rates,
         output_drops: Arc::clone(&output_drops),
+        applied_ratio: Arc::clone(&applied_ratio),
+        output_index_of: output_index_of.clone(),
     };
     let mixer_thread = thread::spawn(move || {
         mixer_loop(mixer, group_consumers, output_producers, mixer_args);
@@ -1257,7 +1419,7 @@ fn build_running_graph(
         output_drops,
         capture_drops,
         render_shortfall,
-        drift_target_fill,
+        applied_ratio,
         ring_fill,
         output_ids,
         group_ids,
@@ -1296,7 +1458,8 @@ fn log_channel_conversions(topology: &Topology, max_block_frames: usize) {
             continue;
         }
         if out.format.layout == ChannelLayout::STEREO {
-            let taps = HrirSet::taps_for(out.format.sample_rate);
+            // Input rate: the spatializer runs pre-SRC (see `Render::build`).
+            let taps = HrirSet::taps_for(g.input_format.sample_rate);
             let partition = max_block_frames.max(1).next_power_of_two();
             println!(
                 "group {:?}: {}ch {:?} -> binaural (partition {partition}, hrir {taps} taps @{})",
@@ -1337,13 +1500,17 @@ fn render_loop(
     // (audio-flow-control B1 — this used to be conflated with the device's
     // full buffer size).
     let mut buf = vec![0.0f32; RENDER_BUF_PERIODS * port.period_frames() * channels];
+    // One `wait_event` means the device freed roughly one period, so one period
+    // is what this loop is allowed to take from the ring each event — see the
+    // `want_frames` comment below for why taking all of `free_frames` is the
+    // bug this bounds.
+    let period_frames = port.period_frames().max(1);
     let wait_timeout = Duration::from_millis(100);
-    // Fill this ring must reach before the loop starts draining it. The
-    // governor's own threshold, deliberately NOT `drift_target_fill`: the
-    // governor stops producing at the threshold, so any higher target is only
-    // reachable via a block overshoot, which would make this exit condition
-    // race the mixer. At the threshold it is exactly decision 7's "two full
-    // device periods of cushion".
+    // Fill this ring must reach before the loop starts draining it: the
+    // governor's own threshold. The governor stops producing there, so any
+    // higher target is only reachable via a block overshoot, which would make
+    // this exit condition race the mixer. At the threshold it is exactly
+    // decision 7's "two full device periods of cushion".
     let prime_target_frames = (consumer.buffer().capacity() as f32
         / channels.max(1) as f32
         * GOVERNOR_THRESHOLD_FILL) as usize;
@@ -1369,8 +1536,21 @@ fn render_loop(
             }
         };
         // Never ask for more than the device just told us it will accept
-        // (B1) — the whole point of `free_frames`.
-        let want_frames = free_frames.min(buf.len() / channels.max(1));
+        // (B1) — the whole point of `free_frames` — and never more than the
+        // single period this event actually corresponds to.
+        //
+        // The period cap is not a refinement, it is the fix for a stable
+        // failure state: `free_frames` reports the device's WHOLE free buffer,
+        // so taking that much drains the ring below the cushion `priming` just
+        // built. The shortfall then gets padded with silence (below), which
+        // means the device's queue shrinks, which makes `free_frames` LARGER
+        // next event, which drains the ring harder — a self-sustaining loop
+        // that punches a silence hole into every buffer written, at the device
+        // period rate. Audibly: gated, skipping audio and a permanently
+        // climbing `xruns`, not an occasional glitch.
+        let want_frames = free_frames
+            .min(period_frames)
+            .min(buf.len() / channels.max(1));
         let want = want_frames * channels;
         let slice = &mut buf[..want];
 
@@ -1394,20 +1574,30 @@ fn render_loop(
             priming = false;
         }
 
+        // WHOLE FRAMES ONLY. The mixer pushes into this ring sample by sample,
+        // so a half-written frame is routinely visible to this thread; popping
+        // an odd sample count would leave every later pop one sample out of
+        // phase with the interleave — a permanent channel swap, not a one-off
+        // glitch. `slots()` only ever grows behind us (SPSC), so a frame count
+        // derived from it is a safe lower bound and every pop below succeeds.
         let mut got = 0;
         if !priming {
-            while got < slice.len() {
-                match consumer.pop() {
-                    Ok(sample) => {
-                        slice[got] = sample;
-                        got += 1;
-                    }
-                    Err(_) => break, // ring empty
+            let take_frames = (slice.len() / channels).min(consumer.slots() / channels);
+            for _ in 0..take_frames * channels {
+                if let Ok(sample) = consumer.pop() {
+                    slice[got] = sample;
+                    got += 1;
                 }
             }
         }
-        if got < slice.len() {
-            slice[got..].fill(0.0); // underrun: pad with silence, never wait for the mixer
+        // Write only the real audio we actually have. Silence is appended ONLY
+        // when there is none at all this event — never behind real samples in
+        // the same buffer, which is what gates the stream (see `want_frames`).
+        // Writing short simply lets the device's queue shrink for one period;
+        // it refills from the ring's cushion on the next event.
+        let write_len = if got > 0 { got } else { slice.len() };
+        if write_len > got {
+            slice[got..write_len].fill(0.0);
             if !priming {
                 // Priming is a deliberate cushion build, not an underrun —
                 // counting it would make `xruns` unusable as the very signal
@@ -1415,6 +1605,8 @@ fn render_loop(
                 ctx.xruns.fetch_add(1, Ordering::Relaxed);
             }
         }
+        let want_frames = write_len / channels;
+        let slice = &buf[..write_len];
         // "I just consumed — refill me for next time" (mixer-demand-driven-
         // wakeup L3 Flow C), synchronized to this real hardware event's own
         // precision, before handing the just-drained buffer to the device.
@@ -1447,6 +1639,9 @@ struct MixerThreadArgs {
     max_block_frames: usize,
     persistent: Arc<Persistent>,
     ring_fill: Arc<Vec<RingGauge>>,
+    /// Per-output applied-ratio gauge and the index map into it, so the mixer
+    /// thread can record each `SetOutputRatio` it applies without a lock.
+    applied_ratio: Arc<Vec<AtomicU64>>,
     output_index_of: HashMap<OutputId, usize>,
     stop: Arc<AtomicBool>,
     sys: Arc<dyn AudioSystem>,
@@ -1481,9 +1676,15 @@ fn mixer_loop(
         .iter()
         .map(|slot| vec![0.0f32; args.max_block_frames * slot.channels])
         .collect();
+    // Sized from the mixer's own accumulator, NOT from `max_block_frames`:
+    // that counts frames at a group's input rate, while this holds frames at
+    // the output device's rate. A short buffer here makes `take_output`
+    // truncate the tick and drop the remainder on the floor (the accumulator
+    // is cleared regardless), so a 48 kHz capture into a 96 kHz device loses
+    // half of every block.
     let mut output_scratch: Vec<Vec<f32>> = output_producers
         .iter()
-        .map(|(_, _, channels)| vec![0.0f32; args.max_block_frames * channels])
+        .map(|(id, _, _)| vec![0.0f32; mixer.output_capacity(*id)])
         .collect();
     // Hysteresis state for RingGauge.active — mixer-thread-owned, no per-tick alloc.
     let mut real_this_tick = vec![false; output_producers.len()];
@@ -1508,7 +1709,7 @@ fn mixer_loop(
 
     while !args.stop.load(Ordering::Relaxed) {
         drain_capture_commands(&args.capture_rx, &mut group_consumers);
-        drain_commands(&args.persistent, &mut mixer, &args.ring_fill, &args.output_index_of);
+        drain_commands(&args.persistent, &mut mixer, &args.applied_ratio, &args.output_index_of);
         // Sampled once per tick, before any group is pulled, so every group
         // this tick decides against the same snapshot (audio-flow-control
         // Flow C) — a stalled output can't be made to look healthier by a
@@ -1568,7 +1769,7 @@ fn update_telemetry(mixer: &Mixer, group_ids: &[GroupId], output_ids: &[OutputId
 fn drain_commands(
     persistent: &Persistent,
     mixer: &mut Mixer,
-    ring_fill: &[RingGauge],
+    applied_ratio: &[AtomicU64],
     output_index_of: &HashMap<OutputId, usize>,
 ) {
     while let Some(envelope) = persistent.commands.pop() {
@@ -1582,9 +1783,7 @@ fn drain_commands(
             // Surfaced via EngineStats::applied_ratio; output_index_of is a
             // plain lookup (no alloc/lock), safe on the mixer's RT thread.
             if let Some(&index) = output_index_of.get(output_id) {
-                ring_fill[index]
-                    .applied_ratio_bits
-                    .store(ratio.value().to_bits(), Ordering::Relaxed);
+                applied_ratio[index].store(ratio.value().to_bits(), Ordering::Relaxed);
             }
         }
         if let Some(retired_chain) = mixer.apply(envelope.cmd) {
@@ -1698,6 +1897,15 @@ fn pull_group_inputs(
     for (i, slot) in group_consumers.iter_mut().enumerate() {
         let scratch = &mut group_scratch[i];
 
+        // No pids: nothing can ever push to this group again until one is
+        // added, so any partial chunk its resampler holds would gate this
+        // output's span forever (mixer.rs `GATE_GRACE_TICKS`). Dropping it here
+        // is the exact signal — the grace would free the span eventually, but
+        // only after an audible gap on every *other* group sharing the output.
+        if slot.pids.is_empty() {
+            mixer.discard_group_partial_input(slot.group_id);
+        }
+
         if !group_may_push(headroom[slot.output_index], block_out_frames[i]) {
             mixer.push_group(slot.group_id, &[]);
             continue;
@@ -1707,14 +1915,19 @@ fn pull_group_inputs(
         let channels = slot.channels.max(1);
         let mut filled_max_frames = 0usize;
         for (_, consumer) in slot.pids.iter_mut() {
+            // WHOLE FRAMES ONLY, same reasoning as `render_loop`'s pop: the
+            // capture thread pushes sample by sample, so a half-written frame
+            // is routinely visible here. Popping the odd sample and then
+            // dropping it (`filled_samples / channels` truncates, and
+            // `scratch` is zeroed next tick) desyncs this ring's interleave
+            // permanently — every later frame arrives channel-swapped.
+            // `slots()` only grows behind us (SPSC), so every pop below succeeds.
+            let take_frames = (scratch.len() / channels).min(consumer.slots() / channels);
             let mut filled_samples = 0;
-            while filled_samples < scratch.len() {
-                match consumer.pop() {
-                    Ok(sample) => {
-                        scratch[filled_samples] += sample;
-                        filled_samples += 1;
-                    }
-                    Err(_) => break,
+            for _ in 0..take_frames * channels {
+                if let Ok(sample) = consumer.pop() {
+                    scratch[filled_samples] += sample;
+                    filled_samples += 1;
                 }
             }
             filled_max_frames = filled_max_frames.max(filled_samples / channels);
@@ -1832,10 +2045,14 @@ fn compute_max_block_frames(plan: &GraphPlan, wake_unit_period: Duration) -> usi
 /// captured under one short lock so the rest of the tick runs lock-free.
 struct SupervisorSnapshot {
     output_ids: Vec<OutputId>,
-    ring_fill: Arc<Vec<RingGauge>>,
+    /// Per output, in `output_ids` order: the fullest capture ring among the
+    /// groups routed there, the running total of samples those groups' pids
+    /// have delivered, and whether the output is live. Read out under the same
+    /// lock rather than handed over as `Arc`s, because `capture_pids` is
+    /// rebuilt whenever routing changes — a cloned handle would go stale.
+    capture: Vec<(f32, u64, bool)>,
     group_outputs: Vec<(GroupId, OutputId)>,
     output_endpoints: Vec<(OutputId, EndpointId)>,
-    drift_target_fill: f32,
 }
 
 fn push_envelope(persistent: &Persistent, cmd: MixerCommand) {
@@ -1881,14 +2098,14 @@ fn supervisor_loop(
     sys: Arc<dyn AudioSystem>,
     stop: Arc<AtomicBool>,
 ) {
-    // `target_fill` is per-build (decision 7 — read from each rebuild's own
-    // `RunningGraph`, below); every other gain/timing stays the shared
-    // default. `default_tick` is used for every sleep regardless, since it
-    // never varies with target_fill.
     let default_tick = DriftConfig::default().tick;
     let device_events = sys.subscribe_device_events().ok();
     let mut drift = DriftController::new(&[], DriftConfig::default());
     let mut known_outputs: Vec<OutputId> = Vec::new();
+    // Previous tick's pid delivery totals, in `known_outputs` order — the idle
+    // guard's baseline. An output whose groups delivered nothing over a tick is
+    // skipped by the controller.
+    let mut last_pushed: Vec<u64> = Vec::new();
 
     while !stop.load(Ordering::Relaxed) {
         // Off-RT drop of chains retired by a `SwapChain` apply (notes §7) —
@@ -1902,10 +2119,9 @@ fn supervisor_loop(
             let guard = running.lock().unwrap();
             guard.as_ref().map(|rg| SupervisorSnapshot {
                 output_ids: rg.output_ids.clone(),
-                ring_fill: Arc::clone(&rg.ring_fill),
+                capture: rg.output_ids.iter().map(|id| output_capture_gauges(rg, *id)).collect(),
                 group_outputs: rg.group_outputs.clone(),
                 output_endpoints: rg.output_endpoints.clone(),
-                drift_target_fill: rg.drift_target_fill,
             })
         };
         let Some(snap) = snapshot else {
@@ -1913,28 +2129,29 @@ fn supervisor_loop(
             continue;
         };
 
-        // Topology changed since last tick (rebuild happened) — old
-        // integrator state no longer applies to a fresh set of rings, and
-        // this build's own `drift_target_fill` (decision 7) replaces
-        // whatever the previous graph's ring capacity/block size implied.
+        // Topology changed since last tick (rebuild happened) — old integrator
+        // state no longer applies to a fresh set of rings.
         if snap.output_ids != known_outputs {
-            let cfg = DriftConfig { target_fill: snap.drift_target_fill, ..DriftConfig::default() };
-            drift = DriftController::new(&snap.output_ids, cfg);
+            drift = DriftController::new(&snap.output_ids, DriftConfig::default());
             known_outputs = snap.output_ids.clone();
+            last_pushed = vec![0; known_outputs.len()];
         }
 
+        // The capture rings are what this loop regulates (clock.rs's module
+        // doc), aggregated per output because one ratio drives every group
+        // routed there. `active` is delivery since the previous tick, not ring
+        // level: a ring sitting at its brim is the state most in need of
+        // correction, so a guard keyed on the ring itself would switch the
+        // controller off exactly when the surplus needed clearing.
         let fills: Vec<(OutputId, FillSample)> = snap
             .output_ids
             .iter()
-            .zip(snap.ring_fill.iter())
-            .map(|(id, gauge)| {
-                (
-                    *id,
-                    FillSample {
-                        fill: gauge.fill_permille.load(Ordering::Relaxed) as f32 / 1000.0,
-                        active: gauge.active.load(Ordering::Relaxed),
-                    },
-                )
+            .zip(snap.capture.iter())
+            .zip(last_pushed.iter_mut())
+            .map(|((id, (fill, pushed, output_active)), last)| {
+                let delivering = *pushed > *last;
+                *last = *pushed;
+                (*id, FillSample { fill: *fill, active: delivering && *output_active })
             })
             .collect();
         for cmd in drift.tick(&fills) {
@@ -2479,7 +2696,18 @@ mod tests {
         let waker = MixerWaker(thread::current());
         let drops = AtomicU64::new(0);
 
-        pid_capture_loop(Box::new(FailingCapture), producer, &stop, &sys, waker, &drops);
+        pid_capture_loop(
+            Box::new(FailingCapture),
+            producer,
+            &stop,
+            &sys,
+            waker,
+            CaptureGauges {
+                drops: &drops,
+                fill: &AtomicU32::new(0),
+                pushed: &AtomicU64::new(0),
+            },
+        );
     }
 
     #[test]
@@ -2521,8 +2749,16 @@ mod tests {
         let (producer, _consumer) = RingBuffer::<f32>::new(ring_capacity);
         let waker = MixerWaker(thread::current());
         let drops = AtomicU64::new(0);
+        let fill = AtomicU32::new(0);
 
-        pid_capture_loop(Box::new(BurstCapture { calls: 0 }), producer, &stop, &sys, waker, &drops);
+        pid_capture_loop(
+            Box::new(BurstCapture { calls: 0 }),
+            producer,
+            &stop,
+            &sys,
+            waker,
+            CaptureGauges { drops: &drops, fill: &fill, pushed: &AtomicU64::new(0) },
+        );
 
         // buf is capture_buf_samples(1ms, 48000, 1) = 96 samples; only
         // ring_capacity fit, the rest must show up here, not vanish.
@@ -2531,6 +2767,154 @@ mod tests {
             drops.load(Ordering::Relaxed),
             (expected_buf_len - ring_capacity) as u64
         );
+        // The same overflow must also move the gauge, not only the counter:
+        // `capture_drops` says samples were lost, `capture_fill` is what
+        // distinguishes a standing surplus from a transient burst. The gauge is
+        // one-pole smoothed from a mid-scale seed, so one poll against a full
+        // ring moves it up by one coefficient's worth rather than snapping to
+        // the brim — the smoothing is the point (an unsmoothed reading railed
+        // the drift controller on packet phase).
+        let seeded = (CAPTURE_FILL_SMOOTHING_SEED * 1000.0) as u32;
+        assert!(
+            fill.load(Ordering::Relaxed) > seeded,
+            "a full ring must push the smoothed gauge above its seed, got {}",
+            fill.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn capture_fill_smoothing_rejects_packet_phase_swing() {
+        // What the smoothing is for. A capture ring alternates between "packet
+        // just landed" and "mixer just drained" every poll; the drift
+        // controller must see the standing level, not that alternation. Live
+        // hardware showed 0.27–0.77 tick to tick against a 0.5 target, which at
+        // kp=0.05 demands 2.5x the correction clamp — so the controller sat on
+        // alternate rails and drove nothing but noise into the resample ratio.
+        //
+        // Modelled directly: alternate the extremes and check the smoothed
+        // value stays close to their mean.
+        let mut smoothed = CAPTURE_FILL_SMOOTHING_SEED;
+        let mut worst_excursion = 0.0f32;
+        for i in 0..2_000 {
+            let instant = if i % 2 == 0 { 0.27 } else { 0.77 };
+            smoothed += CAPTURE_FILL_SMOOTHING * (instant - smoothed);
+            if i > 200 {
+                worst_excursion = worst_excursion.max((smoothed - 0.52).abs());
+            }
+        }
+        assert!(
+            worst_excursion < 0.02,
+            "smoothed fill must track the mean of the swing, not the swing — \
+             worst excursion {worst_excursion:.4} from the 0.52 mean"
+        );
+    }
+
+    #[test]
+    fn a_saturated_ring_still_counts_as_delivering() {
+        // The drift loop's idle guard skips a group whose pids delivered
+        // nothing since the last tick. `pushed_samples` therefore has to count
+        // what the PORT handed over, not what the ring accepted: a ring at its
+        // brim rejects everything, and that is exactly the state the loop
+        // exists to correct. Counting accepted samples would mark the group
+        // idle precisely when its surplus needed clearing, and the ratio would
+        // never be pulled down — the bug would survive its own fix.
+        struct OneBurst {
+            done: bool,
+        }
+        impl CapturePort for OneBurst {
+            fn read(&mut self, buf: &mut [f32]) -> Result<usize, PortError> {
+                if self.done {
+                    return Err(PortError::DeviceInvalidated);
+                }
+                self.done = true;
+                buf.fill(0.25);
+                Ok(buf.len())
+            }
+            fn format(&self) -> Format {
+                mono(48_000)
+            }
+            fn poll_interval(&self) -> Duration {
+                Duration::from_millis(1)
+            }
+        }
+        let stop = AtomicBool::new(false);
+        let sys = MockSystem::new(vec![]);
+        // Capacity 0-ish: `ring_capacity_samples` floors at 64, but here the
+        // ring is built directly, so 1 slot makes almost every push fail.
+        let (producer, _consumer) = RingBuffer::<f32>::new(1);
+        let drops = AtomicU64::new(0);
+        let pushed = AtomicU64::new(0);
+
+        pid_capture_loop(
+            Box::new(OneBurst { done: false }),
+            producer,
+            &stop,
+            &sys,
+            MixerWaker(thread::current()),
+            CaptureGauges { drops: &drops, fill: &AtomicU32::new(0), pushed: &pushed },
+        );
+
+        let delivered = capture_buf_samples(Duration::from_millis(1), 48_000, 1) as u64;
+        assert_eq!(drops.load(Ordering::Relaxed), delivered - 1, "all but one sample rejected");
+        assert_eq!(
+            pushed.load(Ordering::Relaxed),
+            delivered,
+            "activity must reflect what the port delivered, not what the full ring took"
+        );
+    }
+
+    #[test]
+    fn a_full_capture_ring_drops_whole_frames_never_half_of_one() {
+        // The per-sample push loop this replaces could place a frame's L and
+        // drop its R (or vice versa), shifting the ring's interleave by one
+        // sample for the rest of the stream — every later frame arrives
+        // channel-swapped. A ring carrying a standing surplus sits at its brim
+        // continuously, so this is the steady state, not a rare race.
+        //
+        // Capacity 3 with stereo frames is the shape that catches it: one
+        // whole frame fits, and the third slot is a trap the old loop fell
+        // into by pushing the next frame's L into it.
+        let (mut producer, consumer) = RingBuffer::<f32>::new(3);
+        let samples = [1.0f32, -1.0, 2.0, -2.0, 3.0, -3.0];
+
+        let dropped = push_whole_frames(&mut producer, &samples, 2);
+
+        assert_eq!(dropped, 4, "two of the three frames must not fit");
+        assert_eq!(
+            consumer.slots() % 2,
+            0,
+            "the ring must hold whole frames only — an odd count means a frame was split \
+             across the overflow, swapping L/R for every frame after it"
+        );
+    }
+
+    #[test]
+    fn a_capture_read_that_ends_mid_frame_never_shifts_the_ring() {
+        // A port returning a sample count that isn't a whole number of frames
+        // shouldn't happen (WASAPI hands over whole frames), but pushing the
+        // dangling sample would desync the interleave exactly as an overflow
+        // split would. It is counted rather than pushed, so an off-frame port
+        // shows up in `capture_drops` instead of silently corrupting.
+        let (mut producer, consumer) = RingBuffer::<f32>::new(16);
+
+        let dropped = push_whole_frames(&mut producer, &[1.0, -1.0, 2.0], 2);
+
+        assert_eq!(dropped, 1, "the dangling half-frame is counted");
+        assert_eq!(consumer.slots(), 2, "and never enters the ring");
+    }
+
+    #[test]
+    fn capture_fill_tracks_a_partly_filled_ring() {
+        // Not just the brim case: the gauge has to read proportionally, or a
+        // ring climbing toward overflow looks identical to a healthy one right
+        // up until it starts dropping.
+        let (mut producer, _consumer) = RingBuffer::<f32>::new(10);
+        push_whole_frames(&mut producer, &[0.5; 4], 2);
+
+        let capacity = producer.buffer().capacity();
+        let filled = capacity - producer.slots();
+
+        assert_eq!((filled * 1000 / capacity) as u32, 400);
     }
 
     #[test]
@@ -2571,8 +2955,8 @@ mod tests {
         let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(mock_endpoints()));
         let persistent = bare_persistent(&snapshot());
         let rg = build_running_graph(&snapshot(), &sys, &persistent, &HashSet::new()).unwrap();
-        assert_eq!(rg.ring_fill.len(), 1);
-        let ratio = f64::from_bits(rg.ring_fill[0].applied_ratio_bits.load(Ordering::Relaxed));
+        assert_eq!(rg.applied_ratio.len(), rg.output_ids.len());
+        let ratio = f64::from_bits(rg.applied_ratio[0].load(Ordering::Relaxed));
         assert_eq!(ratio, 1.0);
         stop_running_graph(rg);
     }
@@ -2597,7 +2981,7 @@ mod tests {
         });
         assert!(pushed.is_ok());
         sleep(MIXER_FALLBACK_INTERVAL + Duration::from_millis(50));
-        let applied = f64::from_bits(rg.ring_fill[0].applied_ratio_bits.load(Ordering::Relaxed));
+        let applied = f64::from_bits(rg.applied_ratio[0].load(Ordering::Relaxed));
         assert_eq!(applied, 1.003);
         stop_running_graph(rg);
     }
@@ -2739,10 +3123,151 @@ mod tests {
 
         render_loop(Box::new(ShortWriteRender { first_call: true }), consumer, &stop, &ctx, &sys, waker);
 
+        // The loop offers one device period (4 frames), not all 8 free frames —
+        // the port accepts half of that, so 2 frames go uncounted-if-silent.
         assert_eq!(
             shortfall.load(Ordering::Relaxed),
-            4,
+            2,
             "a write accepting less than offered must be counted, never silent"
+        );
+    }
+
+    #[test]
+    fn render_loop_never_writes_silence_behind_real_audio_in_one_buffer() {
+        // The defect this pins produced ~50 xruns/second on real hardware and
+        // gated, skipping output: `free_frames` reports the WHOLE free device
+        // buffer, so the loop took far more than the ring held, wrote
+        // `real audio + silence padding` in one buffer, and thereby made the
+        // device's queue shorter — which made `free_frames` bigger next event.
+        // A silence hole per period, forever.
+        //
+        // Here the device offers 8 free frames but its period is 4 and the ring
+        // holds 5, so the old code would have written 5 real + 3 silent frames.
+        // Succeeds once then errors, so exactly one event runs.
+        struct OneEventRender {
+            first: bool,
+            written: Arc<Mutex<Vec<f32>>>,
+        }
+        impl RenderPort for OneEventRender {
+            fn wait_event(&mut self, _timeout: Duration) -> Result<(), PortError> {
+                if std::mem::replace(&mut self.first, false) {
+                    Ok(())
+                } else {
+                    Err(PortError::DeviceInvalidated)
+                }
+            }
+            fn free_frames(&self) -> Result<usize, PortError> {
+                Ok(8) // the whole free device buffer — two full periods
+            }
+            fn write(&mut self, frames: &[f32]) -> Result<usize, PortError> {
+                self.written.lock().unwrap().extend_from_slice(frames);
+                Ok(frames.len() / 2)
+            }
+            fn format(&self) -> Format {
+                stereo(48_000)
+            }
+            fn period_frames(&self) -> usize {
+                4
+            }
+        }
+
+        let ring_frames = 8; // prime target 4 frames, so 5 queued clears priming
+        let (mut producer, consumer) = RingBuffer::<f32>::new(ring_frames * 2);
+        for _ in 0..5 * 2 {
+            producer.push(0.5).unwrap();
+        }
+        let stop = AtomicBool::new(false);
+        let xruns = AtomicU64::new(0);
+        let shortfall = AtomicU64::new(0);
+        let (fault_tx, _fault_rx) = mpsc::channel();
+        let sys = MockSystem::new(vec![]);
+        let ctx = RenderFaultCtx {
+            xruns: &xruns,
+            shortfall: &shortfall,
+            output_id: OutputId(0),
+            faults: &fault_tx,
+        };
+        let waker = MixerWaker(thread::current());
+
+        let written = Arc::new(Mutex::new(Vec::new()));
+        render_loop(
+            Box::new(OneEventRender { first: true, written: Arc::clone(&written) }),
+            consumer,
+            &stop,
+            &ctx,
+            &sys,
+            waker,
+        );
+
+        let written = written.lock().unwrap();
+        assert_eq!(
+            *written,
+            vec![0.5f32; 4 * 2],
+            "one event may take exactly one device period, all real audio — the old code \
+             wrote 5 real frames plus 3 of silence, gating the stream every period"
+        );
+        assert_eq!(
+            ring_frames * 2 - producer.slots(),
+            2,
+            "only one period may leave the ring; the rest is the cushion and must stay"
+        );
+        assert_eq!(
+            xruns.load(Ordering::Relaxed),
+            0,
+            "a ring that supplied a full period is not an underrun"
+        );
+    }
+
+    #[test]
+    fn pull_group_inputs_never_pops_a_partial_frame() {
+        // The capture thread pushes sample by sample, so a ring holding an ODD
+        // number of samples is a normal mid-write observation, not corruption.
+        // The old loop popped that odd sample and then dropped it (integer
+        // division to frames), permanently shifting the ring's interleave by
+        // one sample — every later frame arrives channel-swapped.
+        let mut slots = vec![GroupSlot {
+            group_id: GroupId(0),
+            pids: Vec::new(),
+            channels: 2,
+            output_index: 0,
+        }];
+        let (mut producer, consumer) = RingBuffer::<f32>::new(16);
+        for s in [1.0f32, 2.0, 3.0, 4.0, 5.0] {
+            producer.push(s).unwrap(); // 2 whole frames + one dangling L sample
+        }
+        slots[0].pids.push((1234, consumer));
+
+        let mut scratch = vec![vec![0.0f32; 8 * 2]];
+        let mut mixer = Mixer::new(
+            &Topology {
+                master: audio_core::Gain::UNITY,
+                groups: vec![audio_core::GroupSpec {
+                    id: GroupId(0),
+                    gain: audio_core::Gain::UNITY,
+                    follow_master: false,
+                    output: OutputId(0),
+                    input_format: stereo(48_000),
+                    dsp: Vec::new(),
+                    duck: None,
+                    spatial: false,
+                    mute: false,
+                }],
+                outputs: vec![audio_core::OutputSpec { id: OutputId(0), format: stereo(48_000) }],
+            },
+            8,
+        )
+        .unwrap();
+        let mut real = vec![false];
+        let headroom = vec![OutputHeadroom { filled_frames: 0, capacity_frames: 1_000 }];
+
+        pull_group_inputs(&mut slots, &mut scratch, &mut mixer, &mut real, &headroom, &[8]);
+
+        let (_, consumer) = &slots[0].pids[0];
+        assert_eq!(
+            consumer.slots(),
+            1,
+            "the dangling half-frame must stay in the ring for the next tick, never be \
+             popped and discarded — discarding it swaps L/R for the rest of the stream"
         );
     }
 
@@ -2953,7 +3478,18 @@ mod tests {
         let waker = MixerWaker(parker.thread().clone());
         let drops = AtomicU64::new(0);
 
-        pid_capture_loop(Box::new(OneShotCapture { called: false }), producer, &stop, &sys, waker, &drops);
+        pid_capture_loop(
+            Box::new(OneShotCapture { called: false }),
+            producer,
+            &stop,
+            &sys,
+            waker,
+            CaptureGauges {
+                drops: &drops,
+                fill: &AtomicU32::new(0),
+                pushed: &AtomicU64::new(0),
+            },
+        );
 
         let elapsed = parker.join().unwrap();
         assert!(
@@ -3025,13 +3561,13 @@ mod tests {
         let ring_fill = Arc::new(vec![RingGauge {
             fill_permille: AtomicU32::new(0),
             active: AtomicBool::new(false),
-            applied_ratio_bits: AtomicU64::new(1.0f64.to_bits()),
         }]);
 
         let args = MixerThreadArgs {
             max_block_frames: 8,
             persistent: bare_persistent(&snapshot()),
             ring_fill: Arc::clone(&ring_fill),
+            applied_ratio: Arc::new(vec![AtomicU64::new(1.0f64.to_bits())]),
             output_index_of,
             stop: Arc::clone(&stop),
             sys,
@@ -3109,17 +3645,18 @@ mod tests {
         let ring_fill = Arc::new(vec![RingGauge {
             fill_permille: AtomicU32::new(0),
             active: AtomicBool::new(false),
-            applied_ratio_bits: AtomicU64::new(1.0f64.to_bits()),
         }]);
         let mut output_index_of = HashMap::new();
         output_index_of.insert(OutputId(0), 0);
         let stop = Arc::new(AtomicBool::new(false));
         let sys: Arc<dyn AudioSystem> = Arc::new(MockSystem::new(vec![]));
+        let applied_ratio = Arc::new(vec![AtomicU64::new(1.0f64.to_bits())]);
 
         let args = MixerThreadArgs {
             max_block_frames: 8,
             persistent: Arc::clone(&persistent),
             ring_fill: Arc::clone(&ring_fill),
+            applied_ratio: Arc::clone(&applied_ratio),
             output_index_of,
             stop: Arc::clone(&stop),
             sys,
@@ -3142,7 +3679,7 @@ mod tests {
             ring_fill[0].active.load(Ordering::Relaxed),
             "both pids' full blocks must have been drained together on the first tick"
         );
-        let applied = f64::from_bits(ring_fill[0].applied_ratio_bits.load(Ordering::Relaxed));
+        let applied = f64::from_bits(applied_ratio[0].load(Ordering::Relaxed));
         assert_eq!(applied, 1.05, "the queued command must also have applied in that same tick");
     }
 
@@ -3166,6 +3703,7 @@ mod tests {
             max_block_frames: 8,
             persistent: bare_persistent(&snapshot()),
             ring_fill: Arc::new(Vec::new()),
+            applied_ratio: Arc::new(Vec::new()),
             output_index_of: HashMap::new(),
             stop: Arc::clone(&stop),
             sys,
@@ -3510,6 +4048,87 @@ mod tests {
         // reaching the mixer: 0.2+0.5, 0.3+(-0.1).
         assert!((scratch[0][0] - 0.7).abs() < 1e-6, "got {}", scratch[0][0]);
         assert!((scratch[0][1] - 0.2).abs() < 1e-6, "got {}", scratch[0][1]);
+    }
+
+    fn group_spec(id: GroupId, output: OutputId) -> audio_core::GroupSpec {
+        audio_core::GroupSpec {
+            id,
+            gain: audio_core::Gain::UNITY,
+            follow_master: false,
+            output,
+            input_format: mono(48_000),
+            dsp: Vec::new(),
+            duck: None,
+            spatial: false,
+            mute: false,
+        }
+    }
+
+    #[test]
+    fn a_group_that_loses_its_last_pid_stops_gating_its_outputs_span() {
+        // MT17, 2026-07-27: unassigning a group's only app silenced the whole
+        // output permanently. Its resampler kept a partial chunk that nothing
+        // could ever complete, and `mix_tick` held the shared span at zero
+        // waiting for it. `pull_group_inputs` fires the discard the moment a
+        // slot has no pids, which is the signal that no input is coming.
+        // Block sized like the real graph, not a toy: below the resampler's
+        // sinc length the first chunks produce no output at all, which would
+        // make this test silent for reasons that have nothing to do with the
+        // span rule.
+        let block = 304;
+        let topology = Topology {
+            master: audio_core::Gain::UNITY,
+            groups: vec![
+                group_spec(GroupId(0), OutputId(0)),
+                group_spec(GroupId(1), OutputId(0)),
+            ],
+            outputs: vec![audio_core::OutputSpec { id: OutputId(0), format: mono(48_000) }],
+        };
+        let mut mixer = Mixer::new(&topology, block).unwrap();
+
+        // Group 1 takes in half a chunk — enough to be "in flight", never
+        // enough to complete — then loses its pid.
+        mixer.push_group(GroupId(1), &vec![0.5f32; block / 2]);
+        mixer.mix_tick();
+        let mut drain = vec![0.0f32; mixer.output_capacity(OutputId(0))];
+        mixer.take_output(OutputId(0), &mut drain);
+
+        let mut consumers = vec![slot(GroupId(0), 1, 0), slot(GroupId(1), 1, 0)];
+        let (mut feed, taps) = rtrb::RingBuffer::<f32>::new(block * 8);
+        consumers[0].pids.push((1, taps));
+        let mut scratch = vec![vec![0.0f32; block], vec![0.0f32; block]];
+        let mut real_this_tick = vec![false];
+        let headroom = vec![OutputHeadroom { filled_frames: 0, capacity_frames: 100_000 }];
+        let block_out_frames = vec![block, block];
+
+        let mut per_tick = Vec::new();
+        for _ in 0..6 {
+            for _ in 0..block {
+                feed.push(0.5).unwrap();
+            }
+            pull_group_inputs(
+                &mut consumers,
+                &mut scratch,
+                &mut mixer,
+                &mut real_this_tick,
+                &headroom,
+                &block_out_frames,
+            );
+            mixer.mix_tick();
+            let mut out = vec![0.0f32; mixer.output_capacity(OutputId(0))];
+            per_tick.push(mixer.take_output(OutputId(0), &mut out));
+        }
+
+        // First tick, not merely "eventually": `mix_tick`'s parking-capacity
+        // backstop also frees the span, but only once the live group has
+        // filled its parking — an audible gap, and a block of its input lost
+        // to a group that will never produce again. The discard is what makes
+        // the unassign silent to everyone else.
+        assert!(
+            per_tick[0] > 0,
+            "the output stalled on the tick the pid went away: {per_tick:?} — a group \
+             with no pids left is still holding its output's span at zero"
+        );
     }
 
     #[test]
@@ -3863,7 +4482,6 @@ mod tests {
         let ring_fill = vec![RingGauge {
             fill_permille: AtomicU32::new(0),
             active: AtomicBool::new(false),
-            applied_ratio_bits: AtomicU64::new(1.0f64.to_bits()),
         }];
         let mut ticks_since_real = vec![ACTIVE_HOLD_TICKS];
         let drops = AtomicU64::new(0);
